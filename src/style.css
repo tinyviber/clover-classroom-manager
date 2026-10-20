@@ -1,0 +1,126 @@
+/* 机房小助手 · 管理端 — magpie "quiet surface" 皮肤
+ * tokens.css + base.css 先加载；这里只放页面骨架与业务样式。
+ */
+
+body { display: flex; flex-direction: column; }
+
+/* ---- 顶栏 ---- */
+.top { display: flex; align-items: center; gap: 8px; padding: 0 10px 0 14px; height: 46px; flex: none; }
+.brand { display: flex; align-items: center; gap: 7px; font-weight: 600; font-size: 13.5px; }
+.brand .mark {
+  width: 17px; height: 17px; border-radius: 5px;
+  background: var(--fg); color: var(--card);
+  display: grid; place-items: center; font-size: 10px; font-weight: 700;
+}
+.crumb { display: flex; align-items: baseline; gap: 7px; font-size: 13px; }
+.crumb > span { color: var(--muted); }
+.crumb > i { font-style: normal; color: var(--faint); }
+.crumb > b { font-weight: 600; color: var(--fg); }
+.top .actions { margin-left: auto; display: flex; gap: 2px; align-items: center; }
+
+/* ---- 主区 ---- */
+.view { flex: 1; overflow-y: auto; padding: 4px max(16px, calc(50% - 600px)) 40px; }
+.stats { grid-template-columns: repeat(4, minmax(0,1fr)); margin: 10px 0 16px; }
+@container (max-width: 700px) {
+  .stats { grid-template-columns: repeat(2, minmax(0,1fr)); }
+}
+
+.filters { display: flex; align-items: center; gap: 8px; margin: 0 2px 9px; flex-wrap: wrap; }
+.filters .grow { flex: 1; }
+.filters .search { width: 220px; }
+
+/* ---- 批量操作条 ---- */
+.batchbar {
+  display: flex; align-items: center; gap: 8px;
+  margin: 0 0 9px; padding: 7px 10px;
+  background: var(--card); border: 1px solid var(--line); border-radius: var(--r-lg);
+  animation: view-in .18s var(--ease);
+}
+.batchbar[hidden] { display: none; }
+.batchbar .n-sel { font-size: var(--fs-ctl); font-weight: 500; font-variant-numeric: tabular-nums; margin-right: 4px; }
+.batchbar .grow { flex: 1; }
+
+/* ---- 设备表 ---- */
+table.led { width: 100%; border-collapse: collapse; font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.led th {
+  padding: 7px 10px 6px; border-bottom: 1px solid var(--line);
+  font-size: 10.5px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--muted); text-align: left; white-space: nowrap;
+}
+:lang(zh) .led th { letter-spacing: .02em; }
+.led td { padding: 7px 10px; border-top: 1px solid var(--line-2); white-space: nowrap; }
+.led tbody tr:first-child td { border-top: 0; }
+.led tbody tr.data { transition: background var(--t-fast); }
+.led tbody tr.data:hover td { background: var(--card-2); }
+.led tbody tr.data.sel td { background: var(--sel); }
+.led tbody tr.data.open td { background: var(--card-2); }
+.led .n { text-align: right; }
+.led .muted { color: var(--muted); }
+.led .who { display: flex; align-items: center; gap: 7px; }
+.led .who .avatar {
+  width: 18px; height: 18px; border-radius: 5px; flex: none;
+  background: var(--pill); color: var(--fg-2);
+  display: grid; place-items: center; font-size: 9.5px; font-weight: 600;
+}
+.led .dname { font-weight: 500; letter-spacing: -.005em; }
+.led .num { font-weight: 600; }
+.led .st { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+.led tr.off .st .d { background: var(--faint); box-shadow: 0 0 0 3px var(--pill); }
+.led tr.off .dname, .led tr.off .num, .led tr.off .ip { color: var(--muted); }
+.led .st .d { width: 6px; height: 6px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 3px var(--green-soft); flex: none; }
+.led tr.alert .st .d { background: var(--amber); box-shadow: 0 0 0 3px var(--amber-soft); }
+
+/* 展开的设备详情行 */
+tr.detail { display: none; }
+tr.detail.open { display: table-row; }
+tr.detail td { padding: 0; white-space: normal; background: var(--card-2); }
+.d-box { display: grid; grid-template-columns: max-content minmax(0,1fr); gap: 5px 16px; padding: 10px 14px 12px; font-size: 11.5px; }
+.d-box dt { color: var(--muted); }
+.d-box dd { margin: 0; color: var(--fg); overflow-wrap: anywhere; user-select: text; }
+.d-box .acts { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 2px; }
+.feat-chips { display: flex; gap: 4px; flex-wrap: wrap; }
+.feat-chips .chip { height: 21px; font-size: 11px; padding: 0 8px; pointer-events: none; }
+
+/* ---- 配置对话框 ---- */
+#cfgBody { padding: 10px 18px 16px; }
+.cfg-group + .cfg-group { margin-top: 14px; }
+.cfg-group .row-head { margin: 0 2px 6px; display: flex; align-items: baseline; }
+.cfg-group .row-head .mini { margin-left: auto; }
+.cfg-list { border: 1px solid var(--line); border-radius: var(--r-lg); overflow: hidden; }
+.cfg-list .row { min-height: 36px; padding: 5px 12px; gap: 10px; }
+.cfg-list .who { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.cfg-list .who .name { font-weight: 400; font-size: 12.5px; }
+.cfg-list .who .sub { display: inline; margin: 0; font-size: 11px; }
+.mini { font-size: 11px; color: var(--faint); }
+
+/* ---- 底栏 ---- */
+.foot { padding: 0 14px 8px; min-height: 26px; display: flex; align-items: center; gap: 8px; }
+.foot .status { font-size: 11.5px; color: var(--muted); }
+.toast {
+  font-size: 11px; font-weight: 500; padding: 2px 9px; border-radius: var(--r-pill);
+  background: var(--green-soft); color: var(--green);
+  animation: view-in .2s var(--ease);
+}
+.toast.err { background: var(--red-soft); color: var(--red); }
+
+.pop#roomMenu { min-width: 150px; }
+.modal[hidden], .pop[hidden] { display: none; }
+.anchor { position: relative; }
+
+/* ---- 分发对话框 ---- */
+.dist-grid { display: grid; grid-template-columns: 76px minmax(0,1fr); gap: 9px 14px; font-size: 12.5px; align-items: start; }
+.dist-grid .k { color: var(--fg-2); text-align: right; padding-top: 1px; }
+.dist-grid .v { min-width: 0; }
+.dist-grid .v .ip-line { display: flex; align-items: center; gap: 6px; padding: 1px 0; }
+.dist-grid .v .ip-line .dot { width: 5px; height: 5px; background: var(--green); }
+.dist-note {
+  margin-top: 14px; padding: 9px 11px; border-radius: var(--r-lg);
+  background: var(--amber-soft); color: var(--amber);
+  font-size: 11.5px; line-height: 1.55;
+}
+.dist-note b { font-weight: 600; }
+
+@media (max-width: 760px) {
+  .led th:nth-child(8), .led td:nth-child(8) { display: none; }
+  .led th:nth-child(7), .led td:nth-child(7) { display: none; }
+}

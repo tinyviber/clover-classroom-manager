@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>机房小助手</title>
+<link rel="stylesheet" href="./src/tokens.css">
+<link rel="stylesheet" href="./src/base.css">
+<link rel="stylesheet" href="./src/client.css">
+</head>
+<body>
+<main class="view view-in">
+  <div class="hero card pad">
+    <div class="hero-top">
+      <span class="mnum" id="mnum">–</span>
+      <span class="st" id="st"><span class="dot" id="stDot"></span><span id="stText">…</span></span>
+    </div>
+    <div class="hero-sub muted" id="mname">–</div>
+    <div class="hero-sub faint mono" id="mip">–</div>
+  </div>
+
+  <div class="row-head"><span class="label">已启用功能</span><span class="note" id="featCount"></span></div>
+  <div class="card" id="featList"></div>
+
+  <div class="row-head"><span class="label">系统</span></div>
+  <div class="card">
+    <div class="row">
+      <div class="who"><div class="name">退出防护</div><div class="sub">需要管理端设置的密码</div></div>
+      <div class="val"><button class="btn action" id="exitBtn">退出…</button></div>
+    </div>
+  </div>
+</main>
+
+<footer class="foot"><span class="status muted">机房小助手 v13.1 · 由管理端统一配置</span></footer>
+
+<div class="modal" id="pwModal" hidden>
+  <div class="dialog" style="width:min(340px,100%)">
+    <div class="d-head"><b>退出防护</b></div>
+    <div class="d-body">
+      <div class="pw-tip muted">请输入管理员密码（演示密码 123456）</div>
+      <input class="input" type="password" id="pwInput" placeholder="密码" autocomplete="off">
+      <div class="pw-err" id="pwErr" hidden>密码错误</div>
+    </div>
+    <div class="d-foot">
+      <button class="btn action" id="pwCancel">取消</button>
+      <button class="btn action primary" id="pwOk">退出</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="./src/client.ts"></script>
+</body>
+</html>

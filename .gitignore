@@ -1,0 +1,8 @@
+node_modules/
+/dist/
+/build/
+/.mygo/
+mygo_windows_*.syso
+agent.exe
+/release/
+.playwright-mcp/
