@@ -8,6 +8,9 @@ package lan
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,17 +25,18 @@ import (
 
 // Device 是注册表里的设备条目（含离线）。
 type Device struct {
-	ID       string   `json:"id"`
-	Name     string   `json:"name"`
-	Label    string   `json:"label"`
-	IP       string   `json:"ip"`
-	MAC      string   `json:"mac"`
-	Version  string   `json:"version"`
-	Online   bool     `json:"online"`
-	HelperOn bool     `json:"helperOn"`
-	Features []string `json:"features"`
-	Alerts   int      `json:"alerts"`
-	LastSeen time.Time `json:"lastSeen"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Label     string    `json:"label"`
+	IP        string    `json:"ip"`
+	MAC       string    `json:"mac"`
+	Version   string    `json:"version"`
+	Online    bool      `json:"online"`
+	HelperOn  bool      `json:"helperOn"`
+	Features  []string  `json:"features"`
+	Alerts    int       `json:"alerts"`
+	TokenHash string    `json:"tokenHash,omitempty"`
+	LastSeen  time.Time `json:"lastSeen"`
 }
 
 // LastSeenText 给 UI 的友好时间。
@@ -61,25 +65,50 @@ type clientConn struct {
 
 // Server 是管理端控制服务器。
 type Server struct {
-	ID     Identity
+	ID      Identity
 	TCPPort int
 
-	mu       sync.Mutex
-	devices  map[string]*Device            // id -> device
-	sessions map[string]*clientConn        // id -> 在线会话
-	OnChange func()                        // 注册表变化回调（UI 用）
-	cmdSeq   atomic.Uint64
+	mu        sync.Mutex
+	devices   map[string]*Device     // id -> device
+	sessions  map[string]*clientConn // id -> 在线会话
+	OnChange  func()                 // 注册表/签到/文件变化回调（UI 用）
+	OnScreens func()                 // 缩略图帧到达回调（高频，UI 自节流）
+	cmdSeq    atomic.Uint64
 
 	persistPath string
 	persistT    *time.Timer
+
+	screens        map[string]ScreenFrame // 各设备最新缩略图 JPEG
+	sign           *signState             // 当前签到会话
+	poll           *pollState             // 当前单题投票
+	demo           *demoState             // 唯一学生演示活动
+	helpRequests   map[string]HelpRequest
+	transfers      map[string]*FileProgress // 文件传输记录
+	inFiles        map[string]*incoming     // 接收中的学生提交
+	inReservations map[string]incomingReservation
+	fileAcks       map[string]chan FileMsg
+	recvDir        string
+	frameWorkers   map[string]*frameWorker
+	screenWatch    map[string]bool // requested thumbnail subscriptions; includes offline targets
+	castMode       string
+	castTargets    map[string]bool
 }
 
 func NewServer(id Identity, tcpPort int) *Server {
 	return &Server{
-		ID:       id,
-		TCPPort:  tcpPort,
-		devices:  map[string]*Device{},
-		sessions: map[string]*clientConn{},
+		ID:             id,
+		TCPPort:        tcpPort,
+		devices:        map[string]*Device{},
+		sessions:       map[string]*clientConn{},
+		screens:        map[string]ScreenFrame{},
+		transfers:      map[string]*FileProgress{},
+		inFiles:        map[string]*incoming{},
+		inReservations: map[string]incomingReservation{},
+		fileAcks:       map[string]chan FileMsg{},
+		helpRequests:   map[string]HelpRequest{},
+		frameWorkers:   map[string]*frameWorker{},
+		screenWatch:    map[string]bool{},
+		castTargets:    map[string]bool{},
 	}
 }
 
@@ -257,7 +286,6 @@ func (s *Server) discoverLoop(ctx context.Context) {
 
 // ---- TCP 会话 ----
 
-
 func (s *Server) serve(conn net.Conn) {
 	defer conn.Close()
 	sess, err := serverHandshake(conn, s.ID)
@@ -272,6 +300,10 @@ func (s *Server) serve(conn net.Conn) {
 		return
 	}
 	h := m.Hello
+	if h.ID == "" || len(h.ID) > 96 || h.Token == "" || len(h.Token) < 32 || len(h.Token) > 512 || len(h.Name) > 256 || len(h.Label) > 128 {
+		log.Printf("lan: 拒绝无效 hello %v", conn.RemoteAddr())
+		return
+	}
 	cc := &clientConn{sess: sess, devID: h.ID}
 
 	s.mu.Lock()
@@ -279,6 +311,18 @@ func (s *Server) serve(conn net.Conn) {
 	if !ok {
 		d = &Device{ID: h.ID}
 		s.devices[h.ID] = d
+	}
+	tokenHash := sha256.Sum256([]byte(h.Token))
+	if d.TokenHash == "" {
+		// TOFU：首次会话绑定随机客户端 token 的哈希；这并不是 enrollment 审批。
+		d.TokenHash = hex.EncodeToString(tokenHash[:])
+	} else {
+		stored, decodeErr := hex.DecodeString(d.TokenHash)
+		if decodeErr != nil || len(stored) != len(tokenHash) || subtle.ConstantTimeCompare(stored, tokenHash[:]) != 1 {
+			s.mu.Unlock()
+			log.Printf("lan: 拒绝设备 %s：客户端 TOFU token 不匹配", h.ID)
+			return
+		}
 	}
 	d.Name, d.Label, d.IP, d.MAC, d.Version = h.Name, h.Label, h.IP, h.MAC, h.Version
 	d.Online, d.LastSeen = true, time.Now()
@@ -289,6 +333,7 @@ func (s *Server) serve(conn net.Conn) {
 	s.sessions[h.ID] = cc
 	s.mu.Unlock()
 	s.changed()
+	s.syncClientActivities(h.ID)
 
 	log.Printf("lan: %s(%s) 上线 %v", h.Name, h.ID, conn.RemoteAddr())
 
@@ -340,22 +385,56 @@ func (s *Server) handle(cc *clientConn, m Msg) {
 		s.mu.Unlock()
 		log.Printf("lan: 告警 %s %s: %s", cc.devID, m.Alert.Kind, m.Alert.Detail)
 		s.changed()
+	case MsgScreen:
+		if m.Screen != nil {
+			s.onScreen(cc.devID, m.Screen)
+		}
+	case MsgSignReply:
+		if m.Sign != nil {
+			s.onSignReply(cc.devID, m.Sign)
+		}
+	case MsgFile:
+		if m.File != nil {
+			s.onFileMsg(cc.devID, m.File)
+		}
+	case MsgHelp:
+		if m.Help != nil {
+			s.onHelp(cc.devID, m.Help)
+		}
+	case MsgPollReply:
+		if m.Poll != nil {
+			s.onPollReply(cc.devID, m.Poll)
+		}
+	case MsgDemo:
+		if m.Demo != nil {
+			s.onDemo(cc.devID, m.Demo)
+		}
 	}
 }
 
 func (s *Server) offline(id string, cc *clientConn) {
 	s.mu.Lock()
 	// 防止把新会话踢下线
-	if cur := s.sessions[id]; cur == cc {
+	current := s.sessions[id] == cc
+	if current {
 		delete(s.sessions, id)
+		delete(s.screens, id)
 		if d := s.devices[id]; d != nil {
 			d.Online = false
 			d.LastSeen = time.Now()
 		}
+		if worker := s.frameWorkers[id]; worker != nil && worker.cc == cc {
+			worker.cancel()
+			delete(s.frameWorkers, id)
+		}
 	}
 	s.mu.Unlock()
-	s.changed()
-	log.Printf("lan: %s 离线", id)
+	if current {
+		s.cleanupIncomingForDevice(id)
+		s.stopDemoForDevice(id)
+		s.changed()
+		log.Printf("lan: %s 离线", id)
+	}
 }
 
 // sweeper 周期把超时的在线设备标记离线。
@@ -370,17 +449,36 @@ func (s *Server) sweeper(ctx context.Context) {
 		}
 		s.mu.Lock()
 		changed := false
+		var offlineIDs []string
 		for id, d := range s.devices {
 			if d.Online && time.Since(d.LastSeen) > OfflineAfter {
 				d.Online = false
 				changed = true
+				offlineIDs = append(offlineIDs, id)
 				if cc := s.sessions[id]; cc != nil {
 					cc.sess.conn.Close()
 					delete(s.sessions, id)
 				}
+				delete(s.screens, id)
+				if worker := s.frameWorkers[id]; worker != nil {
+					worker.cancel()
+					delete(s.frameWorkers, id)
+				}
 			}
 		}
 		s.mu.Unlock()
+		for _, id := range offlineIDs {
+			s.cleanupIncomingForDevice(id)
+			s.stopDemoForDevice(id)
+		}
+		s.expireIncoming()
+		s.expireClassroomSessions()
+		s.mu.Lock()
+		prunedTransfers := s.pruneTransfersLocked(time.Now())
+		s.mu.Unlock()
+		if prunedTransfers {
+			s.changed()
+		}
 		if changed {
 			s.changed()
 		}

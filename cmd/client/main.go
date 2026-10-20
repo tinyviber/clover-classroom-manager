@@ -1,13 +1,15 @@
-// 机房小助手·客户端（学生机 daemon）。
+// 三叶草局域网课堂管理·客户端（学生机 daemon）。
 //
 // 用法（install.bat 做的事）：
-//   1. 拷贝本 exe + client.json 到受还原保护的安装目录
-//   2. 非还原态运行一次 → 自动生成 id/token 回写 client.json
-//   3. 冻结 → 之后每次开机按配置连管理端；连不上走 UDP 发现兜底
+//  1. 拷贝本 exe + client.json 到受还原保护的安装目录
+//  2. 非还原态运行一次 → 自动生成 id/token 回写 client.json
+//  3. 冻结 → 之后每次用户登录后，在交互会话运行；连不上走 UDP 发现兜底
 //
 // client.json 形如：
-//   {"adminAddr":"192.168.31.1:47823","adminPub":"<b64>","room":"301",
-//    "id":"pc-…","token":"…"}
+//
+//	{"adminAddr":"192.168.31.1:47823","adminPub":"<b64>","room":"301",
+//	 "id":"pc-…","token":"…"}
+//
 // adminAddr/adminPub 均可空（空则纯发现 + TOFU），但建议管理端导出时写上。
 package main
 
@@ -21,7 +23,8 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"lab-assistant/internal/lan"
+	"github.com/tinyviber/clover-classroom-manager/internal/lan"
+	"github.com/tinyviber/clover-classroom-manager/internal/studentui"
 )
 
 func main() {
@@ -41,7 +44,7 @@ func main() {
 	}
 	if cfg.EnsureIdentity() {
 		if err := cfg.Save(*cfgPath); err != nil {
-			log.Printf("警告: 回写配置失败（id/token 未固化）: %v", err)
+			log.Fatalf("客户端身份无法持久化，拒绝启动: %v", err)
 		}
 	}
 	if *printID {
@@ -50,6 +53,12 @@ func main() {
 	}
 
 	a := cfg.ToAgent()
+	userConfig, cfgErr := os.UserConfigDir()
+	if cfgErr != nil || userConfig == "" {
+		userConfig = dir
+	}
+	a.RecvDir = filepath.Join(userConfig, "LabHelper", "Received")
+	lan.CleanIncompleteFiles(a.RecvDir)
 	if a.PinnedPub == nil {
 		log.Printf("agent[%s]: 未 pin 管理端公钥，使用 TOFU（信任第一个应答的信标）", cfg.ID)
 	}
@@ -58,5 +67,8 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if err := studentui.Start(ctx, a); err != nil {
+		log.Printf("agent[%s]: 学生交互页面启动失败: %v", cfg.ID, err)
+	}
 	a.Run(ctx)
 }

@@ -24,6 +24,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 )
 
 var hsMagic = []byte("LABHS001")
@@ -199,18 +200,34 @@ func buildSession(conn net.Conn, shared, transcript []byte, client bool) (*sessi
 
 // send 加密并发出一条 Msg。
 func (s *session) send(v any) error {
+	return s.sendWithTimeout(v, 10*time.Second)
+}
+
+func (s *session) sendWithTimeout(v any, timeout time.Duration) error {
 	pt, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
+	if timeout > 0 {
+		if err := s.conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+			return err
+		}
+		defer s.conn.SetWriteDeadline(time.Time{})
+	}
 	ct := s.enc.Seal(nil, seqNonce(s.seqSend), pt, nil)
 	frame := make([]byte, 4+len(ct))
 	binary.BigEndian.PutUint32(frame, uint32(len(ct)))
 	copy(frame[4:], ct)
-	if _, err := s.conn.Write(frame); err != nil {
+	n, err := s.conn.Write(frame)
+	if err != nil {
+		_ = s.conn.Close()
 		return err
+	}
+	if n != len(frame) {
+		_ = s.conn.Close()
+		return io.ErrShortWrite
 	}
 	s.seqSend++
 	return nil

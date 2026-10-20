@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"lab-assistant/internal/lan"
+	"github.com/tinyviber/clover-classroom-manager/internal/lan"
 )
 
 func TestWriteClientPackage(t *testing.T) {

@@ -13,6 +13,84 @@ export interface AdminInfo {
   dataDir: string;
 }
 
+export interface ClassroomDemo {
+  state: string;
+  sessionId: string;
+  sourceId: string;
+  sourceLabel: string;
+  targetIds: string[];
+  requestedAt: string;
+  err?: string;
+}
+
+export interface ClassroomFileProgress {
+  id: string;
+  deviceId: string;
+  label: string;
+  name: string;
+  size: number;
+  sent: number;
+  done: boolean;
+  in: boolean;
+  err?: string;
+  at: string;
+}
+
+export interface ClassroomHelpRequest {
+  deviceId: string;
+  label: string;
+  name: string;
+  at: string;
+}
+
+export interface ClassroomPoll {
+  open: boolean;
+  id: string;
+  question: string;
+  options: string[];
+  deadline: number;
+  sent: number;
+  targetIds: string[];
+  replies: ClassroomPollReply[];
+}
+
+export interface ClassroomPollReply {
+  deviceId: string;
+  label: string;
+  option: string;
+  at: string;
+}
+
+export interface ClassroomSignIn {
+  open: boolean;
+  id: string;
+  deadline: number;
+  sent: number;
+  targetIds: string[];
+  replies: ClassroomSignReply[];
+  online: number;
+}
+
+export interface ClassroomSignReply {
+  deviceId: string;
+  label: string;
+  name: string;
+  at: string;
+}
+
+/** ClassroomState is the push snapshot for classroom activities. */
+export interface ClassroomState {
+  screens: ScreenFrame[];
+  screenWatchIds: string[];
+  signIn: ClassroomSignIn;
+  files: ClassroomFileProgress[];
+  helps: ClassroomHelpRequest[];
+  poll: ClassroomPoll;
+  demo: ClassroomDemo;
+  castMode: string;
+  castTargetIds: string[];
+}
+
 /** ClientStatus is what the student-side helper window shows about itself. */
 export interface ClientStatus {
   name: string;
@@ -50,6 +128,16 @@ export interface FeatureGroup {
   features: Feature[];
 }
 
+/** ScreenFrame is a base64 JPEG thumbnail for the management view. */
+export interface ScreenFrame {
+  deviceId: string;
+  label: string;
+  name: string;
+  jpeg: string;
+  /** Unix milliseconds */
+  at: number;
+}
+
 // ---- Services ----
 
 /** Lab 是绑定给前端的门面：UI 操作 → LAN 指令下发；LAN 变更 → UI 事件。 */
@@ -62,13 +150,36 @@ export const Lab = {
   applyTemplate(ids: string[], keys: string[]): Promise<number> {
     return call("Lab.ApplyTemplate", ids, keys);
   },
+  castMode(): Promise<string> {
+    return call("Lab.CastMode");
+  },
+  /** CastStart captures the teacher display and sends bounded frames to selected clients. */
+  castStart(mode: string, ids: string[]): Promise<boolean> {
+    return call("Lab.CastStart", mode, ids);
+  },
+  castStop(): Promise<void> {
+    return call("Lab.CastStop");
+  },
   /** Catalog returns the feature checklist definition. */
   catalog(): Promise<FeatureGroup[]> {
     return call("Lab.Catalog");
   },
+  /** ClassroomState returns the current classroom snapshot, including the latest frames. */
+  classroomState(): Promise<ClassroomState> {
+    return call("Lab.ClassroomState");
+  },
   /** ClearAlerts resets a device's alert counter. */
   clearAlerts(id: string): Promise<void> {
     return call("Lab.ClearAlerts", id);
+  },
+  clearHelp(deviceID: string): Promise<void> {
+    return call("Lab.ClearHelp", deviceID);
+  },
+  demoStart(sourceID: string, targetIDs: string[]): Promise<boolean> {
+    return call("Lab.DemoStart", sourceID, targetIDs);
+  },
+  demoStop(): Promise<void> {
+    return call("Lab.DemoStop");
   },
   /** Devices returns the current device list. */
   devices(): Promise<Device[]> {
@@ -89,12 +200,27 @@ export const Lab = {
   exportClientPackage(): Promise<string> {
     return call("Lab.ExportClientPackage");
   },
+  openRecvDir(): Promise<string> {
+    return call("Lab.OpenRecvDir");
+  },
+  pickFiles(): Promise<string[]> {
+    return call("Lab.PickFiles");
+  },
+  pollStart(question: string, options: string[], seconds: number, ids: string[]): Promise<number> {
+    return call("Lab.PollStart", question, options, seconds, ids);
+  },
+  pollStop(): Promise<void> {
+    return call("Lab.PollStop");
+  },
   /**
    * Scan re-discovers devices on the LAN. 发现是被动的（agent 自己找来），
    * 这里只做一次注册表刷新。
    */
   scan(): Promise<Device[]> {
     return call("Lab.Scan");
+  },
+  sendFiles(ids: string[], paths: string[]): Promise<number> {
+    return call("Lab.SendFiles", ids, paths);
   },
   /** SetFeatures replaces the enabled feature set of one device. */
   setFeatures(id: string, keys: string[]): Promise<Device> {
@@ -107,12 +233,22 @@ export const Lab = {
   setHelper(ids: string[], on: boolean): Promise<number> {
     return call("Lab.SetHelper", ids, on);
   },
+  signInStart(seconds: number, ids: string[]): Promise<number> {
+    return call("Lab.SignInStart", seconds, ids);
+  },
+  signInStop(): Promise<void> {
+    return call("Lab.SignInStop");
+  },
   /**
    * Status returns what the client-side helper window should display.
    * 演示：本机扮演 pc-02。
    */
   status(): Promise<ClientStatus> {
     return call("Lab.Status");
+  },
+  /** WatchScreens toggles low-rate thumbnail capture for the selected online devices. */
+  watchScreens(ids: string[], on: boolean): Promise<void> {
+    return call("Lab.WatchScreens", ids, on);
   },
 } as const;
 
@@ -122,4 +258,5 @@ export const Lab = {
 export const events = {
   /** DevicesChanged is pushed to every open window when device state changes. */
   devices: event<Device[]>("devices"),
+  classroom: event<ClassroomState>("classroom"),
 } as const;

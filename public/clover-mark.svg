@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none" role="img" aria-labelledby="title">
+  <title id="title">Clover LAN Classroom Manager</title>
+  <g stroke="#F6FBF7" stroke-width="2.5" stroke-linejoin="round">
+    <path fill="#176B45" d="M64 61C55 52 43 38 43 25 43 13 51 6 64 6s21 7 21 19C85 38 73 52 64 61Z" />
+    <path fill="#278A5D" d="M64 61C55 52 43 38 43 25 43 13 51 6 64 6s21 7 21 19C85 38 73 52 64 61Z" transform="rotate(120 64 64)" />
+    <path fill="#369B61" d="M64 61C55 52 43 38 43 25 43 13 51 6 64 6s21 7 21 19C85 38 73 52 64 61Z" transform="rotate(240 64 64)" />
+  </g>
+  <g stroke="#DDF4E4" stroke-width="4" stroke-linecap="round">
+    <path d="M64 57V33" />
+    <path d="m70 67 21 12" />
+    <path d="M58 67 37 79" />
+  </g>
+  <g fill="#EAF9EE" stroke="#176B45" stroke-width="2">
+    <circle cx="64" cy="29" r="5" />
+    <circle cx="94" cy="81" r="5" />
+    <circle cx="34" cy="81" r="5" />
+  </g>
+  <circle cx="64" cy="64" r="8" fill="#F6FBF7" />
+  <circle cx="64" cy="64" r="3.5" fill="#176B45" />
+</svg>

@@ -8,6 +8,7 @@ package lan
 
 import (
 	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -101,7 +102,20 @@ func (c *AgentConfig) Save(path string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o644)
+	return os.WriteFile(path, b, 0o600)
+}
+
+// DemoToken returns a stable, per-device token for agents spawned inside the
+// management process. It is keyed by the persisted admin identity and is for
+// local demos only; deployed clients must keep their own random client.json token.
+func DemoToken(id Identity, deviceID string) string {
+	if len(id.Priv) != ed25519.PrivateKeySize || deviceID == "" {
+		return ""
+	}
+	h := hmac.New(sha256.New, id.Priv)
+	_, _ = h.Write([]byte("lab-assistant/demo-agent/token/v1\x00"))
+	_, _ = h.Write([]byte(deviceID))
+	return hex.EncodeToString(h.Sum(nil)[:16])
 }
 
 // EnsureIdentity 缺 id/token 时生成（不回写，调用方决定何时 Save）。

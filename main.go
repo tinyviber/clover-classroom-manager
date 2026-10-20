@@ -2,18 +2,27 @@ package main
 
 import (
 	"context"
+	"embed"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/egoist/mygo"
-	"lab-assistant/internal/lan"
+	"github.com/tinyviber/clover-classroom-manager/internal/capture"
+	"github.com/tinyviber/clover-classroom-manager/internal/lan"
 )
+
+// Client package scripts are shared by in-app export and GitHub release bundles.
+//
+//go:embed packaging/windows/client-package/install.bat packaging/windows/client-package/uninstall.bat packaging/windows/client-package/verify-config.ps1 packaging/windows/client-package/README.txt
+var clientPackageAssets embed.FS
 
 // ---- 功能目录 ---------------------------------------------------------------
 
@@ -115,6 +124,99 @@ type Lab struct {
 	srv     *lan.Server
 	dataDir string
 	win     *mygo.Window // 管理端窗口（对话框 parent）
+
+	castMu      sync.Mutex
+	classroomMu sync.Mutex // 序列化教师广播与学生演示的启停/冲突检查。
+	castCancel  context.CancelFunc
+	castMode    string // "" | "fullscreen" | "window"
+	castIDs     []string
+}
+
+// ScreenFrame is a base64 JPEG thumbnail for the management view.
+type ScreenFrame struct {
+	DeviceID string `json:"deviceId"`
+	Label    string `json:"label"`
+	Name     string `json:"name"`
+	JPEG     string `json:"jpeg"`
+	At       int64  `json:"at"` // Unix milliseconds
+}
+
+type ClassroomSignReply struct {
+	DeviceID string `json:"deviceId"`
+	Label    string `json:"label"`
+	Name     string `json:"name"`
+	At       string `json:"at"`
+}
+
+type ClassroomSignIn struct {
+	Open      bool                 `json:"open"`
+	ID        string               `json:"id"`
+	Deadline  int64                `json:"deadline"`
+	Sent      int                  `json:"sent"`
+	TargetIDs []string             `json:"targetIds"`
+	Replies   []ClassroomSignReply `json:"replies"`
+	Online    int                  `json:"online"`
+}
+
+type ClassroomFileProgress struct {
+	ID       string `json:"id"`
+	DeviceID string `json:"deviceId"`
+	Label    string `json:"label"`
+	Name     string `json:"name"`
+	Size     int64  `json:"size"`
+	Sent     int64  `json:"sent"`
+	Done     bool   `json:"done"`
+	In       bool   `json:"in"`
+	Err      string `json:"err,omitempty"`
+	At       string `json:"at"`
+}
+
+type ClassroomHelpRequest struct {
+	DeviceID string `json:"deviceId"`
+	Label    string `json:"label"`
+	Name     string `json:"name"`
+	At       string `json:"at"`
+}
+
+type ClassroomPollReply struct {
+	DeviceID string `json:"deviceId"`
+	Label    string `json:"label"`
+	Option   string `json:"option"`
+	At       string `json:"at"`
+}
+
+type ClassroomPoll struct {
+	Open      bool                 `json:"open"`
+	ID        string               `json:"id"`
+	Question  string               `json:"question"`
+	Options   []string             `json:"options"`
+	Deadline  int64                `json:"deadline"`
+	Sent      int                  `json:"sent"`
+	TargetIDs []string             `json:"targetIds"`
+	Replies   []ClassroomPollReply `json:"replies"`
+}
+
+type ClassroomDemo struct {
+	State       string   `json:"state"`
+	SessionID   string   `json:"sessionId"`
+	SourceID    string   `json:"sourceId"`
+	SourceLabel string   `json:"sourceLabel"`
+	TargetIDs   []string `json:"targetIds"`
+	RequestedAt string   `json:"requestedAt"`
+	Err         string   `json:"err,omitempty"`
+}
+
+// ClassroomState is the push snapshot for classroom activities.
+type ClassroomState struct {
+	Screens        []ScreenFrame           `json:"screens"`
+	ScreenWatchIDs []string                `json:"screenWatchIds"`
+	SignIn         ClassroomSignIn         `json:"signIn"`
+	Files          []ClassroomFileProgress `json:"files"`
+	Helps          []ClassroomHelpRequest  `json:"helps"`
+	Poll           ClassroomPoll           `json:"poll"`
+	Demo           ClassroomDemo           `json:"demo"`
+	CastMode       string                  `json:"castMode"`
+	CastTargetIDs  []string                `json:"castTargetIds"`
 }
 
 // Devices returns the current device list.
@@ -275,75 +377,71 @@ func writeClientPackage(dir string, srv *lan.Server) error {
 	if err := cfg.Save(filepath.Join(dir, "client.json")); err != nil {
 		return err
 	}
-	// agent.exe：优先取已交叉编译的 cmd/client 产物
+	// agent.exe：优先取当前版本的交叉编译产物，再兼容旧路径。
 	agentSrc := ""
-	for _, p := range []string{"./agent.exe", "./build/windows-amd64/agent.exe", "./cmd/client/agent.exe"} {
+	candidates := []string{"./build/windows-amd64/agent.exe", "./cmd/client/agent.exe", "./agent.exe"}
+	if executable, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(executable)
+		candidates = append([]string{filepath.Join(exeDir, "agent.exe"), filepath.Join(exeDir, "build", "windows-amd64", "agent.exe")}, candidates...)
+	}
+	for _, p := range candidates {
 		if _, err := os.Stat(p); err == nil {
 			agentSrc = p
 			break
 		}
 	}
-	agentNote := "agent.exe 未随包导出（未发现已构建的客户端，请先：GOOS=windows go build -o agent.exe ./cmd/client）"
+	agentNote := "agent.exe 未随包导出（未发现已构建的客户端，请先：mkdir -p build/windows-amd64 && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o build/windows-amd64/agent.exe ./cmd/client）"
 	if agentSrc != "" {
 		b, err := os.ReadFile(agentSrc)
-		if err == nil {
-			os.WriteFile(filepath.Join(dir, "agent.exe"), b, 0o755)
-			agentNote = "agent.exe 已随包导出"
+		if err != nil {
+			return fmt.Errorf("读取客户端程序 %s: %w", agentSrc, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "agent.exe"), b, 0o755); err != nil {
+			return fmt.Errorf("写入客户端程序: %w", err)
+		}
+		agentNote = "agent.exe 已随包导出"
+	}
+	for _, name := range []string{"install.bat", "uninstall.bat", "verify-config.ps1"} {
+		if err := writeClientPackageAsset(dir, name); err != nil {
+			return err
 		}
 	}
-	if err := os.WriteFile(filepath.Join(dir, "install.bat"), []byte(installBat), 0o644); err != nil {
+	readme, err := clientPackageAssets.ReadFile("packaging/windows/client-package/README.txt")
+	if err != nil {
 		return err
 	}
-	readme := fmt.Sprintf(`机房小助手·客户端安装包
-========================
-
-【重要】学生机都有还原软件，必须在「非还原/解冻状态」下安装！
-
-步骤：
-  1. 把整个 client-package 拷到学生机（U盘/共享目录）
-  2. 确认还原软件处于解冻状态（手动维护模式）
-  3. 右键 install.bat → 以管理员身份运行
-     - 拷贝 agent.exe + client.json 到 C:\LabHelper
-     - 注册开机自启（计划任务，SYSTEM 权限）
-     - 对安装目录设 ACL（普通用户只读）
-     - 首次运行自动生成机器 id/token 并固化进 client.json
-  4. 重启验证管理端能看到这台机器上线
-  5. 冻结系统（创建还原点）
-
-教师机换了 IP？agent 连不上配置地址时会自动 UDP 广播找管理端，
-公钥匹配即可换地址重连，无需重装。
-
-%s
-`, agentNote)
-	return os.WriteFile(filepath.Join(dir, "README.txt"), []byte(readme), 0o644)
+	readmeText := strings.ReplaceAll(string(readme), "@VERSION@", "随当前管理端版本")
+	readmeText = strings.ReplaceAll(readmeText, "@AGENT_STATUS@", agentNote)
+	return os.WriteFile(filepath.Join(dir, "README.txt"), []byte(readmeText), 0o644)
 }
 
-const installBat = `@echo off
-rem ============================================================
-rem  机房小助手·客户端安装 —— 必须在还原软件解冻状态下运行！
-rem ============================================================
-set DIR=C:\LabHelper
-if not exist %DIR% mkdir %DIR%
-copy /y "%~dp0agent.exe" "%DIR%\agent.exe"
-copy /y "%~dp0client.json" "%DIR%\client.json"
-
-rem 开机自启：SYSTEM 权限计划任务（先于用户登录启动）
-schtasks /create /tn "LabHelper" /tr "\"%DIR%\agent.exe\"" /sc onstart /ru SYSTEM /rl HIGHEST /f
-
-rem 安装目录 ACL：仅 SYSTEM/Administrators 可写，Users 只读执行
-icacls %DIR% /inheritance:r /grant:r "SYSTEM:F" "Administrators:F" /grant:r "Users:RX"
-
-rem 首启固化 id/token，然后启动
-"%DIR%\agent.exe" -id
-start "" "%DIR%\agent.exe"
-
-echo.
-echo 安装完成。确认管理端能看到本机上线后，请创建还原点（冻结）。
-pause
-`
+func writeClientPackageAsset(dir, name string) error {
+	data, err := clientPackageAssets.ReadFile("packaging/windows/client-package/" + name)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, name), data, 0o644)
+}
 
 // DevicesChanged is pushed to every open window when device state changes.
 var DevicesChanged = mygo.NewEvent[[]Device]("devices")
+var ClassroomChanged = mygo.NewEvent[ClassroomState]("classroom")
+
+var classroomPushMu sync.Mutex
+var classroomPushTimer *time.Timer
+
+func scheduleClassroomPush(lab *Lab) {
+	classroomPushMu.Lock()
+	if classroomPushTimer == nil {
+		classroomPushTimer = time.AfterFunc(350*time.Millisecond, func() {
+			classroomPushMu.Lock()
+			classroomPushTimer = nil
+			classroomPushMu.Unlock()
+			broadcastClassroom(lab.ClassroomState())
+		})
+	}
+	classroomPushMu.Unlock()
+}
 
 // ---- 组装 --------------------------------------------------------------------
 
@@ -360,20 +458,32 @@ func seedRegistry(srv *lan.Server) {
 			Label:    fmt.Sprintf("A-%02d", i),
 			IP:       fmt.Sprintf("192.168.31.%d", 100+i),
 			MAC:      fmt.Sprintf("54:EE:75:0A:1B:%02X", i),
-			Version:  "13.1",
+			Version:  "0.0.2",
 			Features: append([]string{}, core...),
 			HelperOn: true,
 		})
 	}
 }
 
-// spawnDemoAgents 在进程内跑一批 loopback agent，让管理端吃到真实协议数据。
-// LAB_DEMO_AGENTS=0 可关闭。
-func spawnDemoAgents(ctx context.Context, srv *lan.Server) {
+func demoAgentCount() int {
 	raw := os.Getenv("LAB_DEMO_AGENTS")
-	n, _ := strconv.Atoi(raw)
 	if raw == "" {
-		n = 21 // 默认 21 台，留 3 台离线
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		if err != nil {
+			log.Printf("LAB_DEMO_AGENTS 无效，演示设备已关闭: %v", err)
+		}
+		return 0
+	}
+	return n
+}
+
+// spawnDemoAgents 在进程内跑一批 loopback agent，让管理端吃到真实协议数据。
+func spawnDemoAgents(ctx context.Context, srv *lan.Server, n int) {
+	if n <= 0 {
+		return
 	}
 	offline := map[int]bool{11: true, 15: true, 20: true}
 	helperOff := map[int]bool{4: true, 9: true}
@@ -385,6 +495,7 @@ func spawnDemoAgents(ctx context.Context, srv *lan.Server) {
 		a.Label = fmt.Sprintf("A-%02d", i)
 		a.IP = fmt.Sprintf("192.168.31.%d", 100+i)
 		a.MAC = fmt.Sprintf("54:EE:75:0A:1B:%02X", i)
+		a.Token = lan.DemoToken(srv.ID, a.ID)
 		a.PinnedPub = srv.ID.Pub()
 		a.DirectAddr = fmt.Sprintf("127.0.0.1:%d", srv.TCPPort)
 		if helperOff[i] {
@@ -419,7 +530,13 @@ func main() {
 	}
 	srv := lan.NewServer(id, lan.TCPPort)
 	srv.SetPersistPath(filepath.Join(dataDir, "registry.json"))
-	if len(srv.Devices()) == 0 {
+	recvDir := filepath.Join(dataDir, "received")
+	if err := os.MkdirAll(recvDir, 0o700); err != nil {
+		log.Fatal(err)
+	}
+	srv.SetRecvDir(recvDir)
+	demoAgents := demoAgentCount()
+	if len(srv.Devices()) == 0 && demoAgents > 0 {
 		seedRegistry(srv) // 首启种子；之后以持久化注册表为准
 	}
 	lab := &Lab{srv: srv, dataDir: dataDir}
@@ -428,13 +545,17 @@ func main() {
 	if err := srv.Run(ctx); err != nil {
 		log.Fatal(err)
 	}
-	srv.OnChange = func() { broadcast(lab.Devices()) }
-	spawnDemoAgents(ctx, srv)
+	srv.OnChange = func() {
+		broadcast(lab.Devices())
+		scheduleClassroomPush(lab)
+	}
+	srv.OnScreens = func() { scheduleClassroomPush(lab) }
+	spawnDemoAgents(ctx, srv, demoAgents)
 
 	mygo.Bind(lab)
 	mygo.App.WhenReady(func() {
 		lab.win = mygo.NewWindow(mygo.WindowOptions{
-			Title:           "机房小助手 · 管理端",
+			Title:           "三叶草局域网课堂管理 · 管理端",
 			Width:           1080,
 			Height:          720,
 			MinWidth:        860,
@@ -444,7 +565,7 @@ func main() {
 			BackgroundColor: "light-dark(#f4f4f6, #1a1a1e)",
 		})
 		mygo.NewWindow(mygo.WindowOptions{
-			Title:           "机房小助手",
+			Title:           "三叶草局域网课堂管理",
 			Width:           400,
 			Height:          560,
 			MinWidth:        360,
@@ -463,4 +584,236 @@ func broadcast(devs []Device) {
 	for _, w := range mygo.Windows() {
 		DevicesChanged.Emit(w, devs)
 	}
+}
+
+func broadcastClassroom(state ClassroomState) {
+	for _, w := range mygo.Windows() {
+		ClassroomChanged.Emit(w, state)
+	}
+}
+
+// ---- v0.0.2：屏幕墙 / 广播 / 签到 / 文件 / 课堂互动 ---------------------------
+
+// ClassroomState returns the current classroom snapshot, including the latest frames.
+func (l *Lab) ClassroomState() ClassroomState {
+	frames := l.srv.Screens()
+	state := ClassroomState{
+		Screens:        make([]ScreenFrame, 0, len(frames)),
+		ScreenWatchIDs: l.srv.ScreenWatchTargets(),
+		Files:          make([]ClassroomFileProgress, 0),
+		Helps:          make([]ClassroomHelpRequest, 0),
+		CastMode:       l.CastMode(),
+		CastTargetIDs:  l.srv.CastTargets(),
+	}
+	for _, frame := range frames {
+		state.Screens = append(state.Screens, ScreenFrame{
+			DeviceID: frame.DeviceID,
+			Label:    frame.Label,
+			Name:     frame.Name,
+			JPEG:     base64.StdEncoding.EncodeToString(frame.JPEG),
+			At:       frame.At.UnixMilli(),
+		})
+	}
+	sort.Slice(state.Screens, func(i, j int) bool { return state.Screens[i].Label < state.Screens[j].Label })
+
+	sign := l.srv.SignInState()
+	state.SignIn = ClassroomSignIn{
+		Open: sign.Open, ID: sign.ID, Deadline: sign.Deadline,
+		Sent: sign.Sent, TargetIDs: append([]string{}, sign.TargetIDs...),
+		Online: sign.Online, Replies: make([]ClassroomSignReply, 0, len(sign.Replies)),
+	}
+	for _, reply := range sign.Replies {
+		state.SignIn.Replies = append(state.SignIn.Replies, ClassroomSignReply{
+			DeviceID: reply.DeviceID, Label: reply.Label, Name: reply.Name, At: activityTime(reply.At),
+		})
+	}
+
+	for _, transfer := range l.srv.FileTransfers() {
+		state.Files = append(state.Files, ClassroomFileProgress{
+			ID: transfer.ID, DeviceID: transfer.DeviceID, Label: transfer.Label, Name: transfer.Name,
+			Size: transfer.Size, Sent: transfer.Sent, Done: transfer.Done, In: transfer.In,
+			Err: transfer.Err, At: activityTime(transfer.At),
+		})
+	}
+	for _, request := range l.srv.HelpRequests() {
+		state.Helps = append(state.Helps, ClassroomHelpRequest{
+			DeviceID: request.DeviceID, Label: request.Label, Name: request.Name, At: activityTime(request.At),
+		})
+	}
+
+	poll := l.srv.PollState()
+	state.Poll = ClassroomPoll{
+		Open: poll.Open, ID: poll.ID, Question: poll.Question, Options: append([]string{}, poll.Options...),
+		Deadline: poll.Deadline, Sent: poll.Sent, TargetIDs: append([]string{}, poll.TargetIDs...),
+		Replies: make([]ClassroomPollReply, 0, len(poll.Replies)),
+	}
+	for _, reply := range poll.Replies {
+		state.Poll.Replies = append(state.Poll.Replies, ClassroomPollReply{
+			DeviceID: reply.DeviceID, Label: reply.Label, Option: reply.Option, At: activityTime(reply.At),
+		})
+	}
+
+	demo := l.srv.DemoState()
+	state.Demo = ClassroomDemo{
+		State: demo.State, SessionID: demo.SessionID, SourceID: demo.SourceID,
+		SourceLabel: demo.SourceLabel, TargetIDs: append([]string{}, demo.TargetIDs...),
+		RequestedAt: activityTime(demo.RequestedAt), Err: demo.Err,
+	}
+	return state
+}
+
+func activityTime(at time.Time) string {
+	if at.IsZero() {
+		return ""
+	}
+	return at.UTC().Format(time.RFC3339Nano)
+}
+
+// WatchScreens toggles low-rate thumbnail capture for the selected online devices.
+func (l *Lab) WatchScreens(ids []string, on bool) {
+	l.srv.SetScreenWatch(ids, on)
+	scheduleClassroomPush(l)
+}
+
+// CastStart captures the teacher display and sends bounded frames to selected clients.
+func (l *Lab) CastStart(mode string, ids []string) bool {
+	l.classroomMu.Lock()
+	defer l.classroomMu.Unlock()
+	if mode != "window" && mode != "fullscreen" {
+		return false
+	}
+	if demo := l.srv.DemoState(); demo.State == "pending" || demo.State == "active" {
+		return false
+	}
+	targets := l.srv.OnlineIDs(ids)
+	if len(targets) == 0 {
+		return false
+	}
+	l.castMu.Lock()
+	oldIDs := append([]string(nil), l.castIDs...)
+	if l.castCancel != nil {
+		l.castCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	l.castCancel, l.castMode, l.castIDs = cancel, mode, targets
+	l.castMu.Unlock()
+	l.srv.SetCastState(mode, targets)
+	if len(oldIDs) > 0 {
+		l.srv.Broadcast(lan.Msg{Type: lan.MsgCommand, Cmd: &lan.CommandMsg{
+			ID: fmt.Sprintf("cast-stop-%d", time.Now().UnixNano()), Op: lan.OpCastStop,
+		}}, oldIDs)
+	}
+	l.srv.StopCastFrames(oldIDs)
+	l.srv.Broadcast(lan.Msg{Type: lan.MsgCommand, Cmd: &lan.CommandMsg{
+		ID: fmt.Sprintf("cast-start-%d", time.Now().UnixNano()), Op: lan.OpCastStart,
+		Args: lan.CastStartArgs{Mode: mode},
+	}}, targets)
+	go l.castLoop(ctx, mode, targets)
+	scheduleClassroomPush(l)
+	return true
+}
+
+func (l *Lab) CastStop() {
+	l.classroomMu.Lock()
+	defer l.classroomMu.Unlock()
+	l.castMu.Lock()
+	cancel, ids := l.castCancel, append([]string(nil), l.castIDs...)
+	l.castCancel, l.castMode, l.castIDs = nil, "", nil
+	l.castMu.Unlock()
+	l.srv.SetCastState("", nil)
+	if cancel != nil {
+		cancel()
+	}
+	l.srv.StopCastFrames(ids)
+	if len(ids) > 0 {
+		l.srv.Broadcast(lan.Msg{Type: lan.MsgCommand, Cmd: &lan.CommandMsg{
+			ID: fmt.Sprintf("cast-stop-%d", time.Now().UnixNano()), Op: lan.OpCastStop,
+		}}, ids)
+	}
+	scheduleClassroomPush(l)
+}
+
+func (l *Lab) CastMode() string {
+	l.castMu.Lock()
+	defer l.castMu.Unlock()
+	return l.castMode
+}
+
+func (l *Lab) castLoop(ctx context.Context, mode string, targets []string) {
+	t := time.NewTicker(500 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		jpeg, err := capture.FrameMode(mode, 800, 45)
+		if err != nil {
+			continue
+		}
+		l.srv.QueueCastFrame(targets, jpeg)
+	}
+}
+
+func (l *Lab) SignInStart(seconds int, ids []string) int {
+	_, sent := l.srv.OpenSignIn(seconds, ids)
+	return sent
+}
+
+func (l *Lab) SignInStop() { l.srv.CloseSignIn() }
+
+func (l *Lab) PickFiles() []string {
+	paths, _ := mygo.Dialog.Open(mygo.OpenDialogOptions{
+		Parent: l.win, Title: "选择要分发的文件", Multiple: true,
+	})
+	return paths
+}
+
+func (l *Lab) SendFiles(ids []string, paths []string) int {
+	n := 0
+	for _, path := range paths {
+		n += l.srv.SendFile(ids, path)
+	}
+	return n
+}
+
+func (l *Lab) OpenRecvDir() string {
+	dir := l.srv.RecvDir()
+	if dir != "" {
+		mygo.Shell.OpenPath(dir)
+	}
+	return dir
+}
+
+func (l *Lab) PollStart(question string, options []string, seconds int, ids []string) int {
+	_, sent, err := l.srv.StartPoll(question, options, seconds, ids)
+	if err != nil {
+		log.Printf("lab: 发起随堂投票失败: %v", err)
+		return 0
+	}
+	return sent
+}
+
+func (l *Lab) PollStop() { l.srv.StopPoll() }
+
+func (l *Lab) ClearHelp(deviceID string) { l.srv.ClearHelp(deviceID) }
+
+func (l *Lab) DemoStart(sourceID string, targetIDs []string) bool {
+	l.classroomMu.Lock()
+	defer l.classroomMu.Unlock()
+	if l.CastMode() != "" {
+		return false
+	}
+	if _, err := l.srv.StartDemo(sourceID, targetIDs); err != nil {
+		log.Printf("lab: 发起学生演示失败: %v", err)
+		return false
+	}
+	return true
+}
+
+func (l *Lab) DemoStop() {
+	l.classroomMu.Lock()
+	defer l.classroomMu.Unlock()
+	l.srv.StopDemo()
 }

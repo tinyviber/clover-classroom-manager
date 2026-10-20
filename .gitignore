@@ -2,6 +2,7 @@ node_modules/
 /dist/
 /build/
 /.mygo/
+/.serena/
 mygo_windows_*.syso
 agent.exe
 /release/
