@@ -3,6 +3,7 @@ package lan
 import (
 	"context"
 	"fmt"
+	"net"
 	"testing"
 	"time"
 )
@@ -74,6 +75,67 @@ func TestRoundTrip(t *testing.T) {
 	// clientHandshake 会因签名不匹配失败 → session 不建立，server 无设备
 	if err := bad.session(ctx, bad.DirectAddr, bad.PinnedPub); err == nil {
 		t.Fatal("伪造公钥的握手竟成功了")
+	}
+}
+
+// 组播广播端到端：切片发送 → 加入组 → 重组解密回原帧（走本机组播回环）。
+func TestCastMulticastRoundTrip(t *testing.T) {
+	p, err := NewCastSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender, err := NewCastSender(p, nil)
+	if err != nil {
+		t.Skipf("本机无法建组播发送端: %v", err)
+	}
+	defer sender.Close()
+	rcv, err := JoinCast(p)
+	if err != nil {
+		t.Skipf("本机无法加入组播组: %v", err)
+	}
+	defer rcv.Close()
+
+	got := make(chan []byte, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rcv.Run(ctx, func(jpeg []byte) { got <- jpeg })
+
+	// 发一帧横跨多个分片的假 JPEG（GCM 密文，对端重组+解密校验）。
+	frame := make([]byte, castChunkLen*3+777)
+	for i := range frame {
+		frame[i] = byte(i * 31)
+	}
+	// 默认路由口不通时（VPN/热点网卡禁组播）退回回环口再试。
+	if _, err := sender.Send(frame); err != nil {
+		sender.Close()
+		if sender, err = NewCastSender(p, net.ParseIP("127.0.0.1")); err != nil {
+			t.Skipf("回环组播发送端也建不起来: %v", err)
+		}
+		if _, err := sender.Send(frame); err != nil {
+			t.Skipf("本机没有可用的组播出口: %v", err)
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := sender.Send(frame); err != nil {
+			t.Fatalf("组播发送失败: %v", err)
+		}
+		select {
+		case jpeg := <-got:
+			if len(jpeg) != len(frame) {
+				t.Fatalf("帧长不符: %d != %d", len(jpeg), len(frame))
+			}
+			for i := range jpeg {
+				if jpeg[i] != frame[i] {
+					t.Fatalf("帧内容在 %d 处不符", i)
+				}
+			}
+			return
+		case <-time.After(200 * time.Millisecond):
+			if time.Now().After(deadline) {
+				t.Fatal("组播帧 5s 内未收到")
+			}
+		}
 	}
 }
 

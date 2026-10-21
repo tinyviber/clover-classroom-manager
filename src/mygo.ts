@@ -89,15 +89,7 @@ export interface ClassroomState {
   demo: ClassroomDemo;
   castMode: string;
   castTargetIds: string[];
-}
-
-/** ClientStatus is what the student-side helper window shows about itself. */
-export interface ClientStatus {
-  name: string;
-  label: string;
-  ip: string;
-  helperOn: boolean;
-  features: string[];
+  castQuality: string;
 }
 
 /** Device 是给 UI 的设备视图。 */
@@ -153,7 +145,15 @@ export const Lab = {
   castMode(): Promise<string> {
     return call("Lab.CastMode");
   },
-  /** CastStart captures the teacher display and sends bounded frames to selected clients. */
+  /** CastSetQuality 切换广播画质档；广播中途改也即时生效。 */
+  castSetQuality(level: string): Promise<void> {
+    return call("Lab.CastSetQuality", level);
+  },
+  /**
+   * CastStart 开始对所选学生机的屏幕广播：
+   * 组播会话（UDP，AES-GCM 帧）为主，组播失败的客户端自动走 TCP 兜底。
+   * 已广播时调用即切换模式（全屏⇄窗口）。
+   */
   castStart(mode: string, ids: string[]): Promise<boolean> {
     return call("Lab.CastStart", mode, ids);
   },
@@ -175,6 +175,10 @@ export const Lab = {
   clearHelp(deviceID: string): Promise<void> {
     return call("Lab.ClearHelp", deviceID);
   },
+  /** CollectFiles 让所选学生机弹出「提交文件」请求（托盘气泡 + 互动页）。 */
+  collectFiles(ids: string[]): Promise<number> {
+    return call("Lab.CollectFiles", ids);
+  },
   demoStart(sourceID: string, targetIDs: string[]): Promise<boolean> {
     return call("Lab.DemoStart", sourceID, targetIDs);
   },
@@ -186,19 +190,16 @@ export const Lab = {
     return call("Lab.Devices");
   },
   /**
-   * Exit checks the admin password before disabling the local helper.
-   * Mock password: 123456.
-   */
-  exit(password: string): Promise<boolean> {
-    return call("Lab.Exit", password);
-  },
-  /**
    * ExportClientPackage 生成学生机安装包到所选目录，返回实际输出路径。
    * 含 client.json（已写入管理端地址+公钥）、install.bat、README.txt，
    * 以及 agent.exe（若已用 GOOS=windows go build ./cmd/client 构建过）。
    */
   exportClientPackage(): Promise<string> {
     return call("Lab.ExportClientPackage");
+  },
+  /** FocusAdmin 唤起管理端主窗口（悬浮条的「显示管理端」按钮）。 */
+  focusAdmin(): Promise<void> {
+    return call("Lab.FocusAdmin");
   },
   openRecvDir(): Promise<string> {
     return call("Lab.OpenRecvDir");
@@ -238,13 +239,6 @@ export const Lab = {
   },
   signInStop(): Promise<void> {
     return call("Lab.SignInStop");
-  },
-  /**
-   * Status returns what the client-side helper window should display.
-   * 演示：本机扮演 pc-02。
-   */
-  status(): Promise<ClientStatus> {
-    return call("Lab.Status");
   },
   /** WatchScreens toggles low-rate thumbnail capture for the selected online devices. */
   watchScreens(ids: string[], on: boolean): Promise<void> {

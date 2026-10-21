@@ -41,24 +41,31 @@ type Agent struct {
 
 	// OnCommand 可选钩子：自定义指令处理。返回 false 表示已由 agent 内置处理。
 	OnCommand func(CommandMsg) bool
+	// OnPrompt 可选钩子：有新的课堂互动（"signin"/"poll"/"demo"/"collect"）待学生处理。
+	// 静默运行的客户端用它做气泡通知 + 唤起互动窗口。
+	OnPrompt func(kind, session string)
+	// OnConn 可选钩子：管理端会话建立/断开。
+	OnConn func(connected bool)
 
 	helperOn atomic.Bool
 	features atomic.Value // []string
 
-	cur         atomic.Pointer[session] // 当前会话（SubmitFile 用）
-	watchMu     sync.Mutex
-	watchOff    context.CancelFunc
-	demoOff     context.CancelFunc
-	inFiles     map[string]*incoming
-	inMu        sync.Mutex
-	outMu       sync.Mutex
-	outgoing    map[string]chan FileMsg
-	uiMu        sync.Mutex
-	signPrompt  *SignInOpenArgs
-	pollPrompt  *PollOpenArgs
-	demoPrompt  *DemoRequestArgs
-	demoSession string
-	helpRaised  bool
+	cur           atomic.Pointer[session] // 当前会话（SubmitFile 用）
+	watchMu       sync.Mutex
+	watchOff      context.CancelFunc
+	demoOff       context.CancelFunc
+	castOff       context.CancelFunc // 组播接收循环取消
+	inFiles       map[string]*incoming
+	inMu          sync.Mutex
+	outMu         sync.Mutex
+	outgoing      map[string]chan FileMsg
+	uiMu          sync.Mutex
+	signPrompt    *SignInOpenArgs
+	pollPrompt    *PollOpenArgs
+	demoPrompt    *DemoRequestArgs
+	collectPrompt *CollectOpenArgs
+	demoSession   string
+	helpRaised    bool
 }
 
 // NewAgent 构造一个默认全开防护的 agent。
@@ -173,14 +180,15 @@ func (a *Agent) session(ctx context.Context, addr string, pub ed25519.PublicKey)
 	if err != nil {
 		return err
 	}
-	a.cur.Store(sess)
 	defer func() {
 		a.cur.Store(nil)
+		a.emitConn(false)
 		a.stopWatch()
 		a.stopDemoStream()
+		a.stopCast()
 		a.abortIncoming()
 		a.uiMu.Lock()
-		a.signPrompt, a.pollPrompt, a.demoPrompt = nil, nil, nil
+		a.signPrompt, a.pollPrompt, a.demoPrompt, a.collectPrompt = nil, nil, nil, nil
 		a.demoSession, a.helpRaised = "", false
 		a.uiMu.Unlock()
 		castview.Close()
@@ -199,6 +207,10 @@ func (a *Agent) session(ctx context.Context, addr string, pub ed25519.PublicKey)
 	if err := a.pushStatus(sess); err != nil {
 		return err
 	}
+	// hello 之后再公开当前会话：抢跑窗口期的 SubmitFile 等
+	// 在服务端见到 hello 前发包会被直接断连。
+	a.cur.Store(sess)
+	a.emitConn(true)
 
 	done := make(chan struct{})
 	defer close(done)
@@ -240,7 +252,7 @@ func (a *Agent) session(ctx context.Context, addr string, pub ed25519.PublicKey)
 			}
 		case MsgCast:
 			if m.Cast != nil {
-				if jpeg, err := base64.StdEncoding.DecodeString(m.Cast.JPEG); err == nil && len(jpeg) <= 700<<10 {
+				if jpeg, err := base64.StdEncoding.DecodeString(m.Cast.JPEG); err == nil && len(jpeg) <= MaxCastJPEG {
 					castview.Frame(jpeg)
 				}
 			}
@@ -282,12 +294,19 @@ func (a *Agent) handleCmd(s *session, c CommandMsg) {
 		var args CastStartArgs
 		if b, _ := json.Marshal(c.Args); json.Unmarshal(b, &args) == nil {
 			if args.Mode == "window" || args.Mode == "fullscreen" {
-				castview.Show(args.Mode)
+				if err := a.startCast(s, args); err != nil {
+					// 组播不可用 → 回 "tcp"，管理端把这机标记为 TCP 兜底
+					ack.Detail = "tcp"
+				}
 			} else {
 				ack.OK, ack.Err = false, "无效的广播模式"
+				ack.Detail = "tcp" // 拒绝广播也走兜底，不留黑屏
 			}
+		} else {
+			ack.Detail = "tcp" // 参数解不开：退到 TCP 也不留黑屏
 		}
 	case OpCastStop:
+		a.stopCast()
 		castview.Close()
 	case OpSignInOpen:
 		var args SignInOpenArgs
@@ -295,6 +314,7 @@ func (a *Agent) handleCmd(s *session, c CommandMsg) {
 			a.uiMu.Lock()
 			a.signPrompt = &args
 			a.uiMu.Unlock()
+			a.emitPrompt("signin", args.Session)
 		}
 	case OpSignInClose:
 		a.uiMu.Lock()
@@ -317,17 +337,27 @@ func (a *Agent) handleCmd(s *session, c CommandMsg) {
 			a.uiMu.Lock()
 			a.pollPrompt = &args
 			a.uiMu.Unlock()
+			a.emitPrompt("poll", args.Session)
 		}
 	case OpPollClose:
 		a.uiMu.Lock()
 		a.pollPrompt = nil
 		a.uiMu.Unlock()
+	case OpCollectOpen:
+		var args CollectOpenArgs
+		if b, _ := json.Marshal(c.Args); json.Unmarshal(b, &args) == nil && args.Session != "" {
+			a.uiMu.Lock()
+			a.collectPrompt = &args
+			a.uiMu.Unlock()
+			a.emitPrompt("collect", args.Session)
+		}
 	case OpDemoRequest:
 		var args DemoRequestArgs
 		if b, _ := json.Marshal(c.Args); json.Unmarshal(b, &args) == nil && args.Session != "" {
 			a.uiMu.Lock()
 			a.demoPrompt = &args
 			a.uiMu.Unlock()
+			a.emitPrompt("demo", args.Session)
 		}
 	case OpDemoStart:
 		var args DemoStartArgs
@@ -344,6 +374,7 @@ func (a *Agent) handleCmd(s *session, c CommandMsg) {
 			}
 		}
 	case OpDemoViewer:
+		a.stopCast()
 		castview.Show("window")
 	case OpDemoStop:
 		a.uiMu.Lock()
@@ -383,10 +414,12 @@ func localIP(c net.Conn) string {
 	return ""
 }
 
-// DefaultLabel 从计算机名取后段作机器编号（- 后两位，如 LAB301-PC07 → A-07）。
+// DefaultLabel 从计算机名取后段作机器编号（去掉 PC 前缀，如 LAB301-PC07 → A-07）。
 func DefaultLabel(name string) string {
 	if i := strings.LastIndex(name, "-"); i >= 0 && i < len(name)-1 {
-		return "A-" + name[i+3:]
+		if suffix := strings.TrimPrefix(name[i+1:], "PC"); suffix != "" {
+			return "A-" + suffix
+		}
 	}
 	return name
 }
@@ -411,15 +444,21 @@ type StudentDemoPrompt struct {
 	TargetLabels []string `json:"targetLabels"`
 }
 
+// StudentCollectPrompt 收取文件请求（学生提交一个文件给管理端）。
+type StudentCollectPrompt struct {
+	Session string `json:"session"`
+}
+
 type StudentUIState struct {
-	Connected   bool               `json:"connected"`
-	Name        string             `json:"name"`
-	Label       string             `json:"label"`
-	SignIn      *StudentSignPrompt `json:"signIn,omitempty"`
-	Poll        *StudentPollPrompt `json:"poll,omitempty"`
-	HelpRaised  bool               `json:"helpRaised"`
-	Demo        *StudentDemoPrompt `json:"demo,omitempty"`
-	DemoRunning bool               `json:"demoRunning"`
+	Connected   bool                   `json:"connected"`
+	Name        string                 `json:"name"`
+	Label       string                 `json:"label"`
+	SignIn      *StudentSignPrompt     `json:"signIn,omitempty"`
+	Poll        *StudentPollPrompt     `json:"poll,omitempty"`
+	Collect     *StudentCollectPrompt  `json:"collect,omitempty"`
+	HelpRaised  bool                   `json:"helpRaised"`
+	Demo        *StudentDemoPrompt     `json:"demo,omitempty"`
+	DemoRunning bool                   `json:"demoRunning"`
 }
 
 func (a *Agent) StudentState() StudentUIState {
@@ -440,6 +479,9 @@ func (a *Agent) StudentState() StudentUIState {
 			Session: copy.Session, TargetIDs: append([]string(nil), copy.TargetIDs...),
 			TargetLabels: append([]string(nil), copy.TargetLabels...),
 		}
+	}
+	if a.collectPrompt != nil {
+		state.Collect = &StudentCollectPrompt{Session: a.collectPrompt.Session}
 	}
 	return state
 }
@@ -640,6 +682,90 @@ func (a *Agent) stopDemoStream() {
 	a.watchMu.Unlock()
 }
 
+// emitConn / emitPrompt 触发可选钩子（不持锁，避免回环）。
+func (a *Agent) emitConn(on bool) {
+	if f := a.OnConn; f != nil {
+		f(on)
+	}
+}
+
+func (a *Agent) emitPrompt(kind, session string) {
+	if f := a.OnPrompt; f != nil {
+		f(kind, session)
+	}
+}
+
+// startCast 开始接收一次广播：有组播参数就加入组播组收 UDP 帧，
+// 返回错误时调用方应回 "tcp" 让管理端走 TCP 兜底。
+// 加入成功但始终收不到完整帧（网络吞组播）时，4s 后上报 cast_tcp
+// 告警让管理端把本机改走 TCP 兜底。
+func (a *Agent) startCast(s *session, args CastStartArgs) error {
+	a.stopCast()
+	castview.Show(args.Mode)
+	if args.Group == "" {
+		return nil // 纯 TCP 广播，帧走 MsgCast
+	}
+	key, err := base64.StdEncoding.DecodeString(args.Key)
+	if err != nil {
+		return err
+	}
+	rcv, err := JoinCast(CastSessionParams{
+		Group: args.Group, Port: args.Port, Session: args.Session, Key: key,
+	})
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	a.watchMu.Lock()
+	a.castOff = cancel
+	a.watchMu.Unlock()
+	var lastFrame atomic.Int64 // 最近一次完整解码帧的时间戳
+	lastFrame.Store(time.Now().UnixNano())
+	go func() {
+		rcv.Run(ctx, func(jpeg []byte) {
+			lastFrame.Store(time.Now().UnixNano())
+			castview.Frame(jpeg)
+		})
+		rcv.Close()
+	}()
+	// 滚动看门狗：静止画面也有 ≤5s 的组播心跳帧；连续 ~10s 收不到
+	// 完整帧说明组播断流（丢片整帧丢、IGMP 老化等）→ 上报一次
+	// cast_tcp 让管理端把本机改走 TCP，并停掉组播接收避免双路收帧。
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			if time.Since(time.Unix(0, lastFrame.Load())) <= 10*time.Second {
+				continue
+			}
+			_ = s.send(Msg{Type: MsgAlert, Alert: &AlertMsg{
+				Kind: "cast_tcp", Detail: "已加入组播但收不到广播帧",
+			}})
+			a.stopCast()
+			return
+		}
+	}()
+	return nil
+}
+
+// StopCast 停止组播接收（学生端「退出广播」按钮经 castview.OnExit 调它）。
+func (a *Agent) StopCast() { a.stopCast() }
+
+// stopCast 退出组播组（不断言 viewer 状态，调用方管 castview）。
+func (a *Agent) stopCast() {
+	a.watchMu.Lock()
+	if a.castOff != nil {
+		a.castOff()
+		a.castOff = nil
+	}
+	a.watchMu.Unlock()
+}
+
 func (a *Agent) onFileDown(s *session, msg FileMsg) {
 	if msg.Phase == "ready" || msg.Phase == "complete" || msg.Phase == "error" || msg.Phase == "progress" {
 		a.outMu.Lock()
@@ -820,6 +946,9 @@ func (a *Agent) SubmitFile(path string, displayName ...string) error {
 			}
 			return fmt.Errorf("%s", result.Err)
 		}
+		a.uiMu.Lock()
+		a.collectPrompt = nil // 提交完成，收取请求视为已响应
+		a.uiMu.Unlock()
 		return nil
 	case <-time.After(transferWait(info.Size())):
 		return fmt.Errorf("等待管理端完成回执超时")

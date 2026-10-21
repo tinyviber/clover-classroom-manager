@@ -90,8 +90,15 @@ type Server struct {
 	recvDir        string
 	frameWorkers   map[string]*frameWorker
 	screenWatch    map[string]bool // requested thumbnail subscriptions; includes offline targets
-	castMode       string
-	castTargets    map[string]bool
+	cast           *serverCast     // 当前教师广播会话（nil=未广播）
+}
+
+// serverCast 是一次屏幕广播：组播主通道 + TCP 兜底目标集合。
+type serverCast struct {
+	args    CastStartArgs   // 下发给客户端的会话参数；Group=="" 表示纯 TCP
+	sender  *CastSender     // 组播发送端（nil 表示管理端侧也组播不出去）
+	targets map[string]bool // 全部目标（含离线，重连恢复用）
+	tcpOnly map[string]bool // 组播加入失败、改走 TCP 的目标
 }
 
 func NewServer(id Identity, tcpPort int) *Server {
@@ -108,7 +115,6 @@ func NewServer(id Identity, tcpPort int) *Server {
 		helpRequests:   map[string]HelpRequest{},
 		frameWorkers:   map[string]*frameWorker{},
 		screenWatch:    map[string]bool{},
-		castTargets:    map[string]bool{},
 	}
 }
 
@@ -372,10 +378,25 @@ func (s *Server) handle(cc *clientConn, m Msg) {
 			return
 		}
 		if ch, ok := cc.pending.Load(m.Ack.ID); ok {
-			ch.(chan AckMsg) <- *m.Ack
+			select {
+			case ch.(chan AckMsg) <- *m.Ack:
+			default: // 重复 ack 不阻塞读循环
+			}
 		}
 	case MsgAlert:
 		if m.Alert == nil {
+			return
+		}
+		if m.Alert.Kind == "cast_tcp" {
+			// 组播帧收不到：把这机改走 TCP 兜底，不计入纪律告警。
+			// 已是 TCP 兜底的目标重复上报直接忽略（告警可被伪造）。
+			s.mu.Lock()
+			dup := s.cast != nil && s.cast.tcpOnly[cc.devID]
+			s.mu.Unlock()
+			if !dup {
+				s.MarkCastTCP(cc.devID)
+				log.Printf("lan: %s 组播收不到帧，改走 TCP 兜底", cc.devID)
+			}
 			return
 		}
 		s.mu.Lock()

@@ -241,23 +241,92 @@ func (s *Server) ScreenWatchTargets() []string {
 	return sortedIDs(s.screenWatch)
 }
 
-// SetCastState stores the teacher broadcast activity so a reconnecting target
-// can reopen its viewer. The caller remains responsible for broadcasting the
-// actual start/stop command and streaming frames.
-func (s *Server) SetCastState(mode string, ids []string) {
+// StartCast 开一次广播会话：尝试起组播发送端（失败则整局退回纯 TCP），
+// 记录目标集合供断线重连恢复。调用方随后对每台目标机
+// SendCommand(OpCastStart, CastArgs(id))。
+func (s *Server) StartCast(p CastSessionParams, mode string, ids []string) {
 	if mode != "window" && mode != "fullscreen" {
-		mode, ids = "", nil
+		return
+	}
+	args := CastStartArgs{Mode: mode}
+	var sender *CastSender
+	if p.Group != "" {
+		if cs, err := NewCastSender(p, nil); err == nil {
+			sender = cs
+			args.Group = p.Group
+			args.Port = p.Port
+			args.Session = p.Session
+			args.Key = base64.StdEncoding.EncodeToString(p.Key)
+		}
 	}
 	s.mu.Lock()
-	s.castMode = mode
-	s.castTargets = make(map[string]bool, len(ids))
-	if mode != "" {
-		for _, id := range normalizeIDs(ids) {
-			s.castTargets[id] = true
+	if s.cast != nil && s.cast.sender != nil {
+		s.cast.sender.Close() // 防重复调用泄漏旧发送端
+	}
+	s.cast = &serverCast{
+		args:    args,
+		sender:  sender,
+		targets: map[string]bool{},
+		tcpOnly: map[string]bool{},
+	}
+	for _, id := range normalizeIDs(ids) {
+		s.cast.targets[id] = true
+		if sender == nil {
+			s.cast.tcpOnly[id] = true // 管理端组播不出去 → 全员 TCP
 		}
 	}
 	s.mu.Unlock()
 	s.changed()
+}
+
+// StopCast 关闭当前广播会话并返回旧目标集合（调用方负责逐个发 cast.stop）。
+func (s *Server) StopCast() []string {
+	s.mu.Lock()
+	old := s.cast
+	s.cast = nil
+	s.mu.Unlock()
+	if old == nil {
+		return nil
+	}
+	if old.sender != nil {
+		old.sender.Close()
+	}
+	s.mu.Lock()
+	for id := range old.tcpOnly {
+		if w := s.frameWorkers[id]; w != nil {
+			w.cancel()
+			delete(s.frameWorkers, id)
+		}
+	}
+	s.mu.Unlock()
+	s.changed()
+	return sortedIDs(old.targets)
+}
+
+// CastArgs 返回当前广播要下发给某台客户端的会话参数；id 不在目标里则 false。
+// 已标 TCP 兜底的目标下发剥离组播参数的 args（Group="" → 客户端纯 TCP），
+// 避免重连恢复时又加入组播造成双路收帧。
+func (s *Server) CastArgs(id string) (CastStartArgs, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cast == nil || !s.cast.targets[id] {
+		return CastStartArgs{}, false
+	}
+	args := s.cast.args
+	if s.cast.tcpOnly[id] {
+		args.Group, args.Key, args.Session, args.Port = "", "", 0, 0
+	}
+	return args, true
+}
+
+// CastMode 返回当前广播模式（"" = 未广播）。
+func (s *Server) CastMode() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cast == nil {
+		return ""
+	}
+	return s.cast.args.Mode
 }
 
 // CastTargets returns targets in the active teacher broadcast, including
@@ -265,10 +334,42 @@ func (s *Server) SetCastState(mode string, ids []string) {
 func (s *Server) CastTargets() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.castMode == "" {
+	if s.cast == nil {
 		return []string{}
 	}
-	return sortedIDs(s.castTargets)
+	return sortedIDs(s.cast.targets)
+}
+
+// MarkCastTCP 标记某台目标机改走 TCP 兜底（组播加入失败/丢包时）。
+func (s *Server) MarkCastTCP(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cast != nil && s.cast.targets[id] {
+		s.cast.tcpOnly[id] = true
+	}
+}
+
+// CastFrame 分发一帧广播：组播一次性发出 + 只对 TCP 兜底目标逐个排队。
+func (s *Server) CastFrame(jpeg []byte) {
+	s.mu.Lock()
+	cast := s.cast
+	s.mu.Unlock()
+	if cast == nil {
+		return
+	}
+	if cast.sender != nil {
+		// UDP 尽力投递；单帧失败不影响后续
+		_, _ = cast.sender.Send(jpeg)
+	}
+	s.mu.Lock()
+	tcpIDs := make([]string, 0, len(cast.tcpOnly))
+	for id := range cast.tcpOnly {
+		if _, ok := s.sessions[id]; ok {
+			tcpIDs = append(tcpIDs, id)
+		}
+	}
+	s.mu.Unlock()
+	s.QueueCastFrame(tcpIDs, jpeg)
 }
 
 // Screens returns an immutable snapshot of the most recent frame per device.
@@ -569,10 +670,6 @@ func (s *Server) syncClientActivities(deviceID string) {
 	}
 	_, raised := s.helpRequests[deviceID]
 	watch := s.screenWatch[deviceID]
-	castMode := ""
-	if s.castTargets[deviceID] {
-		castMode = s.castMode
-	}
 	s.mu.Unlock()
 
 	if signArgs != nil {
@@ -599,10 +696,22 @@ func (s *Server) syncClientActivities(deviceID string) {
 	s.sendMsg(deviceID, Msg{Type: MsgCommand, Cmd: &CommandMsg{
 		ID: fmt.Sprintf("watch-%d", s.cmdSeq.Add(1)), Op: OpScreenWatch, Args: ScreenWatchArgs{On: watch},
 	}})
-	if castMode != "" {
-		s.sendMsg(deviceID, Msg{Type: MsgCommand, Cmd: &CommandMsg{
-			ID: fmt.Sprintf("cast-%d", s.cmdSeq.Add(1)), Op: OpCastStart, Args: CastStartArgs{Mode: castMode},
-		}})
+	// 广播恢复要走 SendCommand 等 ack：客户端组播加入失败会回 "tcp" 明细，
+	// 届时把它标记为 TCP 兜底目标。异步派发，不阻塞 serve 读循环。
+	if args, ok := s.CastArgs(deviceID); ok {
+		go func() {
+			ack, err := s.SendCommand(deviceID, OpCastStart, args)
+			if err != nil || !ack.OK || ack.Detail == "tcp" {
+				s.MarkCastTCP(deviceID)
+			}
+			// 发送期间广播可能已结束/换会话：复查，失效则补 cast.stop，
+			// 否则客户端会守着僵尸组播与全屏窗。
+			if _, still := s.CastArgs(deviceID); !still {
+				s.sendMsg(deviceID, Msg{Type: MsgCommand, Cmd: &CommandMsg{
+					ID: fmt.Sprintf("cast-%d", s.cmdSeq.Add(1)), Op: OpCastStop,
+				}})
+			}
+		}()
 	} else {
 		s.sendMsg(deviceID, Msg{Type: MsgCommand, Cmd: &CommandMsg{
 			ID: fmt.Sprintf("cast-%d", s.cmdSeq.Add(1)), Op: OpCastStop,
@@ -1274,6 +1383,7 @@ func (s *Server) expireClassroomSessions() {
 	now := time.Now().Unix()
 	s.mu.Lock()
 	var signTargets, pollTargets []string
+	var demoExpired *demoState
 	if s.sign != nil && !s.sign.closed && s.sign.deadline > 0 && now >= s.sign.deadline {
 		s.sign.closed = true
 		signTargets = sortedIDs(s.sign.recipients)
@@ -1282,7 +1392,19 @@ func (s *Server) expireClassroomSessions() {
 		s.poll.closed = true
 		pollTargets = sortedIDs(s.poll.recipients)
 	}
+	// 学生 60s 未响应演示请求视为拒绝：否则 pending 会一直卡住广播。
+	if s.demo != nil && s.demo.State == "pending" && time.Since(s.demo.RequestedAt) > 60*time.Second {
+		s.demo.State, s.demo.Err = "", "学生未响应演示请求"
+		demoExpired = s.demo
+	}
 	s.mu.Unlock()
+	if demoExpired != nil {
+		// 清掉学生端残留的待响应提示。
+		s.sendMsg(demoExpired.SourceID, Msg{Type: MsgCommand, Cmd: &CommandMsg{
+			ID: fmt.Sprintf("demo-%d", s.cmdSeq.Add(1)), Op: OpDemoStop,
+		}})
+		s.changed()
+	}
 	if signTargets != nil {
 		s.Broadcast(Msg{Type: MsgCommand, Cmd: &CommandMsg{ID: fmt.Sprintf("signin-%d", s.cmdSeq.Add(1)), Op: OpSignInClose}}, signTargets)
 		s.changed()
@@ -1321,6 +1443,9 @@ func (s *Server) pruneTransfersLocked(now time.Time) bool {
 	}
 	return changed
 }
+
+// NormalizeIDs 去空去重并保持顺序；nil/空输入返回 nil。
+func NormalizeIDs(ids []string) []string { return normalizeIDs(ids) }
 
 func normalizeIDs(ids []string) []string {
 	if ids == nil {

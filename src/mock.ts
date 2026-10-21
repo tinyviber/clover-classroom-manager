@@ -1,6 +1,6 @@
 // 浏览器预览 mock：页面不在 MyGo 窗口里运行时（如用 vite 单独调试样式），
 // 用与 main.go 相同的假数据替代 Lab 绑定，让界面可交互。
-import type { ClassroomState, ClientStatus, Device, FeatureGroup } from "./mygo";
+import type { ClassroomState, Device, FeatureGroup } from "./mygo";
 
 export const catalog: FeatureGroup[] = [
   {
@@ -99,6 +99,7 @@ const state = {
     demo: { state: "", sessionId: "", sourceId: "", sourceLabel: "", targetIds: [], requestedAt: "", err: "" },
     castMode: "",
     castTargetIds: [],
+    castQuality: "better",
   } as ClassroomState,
   watching: new Set<string>(),
   screenTimer: 0,
@@ -196,6 +197,12 @@ export const mockLab = {
     return true;
   },
   async castStop() { state.classroom.castMode = ""; state.classroom.castTargetIds = []; emitClassroom(); },
+  async castSetQuality(level: string) { state.classroom.castQuality = level; emitClassroom(); },
+  async collectFiles(ids: string[]) {
+    const targets = state.devices.filter((device) => device.online && ids.includes(device.id));
+    return targets.length;
+  },
+  async focusAdmin() {},
   async signInStart(seconds: number, ids: string[]) {
     const online = state.devices.filter((device) => device.online && (!ids.length || ids.includes(device.id)));
     state.classroom.signIn = {
@@ -293,15 +300,6 @@ export const mockLab = {
     return n;
   },
   async scan() { return [...state.devices]; },
-  async status(): Promise<ClientStatus> {
-    const d = state.devices[1]!;
-    return { name: d.name, label: d.label, ip: d.ip, helperOn: d.helperOn, features: [...d.features] };
-  },
-  async exit(password: string) {
-    if (password !== "123456") return false;
-    await this.setHelper(["pc-02"], false);
-    return true;
-  },
   onDevices(cb: (d: Device[]) => void) {
     listeners.add(cb);
     return () => listeners.delete(cb);

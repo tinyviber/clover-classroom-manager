@@ -21,8 +21,8 @@ bun run build          # 打包各平台安装包到 build/（mygo 无 cgo，可
                        # 例：bunx mygo build -platform windows/amd64 → build/windows-amd64/lab-assistant.exe）
 go test ./...          # 后端测试（lan 协议端到端 + 安装包导出）
 mkdir -p build/windows-amd64
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o build/windows-amd64/agent.exe ./cmd/client
-                       # 交叉编译学生机 agent（导出安装包会带上它）
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -H windowsgui" -o build/windows-amd64/agent.exe ./cmd/client
+                       # 交叉编译学生机 agent（-H windowsgui 无控制台窗口；导出安装包会带上它）
 ```
 
 `.github/workflows/windows-release.yml` 在 `main`/`master` push 和 PR 时构建校验；推送 `v*` 标签时，
@@ -33,9 +33,15 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o build/windows-amd64/agent.ex
 
 - `main.go` — `Lab` 服务（`mygo.Bind` 暴露给前端）：设备列表、功能目录、
   批量启停 `SetHelper`、单机勾选 `SetFeatures`、模板套用 `ApplyTemplate`、
-  扫描 `Scan`、客户端状态 `Status`、密码退出 `Exit`、分发 `AdminInfo`/`ExportClientPackage`。
-  全部经 `lan.Server.SendCommand` 下发到在线 agent；注册表变化经
-  `srv.OnChange` → `DevicesChanged` 事件推给所有窗口。
+  扫描 `Scan`、课堂快照 `ClassroomState`、屏幕墙 `WatchScreens`、广播
+  `CastStart`/`CastStop`/`CastSetQuality`、签到 `SignInStart/Stop`、
+  分发 `SendFiles`/`PickFiles`/`OpenRecvDir`、收文件 `CollectFiles`、
+  投票 `PollStart/Stop`、求助 `ClearHelp`、学生演示 `DemoStart/Stop`、
+  分发 `AdminInfo`/`ExportClientPackage`、`FocusAdmin`（悬浮条唤起主窗）。
+  广播开始时主窗最小化并弹出 `castbar.html` 悬浮条（Panel 无边框小窗），
+  管理端常驻系统托盘（三叶草图标）。全部经 `lan.Server.SendCommand`
+  下发到在线 agent；注册表变化经 `srv.OnChange` → `DevicesChanged` /
+  `ClassroomChanged` 事件推给所有窗口。
   `spawnDemoAgents` 可在进程内跑 loopback agent；默认关闭，设置
   `LAB_DEMO_AGENTS=21` 显式开启 21 个演示客户端。
 - `internal/lan/` — 局域网协议层（真实实现，可直接跨机部署）：
@@ -46,17 +52,41 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o build/windows-amd64/agent.ex
   - `server.go` 管理端：UDP :47822 应答发现、TCP :47823 接客户端、
     设备注册表持久化（registry.json，1s 防抖原子写）、`SendCommand` 等 Ack
   - `agent.go` 学生机 agent：UDP 广播发现（或直接 `AdminAddr`）→ 握手
-    （pin 管理端公钥，空则 TOFU）→ hello → 3s 心跳 + 指令执行
+    （pin 管理端公钥，空则 TOFU）→ hello → 3s 心跳 + 指令执行；
+    `OnPrompt`/`OnConn` 钩子供托盘气泡与按需唤起互动页
+  - `mcast.go` 屏幕广播组播通道（仿极域）：教师端把 AES-256-GCM 加密帧
+    切片组播到 239.42.4.23:47824，一次发送全班接收；每数据报另附
+    HMAC-SHA256 截断 tag（HKDF 派生密钥），伪造分片无法污染重组器；
+    会话参数（组/端口/会话号/密钥）经 TCP 控制通道随 `cast.start` 下发；
+    组播加入失败的客户端回 "tcp"、加入后 ~10s 收不到帧的发 `cast_tcp`
+    告警，都由 `frames.go` 的单槽队列改走 TCP 单播兜底，缺片整帧丢弃
+  - `frames.go` TCP 兜底广播帧分发（每客户端单槽队列，慢端不积压）
+  - `extras.go` 屏幕墙/广播/签到/文件/投票/演示的服务端状态与恢复逻辑
   - `config.go` `AgentConfig`（client.json：adminAddr/adminPub/token/id/room）
     与持久化辅助；`netinfo.go` 本机 IPv4 枚举
   - `sockopt_{unix,windows}.go` 平台 socket 选项（Windows 的 SetsockoptInt 签名不同）
-- `cmd/client/main.go` — 学生机无头 agent 入口：读 client.json（相对 exe，
-  找不到则回落 exe 旁→工作目录），`-id` 只生成身份后退出，供 install.bat 首启固化。
-- `index.html` + `src/main.tsx` + `src/admin/` — React 管理端 UI：设备列表、课堂控制、屏幕墙与客户端分发。
-- `client.html` + `src/client-entry.tsx` + `src/client/` — React 学生端状态窗。
+- `internal/capture/` — 屏幕捕获（robotgo）：`Grab`/`Encode`（画质档参数）
+  与 `Fingerprinter` 画面指纹（静止桌面跳帧，广播心跳 4s 一保）
+- `internal/castview/` — 学生机原生广播画面：`viewer_windows.go` Win32
+  全屏/窗口渲染 + 顶部悬浮工具条（模式切换/退出），其他平台为 no-op
+- `internal/trayicon/` — agent 用无 cgo Win32 系统托盘（菜单/气泡/提示），
+  `trayicon_stub.go` 为非 Windows 平台 no-op；`clover.ico` embed 进 exe
+- `internal/studentui/` — 学生本机回环 HTTP 互动页（签到/投票/举手/
+  演示确认/提交文件）：服务常驻但**不自动开浏览器**，`UI.Open()` 按需唤起
+  （托盘菜单或新课堂活动气泡）；loopback + token 双重校验
+- `cmd/client/main.go` — 学生机静默 agent 入口（GUI 子系统，无控制台）：
+  读 client.json → 日志写 `%LOCALAPPDATA%\LabHelper\agent.log` →
+  命名互斥体单实例 → 系统托盘（三叶草）+ 气泡通知 → `studentui` 按需唤起。
+  `-id` 只打印身份后退出，供 install.bat 首启固化。
+- `index.html` + `src/main.tsx` + `src/admin/` — React 管理端 UI：
+  课堂宫格（预览+选择+快捷工具条，`ClassroomView.tsx`）、设备列表与客户端分发。
+- `castbar.html` + `src/castbar-entry.tsx` + `src/castbar/` — 管理端广播
+  悬浮条页（仿极域顶栏：模式切换/画质/管理端/退出，`--app-region` 拖动）。
 - `src/components/ui/` — shadcn/ui Base Nova 组件；`src/index.css` — 共用主题与布局令牌。
 - `src/api.ts` — MyGo 绑定与浏览器 mock 的单一 API 边界；`src/store.ts` — Zustand 跨视图状态。
 - `src/mock.ts` — 无 MyGo runtime 时（浏览器调试）的假数据。
+- `tools/genicon/` — 三叶草图标生成器（resources/icon.png、tray*.png、
+  internal/trayicon/clover.ico）；`resources/` 为应用与托盘图标。
 
 ## 数据目录（持久化）
 
@@ -77,7 +107,8 @@ Windows `%AppData%\lab-assistant`。
 学生机：**解冻状态下** 管理员运行 `install.bat` →
 校验 `client.json` 中的管理端 Ed25519 公钥 → 拷到 `C:\LabHelper` →
 写入登录启动项并收紧目录 ACL（Users 只读）→ 首启固化身份 →
-用户登录后客户端运行并打开课堂交互页 → 管理端看到上线后创建还原点冻结。
+用户登录后 agent.exe 静默驻留系统托盘（三叶草图标，无窗口无终端）→
+管理端看到上线后创建还原点冻结。
 
 教师机换 IP：agent 连不上 `adminAddr` 时回退 UDP 广播发现，公钥匹配即重连，
 无需重装；换管理端密钥则需重新导出安装包。

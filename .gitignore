@@ -7,3 +7,8 @@ mygo_windows_*.syso
 agent.exe
 /release/
 .playwright-mcp/
+
+# local build outputs
+/client
+/clover-classroom-manager
+/lab-assistant

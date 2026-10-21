@@ -47,7 +47,7 @@ jobs:
       - name: Build client agent
         run: |
           mkdir -p build/client-agent
-          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build/client-agent/agent.exe ./cmd/client
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -H windowsgui" -o build/client-agent/agent.exe ./cmd/client
 
       - name: Assemble release assets
         shell: bash

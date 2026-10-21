@@ -21,6 +21,18 @@ import (
 
 const maxUpload = lan.MaxStudentUploadSize
 
+// UI 是学生互动页面的句柄：服务常驻但页面按需唤起（托盘菜单/新课堂活动）。
+type UI struct {
+	srv *server
+}
+
+// Open 在当前登录会话里唤起互动页（已有页面时浏览器聚焦/复用同地址）。
+func (u *UI) Open() {
+	if err := openBrowser(u.srv.origin + "/"); err != nil {
+		log.Printf("student UI: open %s in a browser (%v)", u.srv.origin, err)
+	}
+}
+
 type server struct {
 	agent       *lan.Agent
 	token       string
@@ -28,15 +40,16 @@ type server struct {
 	uploadSlots chan struct{}
 }
 
-func Start(ctx context.Context, agent *lan.Agent) error {
+// Start 起本机回环 HTTP 服务（不再自动开浏览器——静默客户端按需要 Open）。
+func Start(ctx context.Context, agent *lan.Agent) (*UI, error) {
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	tokenBytes := make([]byte, 24)
 	if _, err := rand.Read(tokenBytes); err != nil {
 		_ = listener.Close()
-		return err
+		return nil, err
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
 	origin := fmt.Sprintf("http://127.0.0.1:%d", port)
@@ -68,12 +81,7 @@ func Start(ctx context.Context, agent *lan.Agent) error {
 		defer cancel()
 		_ = httpServer.Shutdown(shutdownCtx)
 	}()
-	url := origin + "/"
-	log.Printf("student UI: open %s in the logged-in user's browser", url)
-	if err := openBrowser(url); err != nil {
-		log.Printf("student UI: open this address in a browser: %s (%v)", url, err)
-	}
-	return nil
+	return &UI{srv: ui}, nil
 }
 
 func (s *server) page(w http.ResponseWriter, r *http.Request) {
@@ -264,7 +272,7 @@ const studentPage = `<!doctype html>
 <section id="poll" class="card hidden"><h2 id="pollQuestion"></h2><div id="pollOptions"></div><div id="pollDeadline" class="muted"></div></section>
 <section id="demo" class="card hidden"><h2>学生演示请求</h2><div id="demoText" class="muted"></div><div class="actions"><button id="demoAccept">同意并开始</button><button id="demoDecline" class="secondary">拒绝</button><button id="demoStop" class="danger hidden">停止我的演示</button></div></section>
 <section class="card"><h2>需要老师帮助？</h2><div class="muted">举手后老师会在管理端看到你的设备编号。</div><div class="actions"><button id="helpButton">举手求助</button></div></section>
-<section class="card"><h2>提交文件</h2><div class="muted">选择一份不超过 128 MiB 的文件发送给老师。</div><div class="actions"><label class="file-label">选择并提交文件<input id="file" type="file"></label></div></section>
+<section id="collectCard" class="card"><h2>提交文件</h2><div id="collectHint" class="muted">选择一份不超过 128 MiB 的文件发送给老师。</div><div class="actions"><label class="file-label">选择并提交文件<input id="file" type="file"></label></div></section>
 <div id="status" class="status" role="status"></div><div class="foot">此页面仅在本机登录会话中运行。屏幕演示需你明确同意，老师或你都可以停止。</div>
 <script>
 const token="__LAB_TOKEN__",$=id=>document.getElementById(id);let state={},signId="",pollId="",demoId="";
@@ -276,6 +284,7 @@ const si=s.signIn&&!expired(s.signIn.deadline);$("signin").classList.toggle("hid
 const p=s.poll&&!expired(s.poll.deadline);$("poll").classList.toggle("hidden",!p);if(p){$("pollQuestion").textContent=s.poll.question;$("pollDeadline").textContent=s.poll.deadline?"请在截止前选择":"请选择一个选项";if(pollId!==s.poll.session){pollId=s.poll.session;const box=$("pollOptions");box.replaceChildren(...s.poll.options.map(option=>{const b=document.createElement("button");b.className="option";b.textContent=option;b.onclick=async()=>{try{await api("/api/poll",{session:pollId,option});msg("投票已提交");box.querySelectorAll("button").forEach(x=>x.disabled=true)}catch(e){msg(e.message)}};return b}))}}
 const hasPrompt=!!s.demo, running=s.demoRunning;$("demo").classList.toggle("hidden",!hasPrompt&&!running);$("demoAccept").classList.toggle("hidden",!hasPrompt);$("demoDecline").classList.toggle("hidden",!hasPrompt);$("demoStop").classList.toggle("hidden",!running);const recipients=s.demo?(s.demo.targetLabels||[]).join("、")||(s.demo.targetIds||[]).join("、"):"";$("demoText").textContent=running?"你的屏幕正在以低帧率只读分享。":"老师请求你向以下接收设备演示屏幕："+(recipients||"接收设备")+"。只有你同意后才会开始。";if(hasPrompt&&demoId!==s.demo.session){demoId=s.demo.session;$("demoAccept").onclick=async()=>{try{await api("/api/demo",{session:demoId,accept:true});msg("已同意演示，正在连接接收端")}catch(e){msg(e.message)}};$("demoDecline").onclick=async()=>{try{await api("/api/demo",{session:demoId,accept:false});msg("已拒绝演示请求")}catch(e){msg(e.message)}}}
 $("helpButton").textContent=s.helpRaised?"已举手，等待老师":"举手求助";$("helpButton").disabled=s.helpRaised||!s.connected;
+if(s.collect){$("collectHint").textContent="老师正在收取文件，请选择一个文件提交给老师（不超过 128 MiB）。";$("collectCard").style.borderColor="#3549a2";$("collectCard").style.boxShadow="0 2px 14px #3549a222"}else{$("collectHint").textContent="选择一份不超过 128 MiB 的文件发送给老师。";$("collectCard").style.borderColor="";$("collectCard").style.boxShadow=""}
 }
 async function refresh(){try{render(await api("/api/state"))}catch(e){$("connection").textContent="本机页面连接中断"}}
 $("helpButton").onclick=async()=>{try{await api("/api/help",{});msg("已通知老师");await refresh()}catch(e){msg(e.message)}};

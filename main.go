@@ -8,10 +8,12 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/egoist/mygo"
@@ -23,6 +25,14 @@ import (
 //
 //go:embed packaging/windows/client-package/install.bat packaging/windows/client-package/uninstall.bat packaging/windows/client-package/verify-config.ps1 packaging/windows/client-package/README.txt
 var clientPackageAssets embed.FS
+
+// 三叶草托盘图标（tools/genicon 生成）。
+//
+//go:embed resources/tray.png
+var trayIconPNG []byte
+
+//go:embed resources/tray-template.png
+var trayIconTemplatePNG []byte
 
 // ---- 功能目录 ---------------------------------------------------------------
 
@@ -102,15 +112,6 @@ type Device struct {
 	LastSeen string   `json:"lastSeen"`
 }
 
-// ClientStatus is what the student-side helper window shows about itself.
-type ClientStatus struct {
-	Name     string   `json:"name"`
-	Label    string   `json:"label"`
-	IP       string   `json:"ip"`
-	HelperOn bool     `json:"helperOn"`
-	Features []string `json:"features"`
-}
-
 func toView(d lan.Device) Device {
 	return Device{
 		ID: d.ID, Name: d.Name, Label: d.Label, IP: d.IP, MAC: d.MAC,
@@ -128,8 +129,8 @@ type Lab struct {
 	castMu      sync.Mutex
 	classroomMu sync.Mutex // 序列化教师广播与学生演示的启停/冲突检查。
 	castCancel  context.CancelFunc
-	castMode    string // "" | "fullscreen" | "window"
-	castIDs     []string
+	castQuality string // 画质档："perfect"|"better"|"normal"|"low"
+	castBar     *mygo.Window // 广播悬浮控制条（Panel 小窗）
 }
 
 // ScreenFrame is a base64 JPEG thumbnail for the management view.
@@ -217,6 +218,7 @@ type ClassroomState struct {
 	Demo           ClassroomDemo           `json:"demo"`
 	CastMode       string                  `json:"castMode"`
 	CastTargetIDs  []string                `json:"castTargetIds"`
+	CastQuality    string                  `json:"castQuality"`
 }
 
 // Devices returns the current device list.
@@ -293,29 +295,6 @@ func (l *Lab) ClearAlerts(id string) { l.srv.ClearAlerts(id) }
 // Scan re-discovers devices on the LAN. 发现是被动的（agent 自己找来），
 // 这里只做一次注册表刷新。
 func (l *Lab) Scan() []Device { return l.Devices() }
-
-// Status returns what the client-side helper window should display.
-// 演示：本机扮演 pc-02。
-func (l *Lab) Status() ClientStatus {
-	d, ok := l.srv.GetDevice("pc-02")
-	if !ok {
-		return ClientStatus{Name: "LAB301-PC02", Label: "A-02"}
-	}
-	return ClientStatus{
-		Name: d.Name, Label: d.Label, IP: d.IP,
-		HelperOn: d.HelperOn, Features: d.Features,
-	}
-}
-
-// Exit checks the admin password before disabling the local helper.
-// Mock password: 123456.
-func (l *Lab) Exit(password string) bool {
-	if password != "123456" {
-		return false
-	}
-	l.SetHelper([]string{"pc-02"}, false)
-	return true
-}
 
 // ---- 分发 --------------------------------------------------------------------
 
@@ -564,16 +543,35 @@ func main() {
 			StateKey:        "admin",
 			BackgroundColor: "light-dark(#f4f4f6, #1a1a1e)",
 		})
-		mygo.NewWindow(mygo.WindowOptions{
-			Title:           "三叶草局域网课堂管理",
-			Width:           400,
-			Height:          560,
-			MinWidth:        360,
-			MinHeight:       480,
-			URL:             "/client.html",
-			StateKey:        "client",
-			BackgroundColor: "light-dark(#f4f4f6, #1a1a1e)",
+		// 托盘常驻应用：关主窗只隐藏不销毁，否则 FocusAdmin/托盘/悬浮条
+		// 的「管理端」全变成死按钮（窗口销毁后 Show/Focus 是 no-op）。
+		// 退出走托盘菜单的 Quit。
+		lab.win.OnClose(func(e *mygo.CloseEvent) {
+			e.PreventDefault()
+			lab.win.Hide()
 		})
+		// 三叶草托盘图标（macOS 用模板剪影着色，Windows/Linux 用彩色）。
+		icon, template := trayIconPNG, false
+		if runtime.GOOS == "darwin" {
+			icon, template = trayIconTemplatePNG, true
+		}
+		tray, err := mygo.NewTray(mygo.TrayOptions{
+			Icon:           icon,
+			IconIsTemplate: template,
+			ToolTip:        "三叶草课堂管理 · 管理端",
+			Menu: mygo.NewMenu([]*mygo.MenuItem{
+				{ID: "show", Label: "显示管理端", Click: func(_ *mygo.MenuItem, _ *mygo.Window) {
+					lab.FocusAdmin()
+				}},
+				mygo.Separator(),
+				{Role: mygo.RoleQuit},
+			}),
+		})
+		if err != nil {
+			log.Printf("lab: 托盘图标创建失败: %v", err)
+		} else {
+			tray.OnClick(func() { lab.FocusAdmin() })
+		}
 	})
 	if err := mygo.App.Run(); err != nil {
 		log.Fatal(err)
@@ -588,6 +586,13 @@ func broadcast(devs []Device) {
 
 func broadcastClassroom(state ClassroomState) {
 	for _, w := range mygo.Windows() {
+		if w.IsPanel() {
+			// 悬浮条只关心广播状态，不推整屏 base64（每次 ~1-2MB）。
+			light := state
+			light.Screens = nil
+			ClassroomChanged.Emit(w, light)
+			continue
+		}
 		ClassroomChanged.Emit(w, state)
 	}
 }
@@ -604,6 +609,7 @@ func (l *Lab) ClassroomState() ClassroomState {
 		Helps:          make([]ClassroomHelpRequest, 0),
 		CastMode:       l.CastMode(),
 		CastTargetIDs:  l.srv.CastTargets(),
+		CastQuality:    l.quality(),
 	}
 	for _, frame := range frames {
 		state.Screens = append(state.Screens, ScreenFrame{
@@ -675,7 +681,38 @@ func (l *Lab) WatchScreens(ids []string, on bool) {
 	scheduleClassroomPush(l)
 }
 
-// CastStart captures the teacher display and sends bounded frames to selected clients.
+// 广播画质档（仿极域四档画质）：分辨率上限 / JPEG 质量 / 采帧间隔。
+// 帧画面没变化时跳过发送（见 capture.Fingerprinter），静止桌面流量趋近零。
+var castQualityLevels = map[string]capture.Params{
+	"perfect": {MaxWidth: 0, Quality: 82, IntervalMs: 350},    // 极好：原生分辨率
+	"better":  {MaxWidth: 1920, Quality: 72, IntervalMs: 450}, // 较好
+	"normal":  {MaxWidth: 1440, Quality: 58, IntervalMs: 600}, // 普通
+	"low":     {MaxWidth: 960, Quality: 42, IntervalMs: 800},  // 低质（弱网/教学提醒用）
+}
+
+func (l *Lab) quality() string {
+	l.castMu.Lock()
+	defer l.castMu.Unlock()
+	if l.castQuality == "" {
+		l.castQuality = "better"
+	}
+	return l.castQuality
+}
+
+// CastSetQuality 切换广播画质档；广播中途改也即时生效。
+func (l *Lab) CastSetQuality(level string) {
+	if _, ok := castQualityLevels[level]; !ok {
+		return
+	}
+	l.castMu.Lock()
+	l.castQuality = level
+	l.castMu.Unlock()
+	scheduleClassroomPush(l)
+}
+
+// CastStart 开始对所选学生机的屏幕广播：
+// 组播会话（UDP，AES-GCM 帧）为主，组播失败的客户端自动走 TCP 兜底。
+// 已广播时调用即切换模式（全屏⇄窗口）。
 func (l *Lab) CastStart(mode string, ids []string) bool {
 	l.classroomMu.Lock()
 	defer l.classroomMu.Unlock()
@@ -685,30 +722,65 @@ func (l *Lab) CastStart(mode string, ids []string) bool {
 	if demo := l.srv.DemoState(); demo.State == "pending" || demo.State == "active" {
 		return false
 	}
-	targets := l.srv.OnlineIDs(ids)
-	if len(targets) == 0 {
+	online := l.srv.OnlineIDs(ids)
+	if len(online) == 0 {
 		return false
 	}
+	// 目标集合记全量选择（含离线）：离线的设备重连时会被补发广播。
+	targets := lan.NormalizeIDs(ids)
+	if len(targets) == 0 {
+		targets = online
+	}
+
 	l.castMu.Lock()
-	oldIDs := append([]string(nil), l.castIDs...)
 	if l.castCancel != nil {
 		l.castCancel()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	l.castCancel, l.castMode, l.castIDs = cancel, mode, targets
+	l.castCancel = cancel
 	l.castMu.Unlock()
-	l.srv.SetCastState(mode, targets)
-	if len(oldIDs) > 0 {
+
+	oldIDs := l.srv.StopCast() // 结束旧会话（含组播发送端与兜底 worker）
+	stale := make([]string, 0, len(oldIDs))
+	for _, id := range oldIDs {
+		if !contains(targets, id) {
+			stale = append(stale, id)
+		}
+	}
+	if len(stale) > 0 {
 		l.srv.Broadcast(lan.Msg{Type: lan.MsgCommand, Cmd: &lan.CommandMsg{
 			ID: fmt.Sprintf("cast-stop-%d", time.Now().UnixNano()), Op: lan.OpCastStop,
-		}}, oldIDs)
+		}}, stale)
 	}
-	l.srv.StopCastFrames(oldIDs)
-	l.srv.Broadcast(lan.Msg{Type: lan.MsgCommand, Cmd: &lan.CommandMsg{
-		ID: fmt.Sprintf("cast-start-%d", time.Now().UnixNano()), Op: lan.OpCastStart,
-		Args: lan.CastStartArgs{Mode: mode},
-	}}, targets)
-	go l.castLoop(ctx, mode, targets)
+
+	params, err := lan.NewCastSession()
+	if err != nil {
+		params = lan.CastSessionParams{} // 密钥生成都失败了 → 纯 TCP
+	}
+	l.srv.StartCast(params, mode, targets)
+	for _, id := range online {
+		go func(id string) {
+			args, ok := l.srv.CastArgs(id)
+			if !ok {
+				return // 会话已被停/换，不发陈旧参数
+			}
+			ack, err := l.srv.SendCommand(id, lan.OpCastStart, args)
+			if err != nil || !ack.OK || ack.Detail == "tcp" {
+				l.srv.MarkCastTCP(id)
+			}
+			// 广播期间被停/换会话：补 cast.stop 防止僵尸全屏窗。
+			if _, still := l.srv.CastArgs(id); !still {
+				l.srv.Broadcast(lan.Msg{Type: lan.MsgCommand, Cmd: &lan.CommandMsg{
+					ID: fmt.Sprintf("cast-stop-%d", time.Now().UnixNano()), Op: lan.OpCastStop,
+				}}, []string{id})
+			}
+		}(id)
+	}
+	go l.castLoop(ctx, mode)
+	l.openCastBar()
+	if l.win != nil {
+		l.win.Minimize() // 极域行为：广播时收起管理端主界面，顶部悬浮条接管
+	}
 	scheduleClassroomPush(l)
 	return true
 }
@@ -717,43 +789,138 @@ func (l *Lab) CastStop() {
 	l.classroomMu.Lock()
 	defer l.classroomMu.Unlock()
 	l.castMu.Lock()
-	cancel, ids := l.castCancel, append([]string(nil), l.castIDs...)
-	l.castCancel, l.castMode, l.castIDs = nil, "", nil
+	cancel := l.castCancel
+	l.castCancel = nil
 	l.castMu.Unlock()
-	l.srv.SetCastState("", nil)
 	if cancel != nil {
 		cancel()
 	}
-	l.srv.StopCastFrames(ids)
-	if len(ids) > 0 {
+	oldIDs := l.srv.StopCast()
+	if len(oldIDs) > 0 {
 		l.srv.Broadcast(lan.Msg{Type: lan.MsgCommand, Cmd: &lan.CommandMsg{
 			ID: fmt.Sprintf("cast-stop-%d", time.Now().UnixNano()), Op: lan.OpCastStop,
-		}}, ids)
+		}}, oldIDs)
+	}
+	l.closeCastBar()
+	if l.win != nil {
+		l.win.Show() // 恢复开播时最小化的管理端
 	}
 	scheduleClassroomPush(l)
 }
 
-func (l *Lab) CastMode() string {
-	l.castMu.Lock()
-	defer l.castMu.Unlock()
-	return l.castMode
+func (l *Lab) CastMode() string { return l.srv.CastMode() }
+
+// CollectFiles 让所选学生机弹出「提交文件」请求（托盘气泡 + 互动页）。
+func (l *Lab) CollectFiles(ids []string) int {
+	session := "c-" + strconv.FormatInt(time.Now().Unix(), 36)
+	var sent atomic.Int32
+	var wg sync.WaitGroup
+	for _, id := range l.srv.OnlineIDs(ids) {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			if _, err := l.srv.SendCommand(id, lan.OpCollectOpen, lan.CollectOpenArgs{Session: session}); err == nil {
+				sent.Add(1)
+			}
+		}(id)
+	}
+	wg.Wait()
+	return int(sent.Load())
 }
 
-func (l *Lab) castLoop(ctx context.Context, mode string, targets []string) {
-	t := time.NewTicker(500 * time.Millisecond)
-	defer t.Stop()
+// FocusAdmin 唤起管理端主窗口（悬浮条的「显示管理端」按钮）。
+func (l *Lab) FocusAdmin() {
+	if l.win != nil {
+		l.win.Show()
+		l.win.Focus()
+	}
+}
+
+// castLoop 定时抓屏 → 组播+TCP 兜底分发。画质档随 castQuality 即时生效；
+// 画面静止时跳帧（心跳帧 4s 一保）。开播强制连发前 3 帧，让刚加入组播的
+// 客户端尽快拿到画面（它们可能错过了第 1 帧的分片）。
+func (l *Lab) castLoop(ctx context.Context, mode string) {
+	fp := &capture.Fingerprinter{}
+	var lastSend time.Time
+	var lastInterval time.Duration
+	var sent int
+	ticker := time.NewTicker(400 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-ticker.C:
 		}
-		jpeg, err := capture.FrameMode(mode, 800, 45)
+		p := castQualityLevels[l.quality()]
+		if p.IntervalMs != int(lastInterval.Milliseconds()) {
+			lastInterval = time.Duration(p.IntervalMs) * time.Millisecond
+			ticker.Reset(lastInterval)
+		}
+		img, err := capture.Grab(mode)
 		if err != nil {
 			continue
 		}
-		l.srv.QueueCastFrame(targets, jpeg)
+		if sent >= 3 && !fp.Changed(img) && time.Since(lastSend) < 4*time.Second {
+			continue
+		}
+		jpeg := capture.Encode(img, p)
+		if len(jpeg) == 0 || len(jpeg) > lan.MaxCastJPEG {
+			continue
+		}
+		l.srv.CastFrame(jpeg)
+		lastSend = time.Now()
+		sent++
 	}
+}
+
+// ---- 广播悬浮控制条（管理端，仿极域顶栏）----
+
+func (l *Lab) openCastBar() {
+	l.castMu.Lock()
+	defer l.castMu.Unlock()
+	if l.castBar != nil && !l.castBar.IsDestroyed() {
+		l.castBar.Show()
+		return
+	}
+	const bw, bh = 372, 46
+	x, y := 0, 0
+	if d := mygo.Screen.PrimaryDisplay(); d.WorkArea.Width > 0 {
+		x = d.WorkArea.X + (d.WorkArea.Width-bw)/2
+		y = d.WorkArea.Y + 6
+	}
+	l.castBar = mygo.NewWindow(mygo.WindowOptions{
+		Title:       "屏幕广播",
+		URL:         "/castbar.html",
+		Width:       bw,
+		Height:      bh,
+		X:           x,
+		Y:           y,
+		Frameless:   true,
+		Transparent: true,
+		Panel:       true,
+	})
+	// Panel 窗默认会被 Esc 关掉——广播中必须一直挂着，只许 CastStop 销毁。
+	l.castBar.OnClose(func(e *mygo.CloseEvent) { e.PreventDefault() })
+}
+
+func (l *Lab) closeCastBar() {
+	l.castMu.Lock()
+	bar := l.castBar
+	l.castBar = nil
+	l.castMu.Unlock()
+	if bar != nil {
+		bar.Destroy()
+	}
+}
+
+func contains(ids []string, id string) bool {
+	for _, v := range ids {
+		if v == id {
+			return true
+		}
+	}
+	return false
 }
 
 func (l *Lab) SignInStart(seconds int, ids []string) int {

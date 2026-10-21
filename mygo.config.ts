@@ -4,6 +4,7 @@ export default defineConfig({
   name: "lab-assistant",
   identifier: "com.example.labassistant",
   version: "0.0.2",
+  icon: "resources/icon.png",
   // `mygo dev` runs devCommand and loads devUrl; `mygo build` runs
   // buildCommand and embeds frontendDist into the app.
   devUrl: "http://localhost:5173",

@@ -1,9 +1,8 @@
 import { create } from "zustand";
-import type { ClassroomState, ClientStatus, Device, FeatureGroup } from "./mygo";
+import type { ClassroomState, Device, FeatureGroup } from "./mygo";
 
 export type DeviceFilter = "all" | "online" | "offline" | "alert";
 export type MainView = "devices" | "classroom";
-export type ClassroomPane = "wall" | "cast" | "signin" | "files" | "interact";
 export type ThemePreference = "light" | "dark" | "system";
 
 const themeStorageKey = "lab-assistant-theme";
@@ -29,7 +28,6 @@ type LabStore = {
   devices: Device[];
   catalog: FeatureGroup[];
   classroom: ClassroomState | null;
-  clientStatus: ClientStatus | null;
   loading: boolean;
   loadError: string;
   lastScan: string;
@@ -38,15 +36,12 @@ type LabStore = {
   selectedIds: string[];
   expandedIds: string[];
   view: MainView;
-  classroomPane: ClassroomPane;
-  pickedPaths: string[];
   demoSourceId: string;
   theme: ThemePreference;
   resolvedTheme: "light" | "dark";
   setDevices: (devices: Device[]) => void;
   setCatalog: (catalog: FeatureGroup[]) => void;
   setClassroom: (classroom: ClassroomState) => void;
-  setClientStatus: (status: ClientStatus) => void;
   setLoading: (loading: boolean) => void;
   setLoadError: (message: string) => void;
   setLastScan: (value: string) => void;
@@ -57,8 +52,6 @@ type LabStore = {
   clearSelection: () => void;
   toggleExpanded: (id: string) => void;
   setView: (view: MainView) => void;
-  setClassroomPane: (pane: ClassroomPane) => void;
-  setPickedPaths: (paths: string[]) => void;
   setDemoSource: (id: string) => void;
   setTheme: (theme: ThemePreference) => void;
   setResolvedTheme: (theme: "light" | "dark") => void;
@@ -70,7 +63,6 @@ export const useLabStore = create<LabStore>()((set) => ({
   devices: [],
   catalog: [],
   classroom: null,
-  clientStatus: null,
   loading: true,
   loadError: "",
   lastScan: "",
@@ -78,16 +70,13 @@ export const useLabStore = create<LabStore>()((set) => ({
   query: "",
   selectedIds: [],
   expandedIds: [],
-  view: "devices",
-  classroomPane: "wall",
-  pickedPaths: [],
+  view: "classroom",
   demoSourceId: "",
   theme: initialTheme,
   resolvedTheme: readResolvedTheme(initialTheme),
   setDevices: (devices) => set({ devices }),
   setCatalog: (catalog) => set({ catalog }),
   setClassroom: (classroom) => set({ classroom }),
-  setClientStatus: (clientStatus) => set({ clientStatus }),
   setLoading: (loading) => set({ loading }),
   setLoadError: (loadError) => set({ loadError }),
   setLastScan: (lastScan) => set({ lastScan }),
@@ -110,8 +99,6 @@ export const useLabStore = create<LabStore>()((set) => ({
       : [...state.expandedIds, id],
   })),
   setView: (view) => set({ view }),
-  setClassroomPane: (classroomPane) => set({ classroomPane }),
-  setPickedPaths: (pickedPaths) => set({ pickedPaths }),
   setDemoSource: (demoSourceId) => set({ demoSourceId }),
   setTheme: (theme) => {
     try {

@@ -93,7 +93,7 @@ const (
 	OpRestart     = "helper.restart"
 
 	OpScreenWatch  = "screen.watch" // args: {"on": bool}——开/关缩略图流
-	OpCastStart    = "cast.start"   // args: {"mode": "fullscreen"|"window"}
+	OpCastStart    = "cast.start"   // args: CastStartArgs（含组播会话参数）
 	OpCastStop     = "cast.stop"
 	OpSignInOpen   = "signin.open" // args: {"session": "...", "deadline": unix}
 	OpSignInClose  = "signin.close"
@@ -105,6 +105,7 @@ const (
 	OpDemoStart    = "demo.start"
 	OpDemoViewer   = "demo.viewer"
 	OpDemoStop     = "demo.stop"
+	OpCollectOpen  = "collect.open" // 收取文件：学生提交到管理端接收目录
 )
 
 type SetHelperArgs struct {
@@ -119,11 +120,13 @@ type LockScreenArgs struct {
 	Reason string `json:"reason"`
 }
 
-// AckMsg 对 Command 的应答。
+// AckMsg 对 Command 的应答。Detail 携带可选补充信息
+// （如 cast.start 应答里的 "tcp"=组播不可用、走 TCP 兜底）。
 type AckMsg struct {
-	ID  string `json:"id"`
-	OK  bool   `json:"ok"`
-	Err string `json:"err,omitempty"`
+	ID     string `json:"id"`
+	OK     bool   `json:"ok"`
+	Err    string `json:"err,omitempty"`
+	Detail string `json:"detail,omitempty"`
 }
 
 // AlertMsg 客户端主动上报的脱控事件。
@@ -144,9 +147,19 @@ type ScreenMsg struct {
 	JPEG string `json:"j"`
 }
 
-// CastStartArgs 广播模式。
+// CastStartArgs 广播模式 + 组播会话参数。
+// Group 为空表示本次广播走纯 TCP（管理端侧组播也不可用）。
 type CastStartArgs struct {
-	Mode string `json:"mode"` // "fullscreen" | "window"
+	Mode    string `json:"mode"`              // "fullscreen" | "window"
+	Group   string `json:"group,omitempty"`   // 组播地址
+	Port    int    `json:"port,omitempty"`    // 组播端口
+	Session uint32 `json:"session,omitempty"` // 会话号（帧 nonce 的一部分）
+	Key     string `json:"key,omitempty"`     // base64(AES-256 会话密钥)
+}
+
+// CollectOpenArgs 收取文件请求：学生端弹出提交界面。
+type CollectOpenArgs struct {
+	Session string `json:"session"`
 }
 
 // CastMsg S→C 广播帧（JPEG，base64）。
@@ -218,6 +231,9 @@ type FileMsg struct {
 	Data   string `json:"d,omitempty"`      // chunk：base64
 	Err    string `json:"e,omitempty"`      // error：原因
 }
+
+// MaxCastJPEG 是 TCP 兜底广播帧的 JPEG 上限（b64 后仍 < maxFrame）。
+const MaxCastJPEG = 2600 << 10
 
 // FileChunk 每片原始字节数（b64 后 ~1.4 倍，留足 maxFrame 余量）。
 const (

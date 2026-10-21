@@ -56,7 +56,9 @@ type session struct {
 	rmu     sync.Mutex
 }
 
-const maxFrame = 1 << 20
+// maxFrame 是单条加密消息的上限。广播 TCP 兜底帧可能到 ~2.6MB
+// （b64 后 ~3.5MB），故留 4MiB。
+const maxFrame = 4 << 20
 
 func randBytes(n int) []byte {
 	b := make([]byte, n)

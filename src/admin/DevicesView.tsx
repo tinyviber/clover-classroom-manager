@@ -218,7 +218,7 @@ function DeviceRows({
           <Button variant="ghost" size="icon-xs" className="text-muted-foreground" aria-label={expanded ? "收起设备详情" : "展开设备详情"} onClick={(event) => { event.stopPropagation(); onExpand(); }}>
             {expanded ? <ChevronDown /> : <ChevronRight />}
           </Button>
-          <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-muted text-xs font-semibold text-muted-foreground">{device.label.replace(/^./, "")}</span>
+          <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-muted text-xs font-semibold text-muted-foreground">{device.label.replace(/^[A-Za-z]+-?/, "") || device.label}</span>
           <span className="min-w-0">
             <span className="flex flex-wrap items-center gap-1.5 font-medium text-foreground">{device.name}{device.alerts > 0 && <Badge variant="destructive">{device.alerts} 告警</Badge>}</span>
             <span className="block text-xs text-muted-foreground">{device.label}</span>

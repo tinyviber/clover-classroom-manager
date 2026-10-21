@@ -20,7 +20,7 @@ export default defineConfig({
     rollupOptions: {
       input: {
         main: "index.html",
-        client: "client.html",
+        castbar: "castbar.html",
       },
     },
   },

@@ -15,6 +15,9 @@ func Show(mode string) {
 	log.Printf("castview: show %s", mode)
 }
 
+// OnExit 学生端「退出广播」回调（非 Windows 无悬浮条，占位）。
+var OnExit func()
+
 // Frame 收到一帧（丢弃）。
 func Frame(jpeg []byte) {}
 

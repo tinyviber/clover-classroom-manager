@@ -36,6 +36,91 @@ func FrameMode(mode string, maxWidth, quality int) ([]byte, error) {
 	return encodeJPEG(img, maxWidth, quality), nil
 }
 
+// Grab 截取画面（mode="window" 取前台窗口，其余取主屏），供调用方自行编码。
+func Grab(mode string) (image.Image, error) {
+	if mode == "window" {
+		return grabWindow()
+	}
+	return grab()
+}
+
+// Encode 缩放并编码为 JPEG（params.MaxWidth=0 表示原生分辨率）。
+func Encode(src image.Image, params Params) []byte {
+	return encodeJPEG(src, params.MaxWidth, params.Quality)
+}
+
+// Params 广播/监视的编码参数。IntervalMs 由发送端循环使用。
+type Params struct {
+	MaxWidth   int
+	Quality    int
+	IntervalMs int
+}
+
+// Fingerprinter 轻量"画面指纹"，检测画面没变从而跳帧省带宽：
+// 每隔一段采样一个像素，逐样本比较差值，变化占比低于阈值视为静止。
+// 对静态桌面/静止 PPT 这类机房常见画面，可以把流量降到接近零。
+type Fingerprinter struct {
+	last    []sample
+	lastW   int
+	lastH   int
+	has     bool
+}
+
+type sample struct{ r, g, b uint8 }
+
+// Changed 判断画面是否有可见变化（约 0.4% 采样点变化即视为变）。
+func (f *Fingerprinter) Changed(img image.Image) bool {
+	const gw, gh = 48, 27 // 采样网格 48×27
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if w <= 0 || h <= 0 {
+		return false
+	}
+	cur := make([]sample, gw*gh)
+	sx := float64(w) / gw
+	sy := float64(h) / gh
+	for gy := 0; gy < gh; gy++ {
+		y := b.Min.Y + int((float64(gy)+0.5)*sy)
+		for gx := 0; gx < gw; gx++ {
+			x := b.Min.X + int((float64(gx)+0.5)*sx)
+			r, g, bl, _ := img.At(x, y).RGBA()
+			cur[gy*gw+gx] = sample{uint8(r >> 8), uint8(g >> 8), uint8(bl >> 8)}
+		}
+	}
+	changed := true
+	if f.has && f.lastW == w && f.lastH == h && len(f.last) == len(cur) {
+		diff := 0
+		for i := range cur {
+			d := int(cur[i].r) - int(f.last[i].r)
+			if d < 0 {
+				d = -d
+			}
+			if d > 10 {
+				diff++
+				continue
+			}
+			d = int(cur[i].g) - int(f.last[i].g)
+			if d < 0 {
+				d = -d
+			}
+			if d > 10 {
+				diff++
+				continue
+			}
+			d = int(cur[i].b) - int(f.last[i].b)
+			if d < 0 {
+				d = -d
+			}
+			if d > 10 {
+				diff++
+			}
+		}
+		changed = diff*250 > len(cur) // >0.4% 样本变化才算动
+	}
+	f.last, f.lastW, f.lastH, f.has = cur, w, h, true
+	return changed
+}
+
 // encodeJPEG 缩放并编码（双线性足够缩略图/广播用）。
 func encodeJPEG(src image.Image, maxWidth, quality int) []byte {
 	b := src.Bounds()

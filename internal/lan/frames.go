@@ -17,7 +17,7 @@ type frameWorker struct {
 
 // QueueCastFrame sends a frame to the selected clients through one-slot queues.
 func (s *Server) QueueCastFrame(ids []string, jpeg []byte) int {
-	if len(jpeg) == 0 || len(jpeg) > 700<<10 {
+	if len(jpeg) == 0 || len(jpeg) > MaxCastJPEG {
 		return 0
 	}
 	s.mu.Lock()
@@ -63,6 +63,15 @@ func (s *Server) frameWorker(cc *clientConn) *frameWorker {
 	s.frameWorkers[cc.devID] = worker
 	s.mu.Unlock()
 	go func() {
+		defer func() {
+			// 退出时清掉自己在 map 里的条目，否则后续 QueueCastFrame
+			// 会拿到已取消的 worker 静默丢帧。
+			s.mu.Lock()
+			if s.frameWorkers[cc.devID] == worker {
+				delete(s.frameWorkers, cc.devID)
+			}
+			s.mu.Unlock()
+		}()
 		for {
 			select {
 			case <-ctx.Done():
