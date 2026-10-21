@@ -50,7 +50,9 @@ jobs:
       - name: Build client agent
         run: |
           mkdir -p build/client-agent
-          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -H windowsgui" -o build/client-agent/agent.exe ./cmd/client
+          # agent 需兼容 Win7：go1.21 是最后支持 Win7 的 Go，配合 agent.go.mod 降版依赖
+          GOTOOLCHAIN=go1.21.13 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=agent.go.mod -trimpath -ldflags="-s -w -H windowsgui" -o build/client-agent/agent.exe ./cmd/client
+          python3 -c "import struct; d=open('build/client-agent/agent.exe','rb').read(); o=struct.unpack_from('<I',d,0x3C)[0]; assert struct.unpack_from('<H',d,o+64)[0]<=6, 'agent.exe PE min OS > 6.1, breaks Windows 7'"
 
       - name: Assemble release assets
         shell: bash

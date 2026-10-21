@@ -21,8 +21,10 @@ bun run build          # 打包各平台安装包到 build/（mygo 无 cgo，可
                        # 例：bunx mygo build -platform windows/amd64 → build/windows-amd64/lab-assistant.exe）
 go test ./...          # 后端测试（lan 协议端到端 + 安装包导出）
 mkdir -p build/windows-amd64
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -H windowsgui" -o build/windows-amd64/agent.exe ./cmd/client
-                       # 交叉编译学生机 agent（-H windowsgui 无控制台窗口；导出安装包会带上它）
+GOTOOLCHAIN=go1.21.13 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=agent.go.mod -trimpath -ldflags="-s -w -H windowsgui" -o build/windows-amd64/agent.exe ./cmd/client
+                       # 交叉编译学生机 agent：go1.21 是最后支持 Win7 的 Go，配 agent.go.mod
+                       # 的降版依赖，产物 PE 最低版本 6.1（Win7+ 通吃；管理端仍需 Win10+）。
+                       # -H windowsgui 无控制台窗口；导出安装包会带上它
 ```
 
 `.github/workflows/windows-release.yml` 在 `main`/`master` push 和 PR 时构建校验；推送 `v*` 标签时，
