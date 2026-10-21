@@ -70,6 +70,9 @@ func main() {
 		log.Fatal(err)
 	}
 	lab := labsvc.New(srv, hs, dataDir)
+	// 发行构建（-tags=embedagent）把 agent.exe 编进二进制——单独下载
+	// headless exe 时导出安装包也不缺学生端
+	labsvc.EmbeddedAgent = embeddedAgent
 	hs.Bind(lab)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)

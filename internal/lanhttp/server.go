@@ -368,7 +368,29 @@ func (s *Server) clientOK(r *http.Request) bool {
 		return true
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	return err == nil && net.ParseIP(host).IsLoopback()
+	if err != nil || !net.ParseIP(host).IsLoopback() {
+		return false
+	}
+	// 回环连接还要验证 Host 头：攻击者域名可解析到 127.0.0.1
+	// （DNS rebinding），若只看 RemoteAddr 就会把 token 注进
+	// 攻击者源的页面。只认本机名/回环 IP 字面量。
+	return loopbackHost(r.Host)
+}
+
+// loopbackHost 判断 HTTP Host 头是否指向本机（localhost / 回环 IP）。
+func loopbackHost(h string) bool {
+	if h == "" {
+		return false
+	}
+	if host, _, err := net.SplitHostPort(h); err == nil {
+		h = host
+	}
+	h = strings.ToLower(strings.TrimSuffix(h, "."))
+	if h == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(h, "[]"))
+	return ip != nil && ip.IsLoopback()
 }
 
 func (s *Server) serveStatic(w http.ResponseWriter, r *http.Request) {

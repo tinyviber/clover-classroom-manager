@@ -70,6 +70,10 @@ type Agent struct {
 	guardMu     sync.Mutex
 	guardTimer  *time.Timer
 	guardLocked bool
+	// unmanaged 管理端删除设备前经 device.unmanage 下发：本次断线
+	// 起不再触发断线守护——设备被移除不是"掉线"。重新获批准后
+	// 管理端下发 device.manage 显式清零，恢复正常守护语义。
+	unmanaged atomic.Bool
 
 	// pendingAlerts 离线时缓存的告警（紧急解锁发生在断网时也要在
 	// 重连后送达管理端），下条会话建立时 flush。
@@ -164,7 +168,7 @@ var offlineGuardDelay = 15 * time.Second
 // armOfflineGuard 在会话断开后上弦：guard_offline 开启时 15s 内没
 // 重连成功就锁屏（防拔网线脱控）。ctx 结束（agent 退出）不上弦。
 func (a *Agent) armOfflineGuard(ctx context.Context) {
-	if ctx.Err() != nil || !a.offlineGuardOn() {
+	if ctx.Err() != nil || !a.offlineGuardOn() || a.unmanaged.Load() {
 		return
 	}
 	a.guardMu.Lock()
@@ -175,7 +179,7 @@ func (a *Agent) armOfflineGuard(ctx context.Context) {
 	a.guardTimer = time.AfterFunc(offlineGuardDelay, func() {
 		a.guardMu.Lock()
 		a.guardTimer = nil
-		if a.offlineGuardOn() {
+		if a.offlineGuardOn() && !a.unmanaged.Load() {
 			a.guardLocked = true
 			a.guardMu.Unlock()
 			log.Printf("agent[%s]: 与管理端断线超时，锁定屏幕", a.ID)
@@ -548,6 +552,15 @@ func (a *Agent) handleCmd(s *session, c CommandMsg) {
 		}
 	case OpUnlockScreen:
 		castview.Unlock()
+	case OpUnmanage:
+		// 管理端删除本设备：解除管控——本次断线不再触发断线守护。
+		// 重新批准靠 device.manage 显式解除（状态同步指令如
+		// signin.close 不算批准证据，不能顺手清零）。
+		a.unmanaged.Store(true)
+		log.Printf("agent[%s]: 管理端已移除本设备，进入非受控状态", a.ID)
+	case OpManaged:
+		a.unmanaged.Store(false)
+		log.Printf("agent[%s]: 管理端重新批准，恢复受控状态", a.ID)
 	case OpRestart, OpShutdown:
 		var args PowerArgs
 		_ = json.Unmarshal(mustJSON(c.Args), &args)

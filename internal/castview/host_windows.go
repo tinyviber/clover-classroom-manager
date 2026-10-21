@@ -25,7 +25,9 @@ func hostSend(op byte, payload []byte) {
 // RunHost 是 `-castview` 模式的进程入口；返回进程退出码。
 func RunHost() int {
 	defer restoreTaskbar() // 任何退出路径都归还任务栏
-	defer guardPanic("host")
+	// 主循环 panic 必须非零退出——否则父进程把它当正常退出，
+	// 异常重拉路径里该有的告警就被吞了
+	defer fatalPanic("host")
 
 	// 本进程内部用回调变量向父进程回事件（proto.go 声明的钩子
 	// 在子进程侧就是管道事件）。

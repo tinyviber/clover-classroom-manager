@@ -680,6 +680,19 @@ func (s *Server) Approve(ids []string) int {
 		}
 	}
 	s.mu.Unlock()
+	// 若设备此前经 Remove 收到过 unmanage，重新批准须先解除抑制。
+	// OpManaged 在 Approve 返回前并行下发且等 Ack：保证线路顺序与
+	// 调用顺序一致——之后到达的 unmanage（删除）不会被更旧的
+	// manage 覆盖。课堂活动恢复仍是异步的。
+	var wg sync.WaitGroup
+	for _, id := range online {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			_, _ = s.SendCommand(id, OpManaged, nil)
+		}(id)
+	}
+	wg.Wait()
 	for _, id := range online {
 		go s.syncClientActivities(id)
 	}
@@ -739,6 +752,12 @@ func (s *Server) Remove(ids []string) int {
 			}
 			if _, err := s.SendCommand(id, OpCastStop, CastStopArgs{}); err != nil {
 				log.Printf("lan: 删除前停广播 %s 失败: %v", id, err)
+			}
+			// unmanage 放最后：先解锁/停广播再解除管控，随后断连时
+			// agent 的断线守护不再上锁（只有重新批准的 device.manage
+			// 才能把它清回去）
+			if _, err := s.SendCommand(id, OpUnmanage, nil); err != nil {
+				log.Printf("lan: 删除前解除管控 %s 失败: %v（断线守护可能仍会锁屏）", id, err)
 			}
 		}(id)
 	}

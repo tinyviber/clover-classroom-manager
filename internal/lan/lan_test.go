@@ -662,6 +662,52 @@ func TestRemoveDevice(t *testing.T) {
 	}
 }
 
+// 删除设备前管理端会下发 device.unmanage：agent 置 unmanaged 抑制断线
+// 守护；重新批准时管理端下发 device.manage 显式清零，恢复守护语义。
+func TestUnmanageSuppressesOfflineGuard(t *testing.T) {
+	old := offlineGuardDelay
+	offlineGuardDelay = 60 * time.Millisecond
+	defer func() { offlineGuardDelay = old }()
+
+	srv, stopSrv := startTestServer(t)
+	defer stopSrv()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	a := startTestAgent(t, ctx, srv, "pc-um", "TEST-UM")
+	a.features.Store([]string{"guard_offline"})
+	a.helperOn.Store(true)
+
+	if _, err := srv.SendCommand("pc-um", OpUnmanage, nil); err != nil {
+		t.Fatalf("unmanage 下发失败: %v", err)
+	}
+	if !a.unmanaged.Load() {
+		t.Fatal("收到 unmanage 后 unmanaged 未置位")
+	}
+	if !a.offlineGuardOn() {
+		t.Skip("guard_offline 未生效，无法验证抑制")
+	}
+
+	// 被删后断线：守护计时器不应上弦（或上弦后不发锁）
+	srv.Remove([]string{"pc-um"})
+	time.Sleep(3 * offlineGuardDelay)
+	if a.guardIsLocked() {
+		t.Fatal("unmanaged 设备断线后仍被守护锁屏")
+	}
+
+	// 重连 pending → 重新批准 → Approve 下发 device.manage 清零抑制
+	waitFor(t, 10*time.Second, "agent 重连为 pending", func() bool {
+		d, ok := srv.GetDevice("pc-um")
+		return ok && d.Pending
+	})
+	if n := srv.Approve([]string{"pc-um"}); n != 1 {
+		t.Fatalf("重新批准失败: %d", n)
+	}
+	waitFor(t, 5*time.Second, "device.manage 清零 unmanaged", func() bool {
+		return !a.unmanaged.Load()
+	})
+}
+
 // 删除设备必须清干净关联状态：缩略图订阅/高清查看/大图焦点/求助/
 // 广播目标/签到投票回执，否则删除后仍残留订阅或陈旧状态。
 func TestRemoveCleansAssociatedState(t *testing.T) {

@@ -63,7 +63,9 @@ jobs:
           mkdir -p build/manager-headless
           # headless 管理端 embed 前端产物（mygo build 已跑过 build:web 产出 dist/）
           cp -r dist/. cmd/manager-headless/dist/
-          GOTOOLCHAIN=go1.20.14 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=agent.go.mod -trimpath -ldflags="-s -w" -o build/manager-headless/manager-headless.exe ./cmd/manager-headless
+          # agent.exe 拷进包目录供 embedagent 嵌入——单独下载 headless exe 也能导出完整安装包
+          cp packaging/windows/agent.exe cmd/manager-headless/agent.exe
+          GOTOOLCHAIN=go1.20.14 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=agent.go.mod -tags=embedagent -trimpath -ldflags="-s -w" -o build/manager-headless/manager-headless.exe ./cmd/manager-headless
           python3 -c "import struct; d=open('build/manager-headless/manager-headless.exe','rb').read(); o=struct.unpack_from('<I',d,0x3C)[0]; assert struct.unpack_from('<H',d,o+64)[0]<=6, 'manager-headless.exe PE min OS > 6.1, breaks Windows 7'"
 
       - name: Assemble release assets

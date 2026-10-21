@@ -15,6 +15,7 @@ import (
 	"image"
 	_ "image/jpeg"
 	"log"
+	"os"
 	"runtime"
 	"runtime/debug"
 	"sync"
@@ -56,6 +57,19 @@ var (
 func guardPanic(where string) {
 	if r := recover(); r != nil {
 		log.Printf("castview: %s panic: %v\n%s", where, r, debug.Stack())
+	}
+}
+
+// fatalPanic 关键 goroutine（windowThread/decodeThread）的 panic 兜底。
+// 它们经 sync.Once 只起一次，panic 后只记录日志就成了"进程活着但
+// 窗口/解码全失效"的哑死状态——父进程 waitLoop 反而发现不了。
+// 这里让整个子进程非零退出，由父进程按异常退出路径自动重拉。
+// 注意 os.Exit 不跑 defer：任务栏兜底由父进程异常退出路径的
+// showTaskbar() 跨进程补做。
+func fatalPanic(where string) {
+	if r := recover(); r != nil {
+		log.Printf("castview: %s panic（进程退出，父进程会重拉）: %v\n%s", where, r, debug.Stack())
+		os.Exit(2)
 	}
 }
 
@@ -301,7 +315,7 @@ func pushFrame(jpeg []byte) {
 
 // decodeThread 从单槽队列取最新 JPEG 解码成 RGBA 并触发重绘。
 func decodeThread() {
-	defer guardPanic("decodeThread")
+	defer fatalPanic("decodeThread")
 	for jpeg := range frames {
 		src, _, err := image.Decode(bytes.NewReader(jpeg))
 		if err != nil {
@@ -570,7 +584,7 @@ func drawText(hdc win.HDC, s []uint16, rc *win.RECT, format uint32) {
 // ---- 窗口线程与 WndProc ----
 
 func windowThread() {
-	defer guardPanic("windowThread")
+	defer fatalPanic("windowThread")
 	runtime.LockOSThread()
 	defer restoreTaskbar() // 线程死了钩子自动拆，但任务栏藏过的要还回去
 	// Create the first window before entering GetMessage. Show may enqueue its

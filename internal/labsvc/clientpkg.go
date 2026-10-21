@@ -40,15 +40,12 @@ func WriteClientPackage(dir string, srv *lan.Server, addr string) error {
 	if err := cfg.Save(filepath.Join(dir, "client.json")); err != nil {
 		return err
 	}
-	// agent.exe：发行版嵌在管理端里；否则按候选路径找（管理端旁边、
-	// 编译产物、packaging 目录）。
-	agentNote := "agent.exe 未随包导出（未发现已构建的客户端，请先：mkdir -p packaging/windows && GOTOOLCHAIN=go1.20.14 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=agent.go.mod -o packaging/windows/agent.exe ./cmd/client）"
-	if len(EmbeddedAgent) > 0 {
-		if err := os.WriteFile(filepath.Join(dir, "agent.exe"), EmbeddedAgent, 0o755); err != nil {
-			return fmt.Errorf("写入客户端程序: %w", err)
-		}
-		agentNote = "agent.exe 已随包导出"
-	} else {
+	// agent.exe：发行版嵌在管理端里（-tags=embedagent）；否则按候选路径
+	// 找（管理端旁边、编译产物、packaging 目录）。两者都没有时直接报错——
+	// 不能生成"看似成功但没有学生端"的安装包。
+	agentBytes := EmbeddedAgent
+	agentNote := "agent.exe 已随包导出"
+	if len(agentBytes) == 0 {
 		agentSrc := ""
 		candidates := []string{"./packaging/windows/agent.exe", "./build/windows-amd64/agent.exe", "./cmd/client/agent.exe", "./agent.exe"}
 		if executable, err := os.Executable(); err == nil {
@@ -61,16 +58,17 @@ func WriteClientPackage(dir string, srv *lan.Server, addr string) error {
 				break
 			}
 		}
-		if agentSrc != "" {
-			b, err := os.ReadFile(agentSrc)
-			if err != nil {
-				return fmt.Errorf("读取客户端程序 %s: %w", agentSrc, err)
-			}
-			if err := os.WriteFile(filepath.Join(dir, "agent.exe"), b, 0o755); err != nil {
-				return fmt.Errorf("写入客户端程序: %w", err)
-			}
-			agentNote = "agent.exe 已随包导出"
+		if agentSrc == "" {
+			return fmt.Errorf("未找到学生端程序 agent.exe，无法生成安装包（请先构建：mkdir -p packaging/windows && GOTOOLCHAIN=go1.20.14 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=agent.go.mod -o packaging/windows/agent.exe ./cmd/client）")
 		}
+		b, err := os.ReadFile(agentSrc)
+		if err != nil {
+			return fmt.Errorf("读取客户端程序 %s: %w", agentSrc, err)
+		}
+		agentBytes = b
+	}
+	if err := os.WriteFile(filepath.Join(dir, "agent.exe"), agentBytes, 0o755); err != nil {
+		return fmt.Errorf("写入客户端程序: %w", err)
 	}
 	for _, name := range []string{"install.bat", "uninstall.bat", "verify-config.ps1"} {
 		if err := writeClientPackageAsset(dir, name); err != nil {

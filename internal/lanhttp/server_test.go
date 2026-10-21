@@ -59,7 +59,7 @@ func TestStaticTokenNotLeakedToLAN(t *testing.T) {
 func TestStaticInjectionLoopbackAndToken(t *testing.T) {
 	s := testServer(t)
 
-	req := httptest.NewRequest("GET", "/", nil)
+	req := httptest.NewRequest("GET", "http://127.0.0.1:47825/", nil)
 	req.RemoteAddr = "127.0.0.1:53210"
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
@@ -67,7 +67,7 @@ func TestStaticInjectionLoopbackAndToken(t *testing.T) {
 		t.Fatalf("回环页面应注入 token: %d", rec.Code)
 	}
 
-	req = httptest.NewRequest("GET", "/?k="+s.Token(), nil) // LAN + 凭据
+	req = httptest.NewRequest("GET", "http://x.local/?k="+s.Token(), nil) // LAN + 凭据
 	rec = httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), s.Token()) {
@@ -80,6 +80,35 @@ func TestStaticInjectionLoopbackAndToken(t *testing.T) {
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("静态资源应可访问: %d", rec.Code)
+	}
+}
+
+// DNS rebinding：攻击者域名解析到 127.0.0.1 时，浏览器会以回环地址
+// 连上本机服务但 Host 仍是攻击者域名——绝不能把 token 注进它的页面。
+func TestStaticHostRebindingRejected(t *testing.T) {
+	s := testServer(t)
+
+	for _, host := range []string{"evil.example", "127.0.0.1.evil.com", "localhost.evil.com", "example.com"} {
+		req := httptest.NewRequest("GET", "http://"+host+"/", nil)
+		req.RemoteAddr = "127.0.0.1:53210" // 连接来自回环，Host 却是外人
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("Host=%s 回环连接应 401: %d", host, rec.Code)
+		}
+		if strings.Contains(rec.Body.String(), s.Token()) {
+			t.Fatalf("Host=%s 的响应泄露了 token", host)
+		}
+	}
+	// 但合法本机 Host 照常注入
+	for _, host := range []string{"127.0.0.1", "127.0.0.1:47825", "localhost", "localhost:47825", "[::1]:47825"} {
+		req := httptest.NewRequest("GET", "http://"+host+"/", nil)
+		req.RemoteAddr = "[::1]:9999"
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), s.Token()) {
+			t.Fatalf("Host=%s 本机页面应注入 token: %d", host, rec.Code)
+		}
 	}
 }
 
