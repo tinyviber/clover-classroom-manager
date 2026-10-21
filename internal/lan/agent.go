@@ -36,7 +36,9 @@ type Agent struct {
 	// PinnedPub 管理端公钥。nil 表示 TOFU：信任第一个应答的信标。
 	PinnedPub ed25519.PublicKey
 	// DirectAddr 形如 "192.168.31.1:47823"，先直连；失败后回退到 UDP 发现。
+	// 只能在构造期赋值；运行期（含 UDP 发现更新）一律走 directMu。
 	DirectAddr string
+	directMu   sync.RWMutex
 	// RecvDir 教师下发文件的落盘目录（默认 exe 旁 recv/）。
 	RecvDir string
 
@@ -57,11 +59,10 @@ type Agent struct {
 	// OnConn 可选钩子：管理端会话建立/断开。
 	OnConn func(connected bool)
 
-	helperOn  atomic.Bool
-	features  atomic.Value // []string
-	featErrs  atomic.Value // []string——应用失败的策略键
-	watchHiMu sync.Mutex
-	watchHi   bool // 单机高清查看模式（教师点开大图）
+	helperOn atomic.Bool
+	features atomic.Value // []string
+	featErrs atomic.Value // []string——应用失败的策略键
+	watchHi  bool         // 单机高清查看模式（教师点开大图），watchMu 保护
 
 	// guard_offline 守护：断线超时后自动锁屏。guardLocked 只记守护自己
 	// 上的锁，解锁也只解自己的（教师 screen.lock 独立管理）。
@@ -81,8 +82,12 @@ type Agent struct {
 	// powerTimer 关机/重启的 agent 侧可取消倒计时：Windows 的
 	// shutdown /t>0 隐含 /f 强关应用，所以普通关机是我们自己的定时器，
 	// 到期执行不带 /f 的 shutdown /t 0（应用可拒绝）。power.cancel 停它。
+	// powerGen 是排程代数：回调只在 gen 仍是当前代时才执行，防止旧
+	// 定时器回调把新排程清掉或错过取消窗口。timer 一旦进入执行阶段
+	// （gen 消费）就不能再取消——取消接口如实返回 false。
 	powerMu    sync.Mutex
 	powerTimer *time.Timer
+	powerGen   uint64
 
 	cur           atomic.Pointer[session] // 当前会话（SubmitFile 用）
 	watchMu       sync.Mutex
@@ -255,14 +260,14 @@ func (a *Agent) Run(ctx context.Context) {
 		}
 		if err := a.session(ctx, addr, pub); err != nil {
 			log.Printf("agent[%s]: 会话结束: %v", a.ID, err)
-			if ctx.Err() == nil && a.DirectAddr != "" && a.PinnedPub != nil {
+			if ctx.Err() == nil && a.directAddr() != "" && a.PinnedPub != nil {
 				discoverCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 				foundAddr, foundPub, discoverErr := a.discoverBroadcast(discoverCtx, false)
 				cancel()
 				if discoverErr == nil && a.PinnedPub.Equal(foundPub) {
-					if foundAddr != a.DirectAddr {
-						log.Printf("agent[%s]: 管理端地址已更新 %s → %s", a.ID, a.DirectAddr, foundAddr)
-						a.DirectAddr = foundAddr
+					if foundAddr != a.directAddr() {
+						log.Printf("agent[%s]: 管理端地址已更新 %s → %s", a.ID, a.directAddr(), foundAddr)
+						a.setDirectAddr(foundAddr)
 					}
 				} else if discoverErr != nil {
 					log.Printf("agent[%s]: UDP 发现回退失败: %v", a.ID, discoverErr)
@@ -273,10 +278,22 @@ func (a *Agent) Run(ctx context.Context) {
 	}
 }
 
+func (a *Agent) directAddr() string {
+	a.directMu.RLock()
+	defer a.directMu.RUnlock()
+	return a.DirectAddr
+}
+
+func (a *Agent) setDirectAddr(addr string) {
+	a.directMu.Lock()
+	a.DirectAddr = addr
+	a.directMu.Unlock()
+}
+
 // discover 广播找管理端，返回 (tcpAddr, adminPub)。
 func (a *Agent) discover(ctx context.Context) (string, ed25519.PublicKey, error) {
-	if a.DirectAddr != "" && a.PinnedPub != nil {
-		return a.DirectAddr, a.PinnedPub, nil
+	if addr := a.directAddr(); addr != "" && a.PinnedPub != nil {
+		return addr, a.PinnedPub, nil
 	}
 	return a.discoverBroadcast(ctx, true)
 }
@@ -315,8 +332,8 @@ func (a *Agent) discoverBroadcast(ctx context.Context, useConfiguredAddr bool) (
 				continue
 			}
 			addr := fmt.Sprintf("%s:%d", src.IP.String(), b.TCPPort)
-			if useConfiguredAddr && a.DirectAddr != "" {
-				addr = a.DirectAddr
+			if useConfiguredAddr && a.directAddr() != "" {
+				addr = a.directAddr()
 			}
 			return addr, pub, nil
 		}
@@ -516,9 +533,10 @@ func (a *Agent) handleCmd(s *session, c CommandMsg) {
 			ack.OK, ack.Err = false, err.Error()
 		}
 	case OpPowerCancel:
-		a.cancelScheduledPower()
-		if err := powerCancel(); err != nil {
-			ack.OK, ack.Err = false, err.Error()
+		canceled := a.cancelScheduledPower()
+		_ = powerCancel() // 兜底 shutdown /a：可能残留系统级 force 倒计时
+		if !canceled {
+			ack.OK, ack.Err = false, "没有可取消的关机倒计时（未排程或已开始执行）"
 		}
 	case OpNotify:
 		var args NotifyArgs
@@ -1239,19 +1257,36 @@ var powerDelay = 60 * time.Second
 var doPowerAction = powerAction
 
 // schedulePower 普通模式只上定时器（到期执行不带 /f 的关机）；
-// force 模式直接 5s 强关。重复下发同一 op 会重置倒计时。
+// force 模式直接 5s 强关。重复下发或强制模式会先作废旧排程
+// （gen+1 使旧回调即使已进入也不会再执行）。
 func (a *Agent) schedulePower(op string, force bool) error {
+	a.powerMu.Lock()
+	a.powerGen++
+	gen := a.powerGen
+	if a.powerTimer != nil {
+		a.powerTimer.Stop()
+		a.powerTimer = nil
+	}
+	a.powerMu.Unlock()
+
 	if force {
 		return doPowerAction(op, true)
 	}
 	a.powerMu.Lock()
 	defer a.powerMu.Unlock()
-	if a.powerTimer != nil {
-		a.powerTimer.Stop()
+	if a.powerGen != gen {
+		return nil // 排程窗口内又被取消了
 	}
 	a.powerTimer = time.AfterFunc(powerDelay, func() {
 		a.powerMu.Lock()
+		if a.powerGen != gen || a.powerTimer == nil {
+			// 已被更新排程取代或被取消：本回调作废，且绝不能把
+			// 别人的 powerTimer 置 nil。
+			a.powerMu.Unlock()
+			return
+		}
 		a.powerTimer = nil
+		a.powerGen++ // 进入执行阶段：此后取消返回 false
 		a.powerMu.Unlock()
 		if err := doPowerAction(op, false); err != nil {
 			log.Printf("agent[%s]: 执行远程关机/重启失败: %v", a.ID, err)
@@ -1262,14 +1297,19 @@ func (a *Agent) schedulePower(op string, force bool) error {
 }
 
 // cancelScheduledPower 停掉 agent 侧的普通关机倒计时。
-func (a *Agent) cancelScheduledPower() {
+// 返回 false 表示没有进行中的倒计时——可能从未排程，也可能已进入
+// 执行阶段（回调一旦开始执行 doPowerAction 就无法撤回了）。
+func (a *Agent) cancelScheduledPower() bool {
 	a.powerMu.Lock()
 	defer a.powerMu.Unlock()
-	if a.powerTimer != nil {
-		a.powerTimer.Stop()
-		a.powerTimer = nil
-		log.Printf("agent[%s]: 关机/重启倒计时已取消", a.ID)
+	if a.powerTimer == nil {
+		return false
 	}
+	a.powerTimer.Stop()
+	a.powerTimer = nil
+	a.powerGen++
+	log.Printf("agent[%s]: 关机/重启倒计时已取消", a.ID)
+	return true
 }
 
 func mustJSON(v any) []byte {
@@ -1307,16 +1347,45 @@ func validLaunchPath(p string) error {
 	return nil
 }
 
+// AllowedCollectRoots 指定目录收取允许的根目录白名单（管理端与 agent
+// 双侧强制——管理端拦截只是 UX，agent 才是安全边界）。只放学校预设的
+// 作业目录：不开放整个 C:\LabHelper，因为 client.json 的身份 token
+// 也在安装目录里。变量形态便于测试注入临时根目录。
+var AllowedCollectRoots = []string{`C:\Users\Public`, `C:\LabHelper\Homework`}
+
+// collectDirAllowed 校验目录在白名单根之下；先 EvalSymlinks 解掉
+// junction/符号链接再用解析后的真实路径比对，防止目录重定向逃逸。
+func collectDirAllowed(clean string) bool {
+	resolved, err := filepath.EvalSymlinks(clean)
+	if err != nil {
+		resolved = clean
+	}
+	for _, cand := range []string{resolved, clean} {
+		low := strings.ToLower(filepath.ToSlash(cand))
+		for _, root := range AllowedCollectRoots {
+			r := strings.ToLower(filepath.ToSlash(filepath.Clean(root)))
+			if low == r || strings.HasPrefix(low, r+"/") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // collectDir 指定目录收取：按 Glob 匹配目录下文件逐个自动上传。
-// 限额：≤64 个文件、总量 ≤256MB、单文件 ≤128MB；结果经 "collect"
-// 告警回执给管理端（无匹配/失败原因都会点名，不再是只算请求送达）。
+// 限额：尝试 ≤64 个文件、总量 ≤256MB、单文件 ≤128MB；结果经 "collect"
+// 告警带 Stat 结果码回执（ok/empty/denied/quota/fail）。
 func (a *Agent) collectDir(s *session, args CollectOpenArgs) {
-	report := func(detail string) {
-		a.reportAlert(AlertMsg{Kind: "collect", Detail: detail})
+	report := func(stat, detail string) {
+		a.reportAlert(AlertMsg{Kind: "collect", Detail: detail, Stat: stat})
 	}
 	clean := filepath.Clean(args.Dir)
 	if !filepath.IsAbs(clean) || strings.Contains(args.Dir, "..") || strings.HasPrefix(clean, `\\`) {
-		report("目录收取失败：路径无效")
+		report("denied", "目录收取失败：路径无效")
+		return
+	}
+	if !collectDirAllowed(clean) {
+		report("denied", fmt.Sprintf("目录收取失败：%s 不在允许范围", clean))
 		return
 	}
 	pattern := args.Glob
@@ -1324,44 +1393,58 @@ func (a *Agent) collectDir(s *session, args CollectOpenArgs) {
 		pattern = "*"
 	}
 	if strings.Contains(pattern, "..") || strings.ContainsAny(pattern, `/\\`) {
-		report("目录收取失败：匹配规则无效")
+		report("denied", "目录收取失败：匹配规则无效")
 		return
 	}
 	matches, err := filepath.Glob(filepath.Join(clean, pattern))
 	if err != nil || len(matches) == 0 {
-		report(fmt.Sprintf("目录 %s 无匹配文件", clean))
+		report("empty", fmt.Sprintf("目录 %s 无匹配文件", clean))
 		return
 	}
 	const maxFiles, maxTotal = 64, 256 << 20
 	var total int64
-	count := 0
-	failed := 0
+	attempted, sent, failed, skipped := 0, 0, 0, 0
 	for _, p := range matches {
-		if count >= maxFiles || total >= maxTotal {
+		if attempted >= maxFiles || total >= maxTotal {
 			break
 		}
 		info, err := os.Stat(p)
 		if err != nil || !info.Mode().IsRegular() || info.Size() > MaxStudentUploadSize {
+			skipped++
 			continue
 		}
 		if total+info.Size() > maxTotal {
 			break
 		}
+		attempted++
 		if err := a.SubmitFile(p); err != nil {
 			failed++
 			log.Printf("agent[%s]: 收取上传 %s 失败: %v", a.ID, p, err)
 			continue
 		}
-		count++
+		sent++
 		total += info.Size()
 	}
+	limited := attempted >= maxFiles || total >= maxTotal || attempted+skipped < len(matches)
+	suffix := func() string {
+		if limited {
+			return fmt.Sprintf("，已达上限（匹配 %d 个）", len(matches))
+		}
+		return ""
+	}
 	switch {
-	case count == 0 && failed > 0:
-		report(fmt.Sprintf("目录收取失败：%d 个文件均上传失败", failed))
+	case sent == 0 && failed > 0:
+		report("fail", fmt.Sprintf("目录收取失败：%d 个文件均上传失败%s", failed, suffix()))
+	case sent == 0:
+		report("empty", fmt.Sprintf("目录 %s 没有可收取的文件", clean))
 	case failed > 0:
-		report(fmt.Sprintf("目录收取完成：已提交 %d 个文件（%.1f MB，%d 个失败）", count, float64(total)/(1<<20), failed))
+		report("ok", fmt.Sprintf("目录收取完成：已提交 %d 个文件（%.1f MB，%d 个失败%s）", sent, float64(total)/(1<<20), failed, suffix()))
 	default:
-		report(fmt.Sprintf("目录收取完成：已提交 %d 个文件（%.1f MB）", count, float64(total)/(1<<20)))
+		stat := "ok"
+		if limited {
+			stat = "quota"
+		}
+		report(stat, fmt.Sprintf("目录收取完成：已提交 %d 个文件（%.1f MB%s）", sent, float64(total)/(1<<20), suffix()))
 	}
 }
 

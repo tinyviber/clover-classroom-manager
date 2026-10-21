@@ -105,6 +105,7 @@ const state = {
     screenWatchIds: [],
     signIn: { open: false, id: "", deadline: 0, targetIds: [], sent: 0, replies: [], online: 22 },
     files: [],
+    collects: [],
     helps: [],
     poll: { open: false, id: "", question: "", options: [], deadline: 0, targetIds: [], sent: 0, replies: [] },
     demo: { state: "", sessionId: "", sourceId: "", sourceLabel: "", targetIds: [], requestedAt: "", err: "" },

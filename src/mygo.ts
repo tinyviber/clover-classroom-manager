@@ -13,6 +13,17 @@ export interface AdminInfo {
   dataDir: string;
 }
 
+/** ClassroomCollectResult 是一台设备的目录收取回执（结构化结果，不是传输进度）。 */
+export interface ClassroomCollectResult {
+  id: string;
+  deviceId: string;
+  label: string;
+  /** ok / empty / denied / quota / fail */
+  stat: string;
+  detail: string;
+  at: string;
+}
+
 export interface ClassroomDemo {
   state: string;
   sessionId: string;
@@ -84,6 +95,7 @@ export interface ClassroomState {
   screenWatchIds: string[];
   signIn: ClassroomSignIn;
   files: ClassroomFileProgress[];
+  collects: ClassroomCollectResult[];
   helps: ClassroomHelpRequest[];
   poll: ClassroomPoll;
   demo: ClassroomDemo;
@@ -200,6 +212,7 @@ export const Lab = {
   /**
    * CollectFiles 发起文件收取。dir 为空=学生手动选择提交（弹互动页）；
    * dir 非空=按 glob 从学生机指定目录自动收取（学生无需操作）。
+   * 返回 -1 表示目录不在允许范围（collectRoots 白名单外）。
    */
   collectFiles(ids: string[], dir: string, glob: string): Promise<number> {
     return call("Lab.CollectFiles", ids, dir, glob);

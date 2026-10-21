@@ -90,16 +90,16 @@ type CommandMsg struct {
 }
 
 const (
-	OpSetHelper   = "helper.set"   // args: {"on": true}
-	OpSetFeatures = "features.set" // args: {"keys": [...]}
-	OpLockScreen  = "screen.lock"   // args: {"reason": "..."}——黑屏+锁键鼠
+	OpSetHelper    = "helper.set"   // args: {"on": true}
+	OpSetFeatures  = "features.set" // args: {"keys": [...]}
+	OpLockScreen   = "screen.lock"  // args: {"reason": "..."}——黑屏+锁键鼠
 	OpUnlockScreen = "screen.unlock"
-	OpRestart     = "helper.restart" // 学生机重启（shutdown /r）
-	OpShutdown    = "helper.shutdown" // 学生机关机（shutdown /s）
-	OpPowerCancel = "power.cancel"    // shutdown /a 取消倒计时关机/重启
-	OpNotify      = "notify"          // args: {"text"}——教师文字消息（气泡）
-	OpOpenURL     = "url.open"        // args: {"url"}——仅 http/https
-	OpLaunchApp   = "app.launch"      // args: {"path"}——仅 .exe 绝对路径
+	OpRestart      = "helper.restart"  // 学生机重启（shutdown /r）
+	OpShutdown     = "helper.shutdown" // 学生机关机（shutdown /s）
+	OpPowerCancel  = "power.cancel"    // shutdown /a 取消倒计时关机/重启
+	OpNotify       = "notify"          // args: {"text"}——教师文字消息（气泡）
+	OpOpenURL      = "url.open"        // args: {"url"}——仅 http/https
+	OpLaunchApp    = "app.launch"      // args: {"path"}——仅 .exe 绝对路径
 
 	OpScreenWatch  = "screen.watch" // args: {"on": bool, "hi": bool}——缩略图流/单机高清
 	OpCastStart    = "cast.start"   // args: CastStartArgs（含组播会话参数）
@@ -166,6 +166,9 @@ type AlertMsg struct {
 	Kind   string `json:"kind"` // net_down / proc_killed / usb_detected / cast_tcp / emergency_unlock / ...
 	Detail string `json:"detail"`
 	Gen    uint32 `json:"gen,omitempty"`
+	// Stat 是结构化结果码：目录收取回执用它区分 ok/empty/denied/
+	// quota/fail，管理端不再从展示文本里猜成败。
+	Stat string `json:"stat,omitempty"`
 }
 
 // ---- v0.0.2：屏幕 / 广播 / 签到 / 文件 ----

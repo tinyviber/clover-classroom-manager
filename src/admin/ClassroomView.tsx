@@ -183,7 +183,7 @@ export function ClassroomView() {
     try {
       const sent = await api.collectFiles(targets, dir, glob);
       if (sent < 0) {
-        toast.error("目录不在允许范围（仅允许 C:\\Users\\Public 与 C:\\LabHelper 之下）");
+        toast.error("目录不在允许范围（仅允许 C:\\Users\\Public 与 C:\\LabHelper\\Homework 之下）");
         return;
       }
       toast.success(sent
@@ -688,15 +688,41 @@ function DemoDialog({ open, onClose, targets }: { open: boolean; onClose: () => 
 
 function TransfersDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const files = useLabStore((store) => store.classroom?.files) ?? [];
+  const collects = useLabStore((store) => store.classroom?.collects) ?? [];
   const openReceived = async () => {
     try { const path = await api.openRecvDir(); if (path) toast.info(`接收目录：${path}`); }
     catch (error) { toast.error(error instanceof Error ? error.message : "打开接收目录失败"); }
   };
+  const statBadge = (stat: string) => {
+    switch (stat) {
+      case "ok": return <Badge className="bg-emerald-500/15 text-emerald-600">完成</Badge>;
+      case "quota": return <Badge className="bg-amber-500/15 text-amber-600">部分·超限</Badge>;
+      case "empty": return <Badge variant="secondary">无文件</Badge>;
+      case "denied": return <Badge variant="destructive">被拒</Badge>;
+      default: return <Badge variant="destructive">失败</Badge>;
+    }
+  };
   return (
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
       <DialogContent className="sm:max-w-lg">
-        <DialogHeader><DialogTitle>文件传输</DialogTitle><DialogDescription>分发与收取的实时进度。</DialogDescription></DialogHeader>
-        <div className="max-h-80 overflow-y-auto"><TransferList files={files} /></div>
+        <DialogHeader><DialogTitle>文件传输</DialogTitle><DialogDescription>分发与收取的实时进度，以及目录收取的逐设备结果。</DialogDescription></DialogHeader>
+        <div className="max-h-80 overflow-y-auto space-y-4">
+          {collects.length > 0 && (
+            <div>
+              <p className="mb-1.5 text-xs font-medium text-muted-foreground">目录收取结果</p>
+              <ul className="space-y-1.5">
+                {collects.slice(0, 30).map((c) => (
+                  <li key={c.id} className="flex items-center gap-2 text-xs">
+                    {statBadge(c.stat)}
+                    <span className="font-medium">{c.label || c.deviceId}</span>
+                    <span className="text-muted-foreground">{c.detail}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          <TransferList files={files} />
+        </div>
         <DialogFooter>
           <Button size="sm" variant="outline" onClick={() => void openReceived()}><ArrowDownToLine />打开接收目录</Button>
         </DialogFooter>
@@ -827,7 +853,7 @@ function CollectDialog({ open, onClose, onSubmit }: { open: boolean; onClose: ()
           <div className="space-y-2">
             <label className="grid gap-1.5 text-xs font-medium">学生机目录<Input value={dir} onChange={(e) => setDir(e.target.value)} placeholder="C:\\Users\\Public\\Desktop\\作业" /></label>
             <label className="grid gap-1.5 text-xs font-medium">匹配规则<Input value={glob} onChange={(e) => setGlob(e.target.value)} placeholder="*.* 或 *.docx" /></label>
-            <p className="text-xs text-muted-foreground">学生无需操作，匹配文件将自动上传（仅允许 C:\Users\Public 与 C:\LabHelper 之下的目录；单机 ≤64 个文件、总量 ≤256MB、单文件 ≤128MB）。结果会逐台显示在「文件传输」。</p>
+            <p className="text-xs text-muted-foreground">学生无需操作，匹配文件将自动上传（仅允许 C:\Users\Public 与 C:\LabHelper\Homework 之下的目录；单机尝试 ≤64 个文件、总量 ≤256MB、单文件 ≤128MB）。结果会逐台显示在「文件传输」。</p>
           </div>
         )}
         <DialogFooter>

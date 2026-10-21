@@ -81,6 +81,9 @@ type Server struct {
 	// 都能直接混入课堂。
 	AutoApprove bool
 
+	// boundPort 是实际监听的 TCP 端口（TCPPort=0 时为内核分配值）。
+	boundPort atomic.Int32
+
 	mu        sync.Mutex
 	devices   map[string]*Device     // id -> device
 	sessions  map[string]*clientConn // id -> 在线会话
@@ -98,6 +101,7 @@ type Server struct {
 	demo           *demoState             // 唯一学生演示活动
 	helpRequests   map[string]HelpRequest
 	transfers      map[string]*FileProgress // 文件传输记录
+	collectResults []CollectResult          // 目录收取逐设备回执（最新 100 条）
 	inFiles        map[string]*incoming     // 接收中的学生提交
 	inReservations map[string]incomingReservation
 	fileAcks       map[string]chan FileMsg
@@ -257,7 +261,9 @@ func (s *Server) tcpLoop(ctx context.Context) {
 			time.Sleep(3 * time.Second)
 			continue
 		}
-		log.Printf("lan: TCP 监听 :%d", s.TCPPort)
+		// TCPPort=0 时记录内核分配的真实端口（测试/信标取这里）。
+		s.boundPort.Store(int32(ln.Addr().(*net.TCPAddr).Port))
+		log.Printf("lan: TCP 监听 :%d", ln.Addr().(*net.TCPAddr).Port)
 		s.acceptLoop(ctx, ln)
 		// acceptLoop 返回说明监听失败或 ctx 结束
 	}
@@ -293,8 +299,15 @@ func (s *Server) acceptLoop(ctx context.Context, ln net.Listener) {
 
 // ---- UDP 发现应答 ----
 
+// effectivePort 返回对外广播的 TCP 端口：TCPPort=0 时用内核分配值。
+func (s *Server) effectivePort() int {
+	if p := s.boundPort.Load(); p != 0 {
+		return int(p)
+	}
+	return s.TCPPort
+}
+
 func (s *Server) discoverLoop(ctx context.Context) {
-	beacon := encodeBeacon(s.TCPPort, s.ID.Pub())
 	buf := make([]byte, 256)
 	for ctx.Err() == nil {
 		// 与 tcpLoop 同理：端口被占就等一会儿再抢
@@ -314,7 +327,7 @@ func (s *Server) discoverLoop(ctx context.Context) {
 				continue
 			}
 			if string(buf[:min(n, len(DiscoverMagic))]) == DiscoverMagic {
-				c.WriteToUDP(beacon, src)
+				c.WriteToUDP(encodeBeacon(s.effectivePort(), s.ID.Pub()), src)
 			}
 		}
 		c.Close()
@@ -437,16 +450,20 @@ func (s *Server) handle(cc *clientConn, m Msg) {
 			return
 		}
 		if m.Alert.Kind == "collect" {
-			// 目录收取的逐设备结果（成功/无匹配/失败原因）记到传输列表，
-			// 教师能在「文件传输」里看到每台机器的真实收态。
+			// 目录收取的逐设备结果进独立的 CollectResult 列表（不伪装成
+			// 文件传输——"无匹配/权限不足/超限"都不是 100% 传输成功）。
 			s.mu.Lock()
 			label := ""
 			if d := s.devices[cc.devID]; d != nil {
 				label = d.Label
 			}
-			s.transfers[fmt.Sprintf("collect-%s-%d", cc.devID, time.Now().UnixNano())] = &FileProgress{
-				ID: fmt.Sprintf("collect-%s", cc.devID), DeviceID: cc.devID,
-				Label: label, Name: m.Alert.Detail, Done: true, In: true, At: time.Now(),
+			s.collectResults = append(s.collectResults, CollectResult{
+				ID:       fmt.Sprintf("%s-%d", cc.devID, time.Now().UnixNano()),
+				DeviceID: cc.devID, Label: label,
+				Stat: m.Alert.Stat, Detail: m.Alert.Detail, At: time.Now(),
+			})
+			if len(s.collectResults) > 100 {
+				s.collectResults = s.collectResults[len(s.collectResults)-100:]
 			}
 			s.mu.Unlock()
 			s.changed()

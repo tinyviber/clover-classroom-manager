@@ -236,26 +236,29 @@ func waitFor(t *testing.T, d time.Duration, what string, cond func() bool) {
 	}
 }
 
-func startTestServer(t *testing.T, port int) (*Server, context.CancelFunc) {
+// startTestServer 用 TCPPort=0 让内核分配空闲端口——固定端口在并行/
+// 快速重跑时会撞上旧监听还没退出。启动后从 srv.TCPPort 读真实端口。
+func startTestServer(t *testing.T) (*Server, context.CancelFunc) {
 	t.Helper()
 	id, err := GenIdentity()
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := NewServer(id, port)
+	srv := NewServer(id, 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	if err := srv.Run(ctx); err != nil {
 		cancel()
 		t.Fatal(err)
 	}
+	waitFor(t, 3*time.Second, "TCP 监听就绪", func() bool { return srv.boundPort.Load() != 0 })
 	return srv, cancel
 }
 
-func startTestAgent(t *testing.T, ctx context.Context, srv *Server, port int, id, name string) *Agent {
+func startTestAgent(t *testing.T, ctx context.Context, srv *Server, id, name string) *Agent {
 	t.Helper()
 	a := NewAgent(id, name)
 	a.PinnedPub = srv.ID.Pub()
-	a.DirectAddr = "127.0.0.1:" + fmt.Sprint(port)
+	a.DirectAddr = fmt.Sprintf("127.0.0.1:%d", srv.boundPort.Load())
 	go a.Run(ctx)
 	waitFor(t, 5*time.Second, "agent 上线", func() bool {
 		d, ok := srv.GetDevice(id)
@@ -281,11 +284,11 @@ func TestOfflineGuardEmergencyUnlock(t *testing.T) {
 	offlineGuardDelay = 60 * time.Millisecond
 	defer func() { offlineGuardDelay = old }()
 
-	srv, stopSrv := startTestServer(t, 47895)
+	srv, stopSrv := startTestServer(t)
 	defer stopSrv()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	a := startTestAgent(t, ctx, srv, 47895, "pc-g", "PC-G")
+	a := startTestAgent(t, ctx, srv, "pc-g", "PC-G")
 	if _, err := srv.SendCommand("pc-g", OpSetFeatures, SetFeaturesArgs{Keys: []string{"guard_offline"}}); err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +298,7 @@ func TestOfflineGuardEmergencyUnlock(t *testing.T) {
 	})
 
 	// 断线：关掉服务端侧连接，并把 agent 的直连地址指到死端口让它重连不上。
-	goodAddr := a.DirectAddr
+	goodAddr := a.directAddr()
 	killConn := func() {
 		srv.mu.Lock()
 		cc := srv.sessions["pc-g"]
@@ -303,7 +306,7 @@ func TestOfflineGuardEmergencyUnlock(t *testing.T) {
 		if cc == nil {
 			t.Fatal("服务端会话缺失")
 		}
-		a.DirectAddr = "127.0.0.1:1"
+		a.setDirectAddr("127.0.0.1:1")
 		_ = cc.sess.conn.Close()
 	}
 	killConn()
@@ -328,7 +331,7 @@ func TestOfflineGuardEmergencyUnlock(t *testing.T) {
 	}
 
 	// 重连：告警补发，守护解锁且下轮断线可重新上弦。
-	a.DirectAddr = goodAddr
+	a.setDirectAddr(goodAddr)
 	waitFor(t, 5*time.Second, "重连后告警送达", func() bool {
 		d, _ := srv.GetDevice("pc-g")
 		return d.Alerts > 0
@@ -364,14 +367,20 @@ func TestPowerScheduleSemantics(t *testing.T) {
 		t.Fatal("普通关机竟立即执行")
 	case <-time.After(50 * time.Millisecond):
 	}
-	// 取消后到期不执行
-	a.cancelScheduledPower()
+	// 取消后到期不执行；重复取消如实返回 false（没有进行中的倒计时）。
+	if !a.cancelScheduledPower() {
+		t.Fatal("进行中的倒计时取消失败")
+	}
+	if a.cancelScheduledPower() {
+		t.Fatal("空取消竟报成功")
+	}
 	select {
 	case <-fired:
 		t.Fatal("取消的倒计时仍执行了")
 	case <-time.After(200 * time.Millisecond):
 	}
-	// 重新排程 → 到期以非强制语义执行
+	// 重新排程 → 到期以非强制语义执行；执行后取消必须返回 false
+	// （已进入执行阶段，无法再撤回）。
 	if err := a.schedulePower(OpShutdown, false); err != nil {
 		t.Fatal(err)
 	}
@@ -382,6 +391,14 @@ func TestPowerScheduleSemantics(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("倒计时到期未执行")
+	}
+	waitFor(t, time.Second, "执行阶段完成", func() bool {
+		a.powerMu.Lock()
+		defer a.powerMu.Unlock()
+		return a.powerTimer == nil
+	})
+	if a.cancelScheduledPower() {
+		t.Fatal("已执行的关机竟还能取消")
 	}
 	// 强制模式立即执行且带 force
 	if err := a.schedulePower(OpShutdown, true); err != nil {
@@ -400,12 +417,12 @@ func TestPowerScheduleSemantics(t *testing.T) {
 // 高清查看不被缩略图监看重发覆盖 + 单焦点：重发 screenWatch 后
 // A 机仍保持 hi 订阅；切到 B 机查看时 A 的 hi 关闭。
 func TestHiViewSurvivesScreenWatch(t *testing.T) {
-	srv, stopSrv := startTestServer(t, 47896)
+	srv, stopSrv := startTestServer(t)
 	defer stopSrv()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	a1 := startTestAgent(t, ctx, srv, 47896, "pc-a", "PC-A")
-	startTestAgent(t, ctx, srv, 47896, "pc-b", "PC-B")
+	a1 := startTestAgent(t, ctx, srv, "pc-a", "PC-A")
+	startTestAgent(t, ctx, srv, "pc-b", "PC-B")
 
 	srv.SetScreenWatch([]string{"pc-a", "pc-b"}, true)
 	waitFor(t, 3*time.Second, "pc-a 缩略图订阅", func() bool {
@@ -417,15 +434,15 @@ func TestHiViewSurvivesScreenWatch(t *testing.T) {
 	// 双击看大图 → 再因其他设备重连重发全班监看 → A 必须保持 hi。
 	srv.ViewDevice("pc-a", true)
 	waitFor(t, 3*time.Second, "pc-a hi 订阅", func() bool {
-		a1.watchHiMu.Lock()
-		defer a1.watchHiMu.Unlock()
+		a1.watchMu.Lock()
+		defer a1.watchMu.Unlock()
 		return a1.watchHi
 	})
 	srv.SetScreenWatch([]string{"pc-a", "pc-b"}, true)
 	time.Sleep(300 * time.Millisecond) // 让重发命令抵达 agent
-	a1.watchHiMu.Lock()
+	a1.watchMu.Lock()
 	hi := a1.watchHi
-	a1.watchHiMu.Unlock()
+	a1.watchMu.Unlock()
 	if !hi {
 		t.Fatal("缩略图监看重发覆盖了高清查看")
 	}
@@ -433,8 +450,8 @@ func TestHiViewSurvivesScreenWatch(t *testing.T) {
 	// 单焦点：切去 B 查看时 A 的 hi 订阅被关闭。
 	srv.ViewDevice("pc-b", true)
 	waitFor(t, 3*time.Second, "pc-a hi 关闭", func() bool {
-		a1.watchHiMu.Lock()
-		defer a1.watchHiMu.Unlock()
+		a1.watchMu.Lock()
+		defer a1.watchMu.Unlock()
 		return !a1.watchHi
 	})
 	srv.mu.Lock()
@@ -463,30 +480,42 @@ func TestCollectDirConstraints(t *testing.T) {
 	f.Close()
 
 	a := NewAgent("pc-c", "PC-C")
-	alertDetail := func() string {
+	alertResult := func() (string, string) {
 		a.pendMu.Lock()
 		defer a.pendMu.Unlock()
 		if len(a.pendAlerts) == 0 {
-			return ""
+			return "", ""
 		}
-		d := a.pendAlerts[len(a.pendAlerts)-1].Detail
+		last := a.pendAlerts[len(a.pendAlerts)-1]
 		a.pendAlerts = nil
-		return d
+		return last.Stat, last.Detail
 	}
 
-	// 越界路径被拒
+	// 不在白名单的绝对路径被拒（白名单在 agent 侧，不只管理端）
+	outside := t.TempDir()
+	a.collectDir(nil, CollectOpenArgs{Dir: outside, Glob: "*"})
+	if stat, d := alertResult(); stat != "denied" {
+		t.Fatalf("白名单外路径未被拒: stat=%q %q", stat, d)
+	}
+
+	// 注入临时根目录模拟学校预设作业目录
+	oldRoots := AllowedCollectRoots
+	AllowedCollectRoots = []string{dir}
+	defer func() { AllowedCollectRoots = oldRoots }()
+
+	// 越界语法被拒
 	a.collectDir(nil, CollectOpenArgs{Dir: "..\\Windows", Glob: "*"})
-	if d := alertDetail(); !strings.Contains(d, "路径无效") {
-		t.Fatalf("越界路径未被拒: %q", d)
+	if stat, d := alertResult(); stat != "denied" || !strings.Contains(d, "路径无效") {
+		t.Fatalf("越界路径未被拒: stat=%q %q", stat, d)
 	}
 	// 无匹配
 	a.collectDir(nil, CollectOpenArgs{Dir: dir, Glob: "*.zzz"})
-	if d := alertDetail(); !strings.Contains(d, "无匹配文件") {
-		t.Fatalf("无匹配未上报: %q", d)
+	if stat, d := alertResult(); stat != "empty" || !strings.Contains(d, "无匹配文件") {
+		t.Fatalf("无匹配未上报: stat=%q %q", stat, d)
 	}
 	// 有匹配但离线：上传全部失败也要如实上报，大文件被跳过
 	a.collectDir(nil, CollectOpenArgs{Dir: dir, Glob: "*.txt"})
-	if d := alertDetail(); !strings.Contains(d, "上传失败") {
-		t.Fatalf("离线上传失败未上报: %q", d)
+	if stat, d := alertResult(); stat != "fail" || !strings.Contains(d, "上传失败") {
+		t.Fatalf("离线上传失败未上报: stat=%q %q", stat, d)
 	}
 }

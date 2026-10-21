@@ -141,8 +141,8 @@ type Lab struct {
 	castMu      sync.Mutex
 	classroomMu sync.Mutex // 序列化教师广播与学生演示的启停/冲突检查。
 	castCancel  context.CancelFunc
-	castQuality string // 画质档："perfect"|"better"|"normal"|"low"
-	castTitle   string // 窗口广播钉住的共享窗口标题（""=非窗口模式）
+	castQuality string       // 画质档："perfect"|"better"|"normal"|"low"
+	castTitle   string       // 窗口广播钉住的共享窗口标题（""=非窗口模式）
 	castBar     *mygo.Window // 广播悬浮控制条（Panel 小窗）
 
 	seatMu   sync.Mutex
@@ -189,6 +189,16 @@ type ClassroomFileProgress struct {
 	At       string `json:"at"`
 }
 
+// ClassroomCollectResult 是一台设备的目录收取回执（结构化结果，不是传输进度）。
+type ClassroomCollectResult struct {
+	ID       string `json:"id"`
+	DeviceID string `json:"deviceId"`
+	Label    string `json:"label"`
+	Stat     string `json:"stat"` // ok / empty / denied / quota / fail
+	Detail   string `json:"detail"`
+	At       string `json:"at"`
+}
+
 type ClassroomHelpRequest struct {
 	DeviceID string `json:"deviceId"`
 	Label    string `json:"label"`
@@ -226,19 +236,20 @@ type ClassroomDemo struct {
 
 // ClassroomState is the push snapshot for classroom activities.
 type ClassroomState struct {
-	Screens        []ScreenFrame           `json:"screens"`
-	ScreenWatchIDs []string                `json:"screenWatchIds"`
-	SignIn         ClassroomSignIn         `json:"signIn"`
-	Files          []ClassroomFileProgress `json:"files"`
-	Helps          []ClassroomHelpRequest  `json:"helps"`
-	Poll           ClassroomPoll           `json:"poll"`
-	Demo           ClassroomDemo           `json:"demo"`
-	CastMode       string                  `json:"castMode"`
-	CastTargetIDs  []string                `json:"castTargetIds"`
-	CastQuality    string                  `json:"castQuality"`
-	CastTitle      string                  `json:"castTitle"` // 窗口模式共享的窗口标题
-	FocusID        string                  `json:"focusId"`   // 正在高清查看的设备
-	FocusScreen    *ScreenFrame            `json:"focusScreen,omitempty"`
+	Screens        []ScreenFrame            `json:"screens"`
+	ScreenWatchIDs []string                 `json:"screenWatchIds"`
+	SignIn         ClassroomSignIn          `json:"signIn"`
+	Files          []ClassroomFileProgress  `json:"files"`
+	Collects       []ClassroomCollectResult `json:"collects"`
+	Helps          []ClassroomHelpRequest   `json:"helps"`
+	Poll           ClassroomPoll            `json:"poll"`
+	Demo           ClassroomDemo            `json:"demo"`
+	CastMode       string                   `json:"castMode"`
+	CastTargetIDs  []string                 `json:"castTargetIds"`
+	CastQuality    string                   `json:"castQuality"`
+	CastTitle      string                   `json:"castTitle"` // 窗口模式共享的窗口标题
+	FocusID        string                   `json:"focusId"`   // 正在高清查看的设备
+	FocusScreen    *ScreenFrame             `json:"focusScreen,omitempty"`
 }
 
 // Devices returns the current device list.
@@ -409,7 +420,7 @@ func (l *Lab) loadSeats() {
 		return
 	}
 	var saved struct {
-		Cols  int              `json:"cols"`
+		Cols  int               `json:"cols"`
 		Seats map[string][2]int `json:"seats"`
 	}
 	if json.Unmarshal(b, &saved) != nil {
@@ -428,7 +439,7 @@ func (l *Lab) loadSeats() {
 func (l *Lab) saveSeats() {
 	l.seatMu.Lock()
 	saved := struct {
-		Cols  int              `json:"cols"`
+		Cols  int               `json:"cols"`
 		Seats map[string][2]int `json:"seats"`
 	}{Cols: l.seatCols, Seats: l.seatMap}
 	l.seatMu.Unlock()
@@ -768,11 +779,12 @@ func (l *Lab) ClassroomState() ClassroomState {
 		Screens:        make([]ScreenFrame, 0, len(frames)),
 		ScreenWatchIDs: l.srv.ScreenWatchTargets(),
 		Files:          make([]ClassroomFileProgress, 0),
+		Collects:       make([]ClassroomCollectResult, 0),
 		Helps:          make([]ClassroomHelpRequest, 0),
 		CastMode:       l.CastMode(),
 		CastTargetIDs:  l.srv.CastTargets(),
 		CastQuality:    l.quality(),
-		CastTitle:     l.castTitleForUI(),
+		CastTitle:      l.castTitleForUI(),
 	}
 	for _, frame := range frames {
 		state.Screens = append(state.Screens, ScreenFrame{
@@ -802,6 +814,12 @@ func (l *Lab) ClassroomState() ClassroomState {
 			ID: transfer.ID, DeviceID: transfer.DeviceID, Label: transfer.Label, Name: transfer.Name,
 			Size: transfer.Size, Sent: transfer.Sent, Done: transfer.Done, In: transfer.In,
 			Err: transfer.Err, At: activityTime(transfer.At),
+		})
+	}
+	for _, result := range l.srv.CollectResults() {
+		state.Collects = append(state.Collects, ClassroomCollectResult{
+			ID: result.ID, DeviceID: result.DeviceID, Label: result.Label,
+			Stat: result.Stat, Detail: result.Detail, At: activityTime(result.At),
 		})
 	}
 	for _, request := range l.srv.HelpRequests() {
@@ -991,18 +1009,16 @@ func (l *Lab) CastStop() {
 
 func (l *Lab) CastMode() string { return l.srv.CastMode() }
 
-// collectRoots 指定目录收取允许的根目录白名单（学校预设作业目录语义）。
-// 放开任意路径等于把整个学生机目录树变成可远程抓取面。
-var collectRoots = []string{`C:\Users\Public`, `C:\LabHelper`}
-
+// validCollectDir 教师端预检：目录必须在 lan.AllowedCollectRoots
+// 白名单下（agent 侧还会再验——管理端拦截只是 UX，agent 是安全边界）。
 func validCollectDir(dir string) bool {
 	if dir == "" || strings.Contains(dir, "..") || strings.HasPrefix(dir, `\\`) {
 		return false
 	}
-	low := strings.ToLower(dir)
-	for _, root := range collectRoots {
-		r := strings.ToLower(root)
-		if low == r || strings.HasPrefix(low, r+`\`) {
+	low := strings.ToLower(filepath.ToSlash(dir))
+	for _, root := range lan.AllowedCollectRoots {
+		r := strings.ToLower(filepath.ToSlash(filepath.Clean(root)))
+		if low == r || strings.HasPrefix(low, r+"/") {
 			return true
 		}
 	}

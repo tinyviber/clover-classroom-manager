@@ -64,6 +64,28 @@ type HelpRequest struct {
 	At       time.Time `json:"at"`
 }
 
+// CollectResult 是一次「指定目录收取」的逐设备回执（与 FileProgress
+// 分开——操作结果不是传输进度）。
+type CollectResult struct {
+	ID       string    `json:"id"` // deviceID-时间戳，React key 用，天然唯一
+	DeviceID string    `json:"deviceId"`
+	Label    string    `json:"label"`
+	Stat     string    `json:"stat"` // ok / empty / denied / quota / fail
+	Detail   string    `json:"detail"`
+	At       time.Time `json:"at"`
+}
+
+// CollectResults 返回最近的收取结果（新→旧，上限 100 条）。
+func (s *Server) CollectResults() []CollectResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]CollectResult, len(s.collectResults))
+	for i, r := range s.collectResults {
+		out[len(s.collectResults)-1-i] = r
+	}
+	return out
+}
+
 type PollReply struct {
 	DeviceID string    `json:"deviceId"`
 	Label    string    `json:"label"`
