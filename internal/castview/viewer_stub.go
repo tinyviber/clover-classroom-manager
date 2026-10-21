@@ -11,15 +11,18 @@ var once sync.Once
 
 // Show 开发 stub：只记日志（无窗口）。
 func Show(mode string) {
+	if Disabled.Load() {
+		return
+	}
 	once.Do(func() { log.Printf("castview: 非 Windows 平台，广播窗以 stub 运行") })
 	log.Printf("castview: show %s", mode)
 }
 
-// OnExit 学生端「退出广播」回调（非 Windows 无悬浮条，占位）。
-var OnExit func()
-
-// OnEmergencyUnlock 紧急解锁回调（非 Windows 无键鼠钩子，占位）。
-var OnEmergencyUnlock func()
+// RunHost 非 Windows 无 viewer 子进程；直接报错退出。
+func RunHost() int {
+	log.Printf("castview: -castview 仅 Windows 可用")
+	return 1
+}
 
 // Frame 收到一帧（丢弃）。
 func Frame(jpeg []byte) {}

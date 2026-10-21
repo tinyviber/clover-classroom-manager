@@ -229,11 +229,15 @@ export const Lab = {
   },
   /**
    * ExportClientPackage 生成学生机安装包到所选目录，返回实际输出路径。
-   * 含 client.json（已写入管理端地址+公钥）、安装脚本，以及 agent.exe。
-   * 发行版的 agent 嵌在管理端里；开发构建则使用管理端旁边的 agent.exe。
+   * 含 client.json（已写入管理端地址+公钥）、install.bat、README.txt，
+   * 以及 agent.exe（若存在，见 agentCandidates）。
    */
   exportClientPackage(addr: string): Promise<string> {
     return call("Lab.ExportClientPackage", addr);
+  },
+  /** ExportClientPackageTo 生成安装包到 dir（不弹对话框——headless zip 下载端点用）。 */
+  exportClientPackageTo(dir: string, addr: string): Promise<void> {
+    return call("Lab.ExportClientPackageTo", dir, addr);
   },
   /** FocusAdmin 唤起管理端主窗口（悬浮条的「显示管理端」按钮）。 */
   focusAdmin(): Promise<void> {
@@ -278,6 +282,14 @@ export const Lab = {
   /** RejectDevices 拒绝待注册设备：移出注册表并断开连接。 */
   rejectDevices(ids: string[]): Promise<number> {
     return call("Lab.RejectDevices", ids);
+  },
+  /**
+   * RemoveDevices 从注册表删除任意设备（在线的先下发解锁/停广播再断开）。
+   * agent 重连后只能重新注册为待审批，不会自动恢复课堂资格。
+   * 同时清掉座位布局里的陈旧条目。
+   */
+  removeDevices(ids: string[]): Promise<number> {
+    return call("Lab.RemoveDevices", ids);
   },
   /** SaveSeats 保存座位布局（拖拽结果整体回写）。 */
   saveSeats(seats: Record<string, number[]>): Promise<void> {

@@ -47,13 +47,26 @@ jobs:
       - name: Build client agent
         run: |
           mkdir -p packaging/windows
-          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -H windowsgui" -o packaging/windows/agent.exe ./cmd/client
+          # agent 需兼容 Win7：go1.20 是最后官方支持 Win7 的 Go，配合 agent.go.mod 降版依赖；
+          # 产出到 packaging/windows/agent.exe 供管理端 -tags=embedagent 嵌入
+          GOTOOLCHAIN=go1.20.14 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=agent.go.mod -trimpath -ldflags="-s -w -H windowsgui" -o packaging/windows/agent.exe ./cmd/client
+          python3 -c "import struct; d=open('packaging/windows/agent.exe','rb').read(); o=struct.unpack_from('<I',d,0x3C)[0]; assert struct.unpack_from('<H',d,o+64)[0]<=6, 'agent.exe PE min OS > 6.1, breaks Windows 7'"
 
       - name: Build management app
         run: bunx mygo build -platform windows/amd64 -o build
         env:
           CGO_ENABLED: "0"
           GOFLAGS: "-tags=embedagent"
+
+      - name: Build headless manager (Windows 7+)
+        run: |
+          mkdir -p build/manager-headless
+          # headless 管理端 embed 前端产物（mygo build 已跑过 build:web 产出 dist/）
+          cp -r dist/. cmd/manager-headless/dist/
+          # agent.exe 拷进包目录供 embedagent 嵌入——单独下载 headless exe 也能导出完整安装包
+          cp packaging/windows/agent.exe cmd/manager-headless/agent.exe
+          GOTOOLCHAIN=go1.20.14 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=agent.go.mod -tags=embedagent -trimpath -ldflags="-s -w" -o build/manager-headless/manager-headless.exe ./cmd/manager-headless
+          python3 -c "import struct; d=open('build/manager-headless/manager-headless.exe','rb').read(); o=struct.unpack_from('<I',d,0x3C)[0]; assert struct.unpack_from('<H',d,o+64)[0]<=6, 'manager-headless.exe PE min OS > 6.1, breaks Windows 7'"
 
       - name: Assemble release assets
         shell: bash
@@ -73,10 +86,26 @@ jobs:
           fi
 
           release_dir="dist/release"
-          mkdir -p "$release_dir"
+          manager_dir="dist/manager-package"
+          agent_exe="packaging/windows/agent.exe"
+          headless_exe="build/manager-headless/manager-headless.exe"
+          mkdir -p "$release_dir" "$manager_dir"
+
           manager_name="clover-classroom-manager-${version}-windows-x64.exe"
+          headless_name="clover-classroom-manager-headless-${version}-windows-x64.exe"
+          manager_zip="clover-classroom-manager-${version}-windows-x64.zip"
+
           cp "$manager_exe" "$release_dir/$manager_name"
-          (cd "$release_dir" && sha256sum *.exe > SHA256SUMS.txt)
+          cp "$headless_exe" "$release_dir/$headless_name"
+
+          cp "$manager_exe" "$manager_dir/Clover-Classroom-Manager.exe"
+          cp "$headless_exe" "$manager_dir/Clover-Classroom-Manager-Win7.exe"
+          cp "$agent_exe" "$manager_dir/agent.exe"
+          cp public/clover-mark.svg "$manager_dir/clover-mark.svg"
+          cp packaging/windows/manager/README.txt "$manager_dir/README.txt"
+          (cd "$manager_dir" && zip -qr "../release/$manager_zip" .)
+
+          (cd "$release_dir" && sha256sum *.exe *.zip > SHA256SUMS.txt)
 
       - name: Upload Windows x64 build artifact
         if: github.event_name == 'push'
@@ -109,9 +138,11 @@ jobs:
           body: |
             三叶草（Clover）局域网课堂管理的 Windows x64 版本。
 
-            - 管理端 EXE：教师机运行。学生端已包含在程序内，用「分发客户端」导出安装包，其中写入当前管理端地址和公钥，并带上学生端 agent。
+            - 管理端 EXE：教师机运行，需 Windows 10+（mygo/WebView2）。学生端 agent 已嵌在程序内，「分发客户端」导出安装包时写入当前管理端地址和公钥。
+            - 管理端 headless EXE：无窗口管理端，教师用浏览器打开同一套管理界面，可在 Windows 7 运行。
+            - 管理端 ZIP：内含桌面管理端、Win7 headless 管理端与学生端 agent.exe——客户端安装包由管理端自动生成，不单发。
             - `SHA256SUMS.txt`：发布文件校验和。
 
-            管理端为 Windows x86_64。学生机请安装管理端导出的安装包。
+            管理端 GUI 需 Windows 10+；headless 管理端与学生端 agent 为 Windows 7+。首次连接前请使用管理端导出的配置固定公钥；安装说明见 ZIP 内 README。
           files: dist/release/*
           fail_on_unmatched_files: true

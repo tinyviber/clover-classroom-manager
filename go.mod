@@ -6,6 +6,7 @@ require (
 	github.com/egoist/mygo v0.5.5
 	github.com/kbinani/screenshot v0.0.0-20250624051815-089614a94018
 	github.com/lxn/win v0.0.0-20210218163916-a377121e959e
+	golang.org/x/crypto v0.58.0
 	golang.org/x/image v0.47.0
 	golang.org/x/sys v0.49.0
 )

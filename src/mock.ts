@@ -375,6 +375,7 @@ export const mockLab = {
     };
   },
   async exportClientPackage(_addr: string) { return ""; },
+  async exportClientPackageTo(_dir: string, _addr: string) {},
   async approveDevices(ids: string[]) {
     let n = 0;
     for (const d of state.devices) if (ids.includes(d.id) && d.pending) { d.pending = false; n++; }
@@ -384,6 +385,12 @@ export const mockLab = {
   async rejectDevices(ids: string[]) {
     const before = state.devices.length;
     state.devices = state.devices.filter((d) => !(ids.includes(d.id) && d.pending));
+    if (state.devices.length !== before) emit();
+    return before - state.devices.length;
+  },
+  async removeDevices(ids: string[]) {
+    const before = state.devices.length;
+    state.devices = state.devices.filter((d) => !ids.includes(d.id));
     if (state.devices.length !== before) emit();
     return before - state.devices.length;
   },

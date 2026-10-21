@@ -55,14 +55,24 @@ func Start(ctx context.Context, agent *lan.Agent) (*UI, error) {
 	origin := fmt.Sprintf("http://127.0.0.1:%d", port)
 	ui := &server{agent: agent, token: hex.EncodeToString(tokenBytes), origin: origin, uploadSlots: make(chan struct{}, 2)}
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /", ui.page)
-	mux.HandleFunc("GET /api/state", ui.state)
-	mux.HandleFunc("POST /api/signin", ui.signIn)
-	mux.HandleFunc("POST /api/poll", ui.poll)
-	mux.HandleFunc("POST /api/help", ui.help)
-	mux.HandleFunc("POST /api/demo", ui.demo)
-	mux.HandleFunc("POST /api/demo/stop", ui.demoStop)
-	mux.HandleFunc("POST /api/upload", ui.upload)
+	route := func(method, pattern string, h http.HandlerFunc) {
+		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != method {
+				w.Header().Set("Allow", method)
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			h(w, r)
+		})
+	}
+	route("GET", "/", ui.page)
+	route("GET", "/api/state", ui.state)
+	route("POST", "/api/signin", ui.signIn)
+	route("POST", "/api/poll", ui.poll)
+	route("POST", "/api/help", ui.help)
+	route("POST", "/api/demo", ui.demo)
+	route("POST", "/api/demo/stop", ui.demoStop)
+	route("POST", "/api/upload", ui.upload)
 	httpServer := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 3 * time.Second,

@@ -632,3 +632,131 @@ func TestDiscoverReleasesPortPromptly(t *testing.T) {
 	cancel()
 	waitFor(t, time.Second, "取消后立即释放 UDP 发现端口", func() bool { return !udpDiscoveryBound() })
 }
+
+// Remove 删除任意已注册设备：在线会话断开、注册表清除；
+// agent 仍在跑会重连，但只能回到 pending 等审批，不会自动恢复资格。
+func TestRemoveDevice(t *testing.T) {
+	srv, stopSrv := startTestServer(t)
+	defer stopSrv()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	startTestAgent(t, ctx, srv, "pc-del", "TEST-DEL") // 已批准在线
+	if n := srv.Remove([]string{"pc-del"}); n != 1 {
+		t.Fatalf("Remove 应删 1 台: %d", n)
+	}
+	if _, ok := srv.GetDevice("pc-del"); ok {
+		t.Fatal("设备删除后仍在注册表")
+	}
+	// agent 还在跑：重连后只能以 pending 回归
+	waitFor(t, 10*time.Second, "agent 重连为 pending", func() bool {
+		d, ok := srv.GetDevice("pc-del")
+		return ok && d.Pending
+	})
+	if _, err := srv.SendCommand("pc-del", OpSetHelper, SetHelperArgs{On: true}); err == nil {
+		t.Fatal("重连后的 pending 设备竟能收到课堂指令")
+	}
+	// 再删一次（pending 也删得掉）+ 不存在的 id 安全跳过
+	if n := srv.Remove([]string{"pc-del", "no-such"}); n != 1 {
+		t.Fatalf("重注册的设备应再计 1: %d", n)
+	}
+}
+
+// 删除设备前管理端会下发 device.unmanage：agent 置 unmanaged 抑制断线
+// 守护；重新批准时管理端下发 device.manage 显式清零，恢复守护语义。
+func TestUnmanageSuppressesOfflineGuard(t *testing.T) {
+	old := offlineGuardDelay
+	offlineGuardDelay = 60 * time.Millisecond
+	defer func() { offlineGuardDelay = old }()
+
+	srv, stopSrv := startTestServer(t)
+	defer stopSrv()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	a := startTestAgent(t, ctx, srv, "pc-um", "TEST-UM")
+	a.features.Store([]string{"guard_offline"})
+	a.helperOn.Store(true)
+
+	if _, err := srv.SendCommand("pc-um", OpUnmanage, nil); err != nil {
+		t.Fatalf("unmanage 下发失败: %v", err)
+	}
+	if !a.unmanaged.Load() {
+		t.Fatal("收到 unmanage 后 unmanaged 未置位")
+	}
+	if !a.offlineGuardOn() {
+		t.Skip("guard_offline 未生效，无法验证抑制")
+	}
+
+	// 被删后断线：守护计时器不应上弦（或上弦后不发锁）
+	srv.Remove([]string{"pc-um"})
+	time.Sleep(3 * offlineGuardDelay)
+	if a.guardIsLocked() {
+		t.Fatal("unmanaged 设备断线后仍被守护锁屏")
+	}
+
+	// 重连 pending → 重新批准 → Approve 下发 device.manage 清零抑制
+	waitFor(t, 10*time.Second, "agent 重连为 pending", func() bool {
+		d, ok := srv.GetDevice("pc-um")
+		return ok && d.Pending
+	})
+	if n := srv.Approve([]string{"pc-um"}); n != 1 {
+		t.Fatalf("重新批准失败: %d", n)
+	}
+	waitFor(t, 5*time.Second, "device.manage 清零 unmanaged", func() bool {
+		return !a.unmanaged.Load()
+	})
+}
+
+// 删除设备必须清干净关联状态：缩略图订阅/高清查看/大图焦点/求助/
+// 广播目标/签到投票回执，否则删除后仍残留订阅或陈旧状态。
+func TestRemoveCleansAssociatedState(t *testing.T) {
+	srv, stopSrv := startTestServer(t)
+	defer stopSrv()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	startTestAgent(t, ctx, srv, "pc-x", "TEST-X")
+
+	srv.mu.Lock()
+	srv.screens["pc-x"] = ScreenFrame{JPEG: []byte{1}}
+	srv.screenWatch["pc-x"] = true
+	srv.hiView["pc-x"] = true
+	srv.hiFrames["pc-x"] = ScreenFrame{JPEG: []byte{2}}
+	srv.focusID = "pc-x"
+	srv.helpRequests["pc-x"] = HelpRequest{DeviceID: "pc-x"}
+	srv.cast = &serverCast{targets: map[string]bool{"pc-x": true, "pc-y": true}, tcpOnly: map[string]bool{"pc-x": true}}
+	srv.sign = &signState{recipients: map[string]bool{"pc-x": true}, replies: map[string]SignReply{"pc-x": {DeviceID: "pc-x"}}}
+	srv.poll = &pollState{recipients: map[string]bool{"pc-x": true}, replies: map[string]PollReply{"pc-x": {DeviceID: "pc-x"}}}
+	srv.mu.Unlock()
+
+	if n := srv.Remove([]string{"pc-x"}); n != 1 {
+		t.Fatalf("Remove 应删 1 台: %d", n)
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	checks := map[string]bool{
+		"screens":        srv.screens["pc-x"].JPEG == nil,
+		"screenWatch":    !srv.screenWatch["pc-x"],
+		"hiView":         !srv.hiView["pc-x"],
+		"hiFrames":       srv.hiFrames["pc-x"].JPEG == nil,
+		"focusID":        srv.focusID == "",
+		"helpRequests":   srv.helpRequests["pc-x"].DeviceID == "",
+		"cast.targets":   !srv.cast.targets["pc-x"],
+		"cast.tcpOnly":   !srv.cast.tcpOnly["pc-x"],
+		"sign.recipient": !srv.sign.recipients["pc-x"],
+		"sign.reply":     srv.sign.replies["pc-x"].DeviceID == "",
+		"poll.recipient": !srv.poll.recipients["pc-x"],
+		"poll.reply":     srv.poll.replies["pc-x"].DeviceID == "",
+	}
+	for name, ok := range checks {
+		if !ok {
+			t.Errorf("删除后 %s 仍残留 pc-x 状态", name)
+		}
+	}
+	// 广播的其他目标不受影响
+	if !srv.cast.targets["pc-y"] {
+		t.Error("删除 pc-x 不应动 pc-y 的广播目标")
+	}
+}

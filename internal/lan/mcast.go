@@ -19,7 +19,6 @@ package lan
 import (
 	"context"
 	"crypto/cipher"
-	"crypto/hkdf"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -79,7 +78,7 @@ func castNonce(session uint32, frame uint64) []byte {
 
 // castTagKey 由会话密钥导出数据报认证密钥（与 GCM 帧密钥分离）。
 func castTagKey(key []byte) ([]byte, error) {
-	return hkdf.Key(sha256.New, key, nil, "clcf-dgram", 32)
+	return hkdfKey(key, nil, "clcf-dgram")
 }
 
 // castTag 计算数据报认证 tag（覆盖头部+负载）。
@@ -152,7 +151,7 @@ func NewCastSender(p CastSessionParams, ifIP net.IP) (*CastSender, error) {
 }
 
 // multicastOutIP 用 UDP connect 探测内核会给该组播组选的源地址
-//（即默认路由的出口 IP）；失败时退回第一张局域网 IPv4。
+// （即默认路由的出口 IP）；失败时退回第一张局域网 IPv4。
 func multicastOutIP(conn *net.UDPConn, group net.IP) net.IP {
 	probe, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: group, Port: CastUDPPort})
 	if err == nil {

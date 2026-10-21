@@ -1,6 +1,9 @@
 node_modules/
 /dist/
 /build/
+# headless 管理端 embed 的前端产物（构建时由 dist/ 拷入，.gitkeep 占位除外）
+/cmd/manager-headless/dist/*
+!/cmd/manager-headless/dist/.gitkeep
 /.mygo/
 /.serena/
 mygo_windows_*.syso

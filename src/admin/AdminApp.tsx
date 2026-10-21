@@ -8,7 +8,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
-import { api, nativeRuntime, onClassroomChanged, onDevicesChanged } from "@/api";
+import { api, clientPackageURL, nativeRuntime, onClassroomChanged, onDevicesChanged, remoteRuntime } from "@/api";
 import { useLabStore } from "@/store";
 import type { AdminInfo } from "@/mygo";
 import { DevicesView } from "./DevicesView";
@@ -102,7 +102,7 @@ export function AdminApp() {
             <Button variant={view === "classroom" ? "secondary" : "ghost"} size="sm" aria-current={view === "classroom" ? "page" : undefined} onClick={() => void selectView("classroom")}><Radio />课堂</Button>
           </nav>
           <div className="order-2 ml-auto flex items-center gap-2 sm:order-none sm:ml-0">
-            <Badge variant="outline" className="hidden gap-1.5 sm:inline-flex"><span className={`size-1.5 rounded-full ${loadError ? "bg-destructive" : "bg-success"}`} />{loadError ? "服务异常" : nativeRuntime ? "管理端在线" : "预览模式"}</Badge>
+            <Badge variant="outline" className="hidden gap-1.5 sm:inline-flex"><span className={`size-1.5 rounded-full ${loadError ? "bg-destructive" : "bg-success"}`} />{loadError ? "服务异常" : nativeRuntime || remoteRuntime ? "管理端在线" : "预览模式"}</Badge>
             <Button variant="outline" size="sm" onClick={() => void scan()} disabled={loading}><RefreshCw className={`size-4 ${loading ? "animate-spin" : ""}`} /><span className="hidden md:inline">扫描</span></Button>
             <DistributionDialog />
             <Button variant="ghost" size="icon" aria-label="切换浅色或深色主题" title="切换主题" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>
@@ -178,6 +178,16 @@ function DistributionDialog() {
   const exportPackage = async () => {
     setExporting(true);
     try {
+      if (remoteRuntime) {
+        // headless：安装包 zip 由管理端生成后走浏览器下载
+        const a = document.createElement("a");
+        a.href = clientPackageURL(addr);
+        a.download = "client-package.zip";
+        a.click();
+        toast.success("安装包已开始下载");
+        setOpen(false);
+        return;
+      }
       const output = await api.exportClientPackage(addr);
       if (output) { toast.success(`安装包已导出到 ${output}`); setOpen(false); }
       else toast.info("已取消导出");

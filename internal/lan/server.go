@@ -353,7 +353,7 @@ func (s *Server) serveDiscover(ctx context.Context, c *net.UDPConn, buf []byte) 
 			}
 			return
 		}
-		if string(buf[:min(n, len(DiscoverMagic))]) == DiscoverMagic {
+		if string(buf[:imin(n, len(DiscoverMagic))]) == DiscoverMagic {
 			_, _ = c.WriteToUDP(encodeBeacon(s.effectivePort(), s.ID.Pub()), src)
 		}
 	}
@@ -680,6 +680,19 @@ func (s *Server) Approve(ids []string) int {
 		}
 	}
 	s.mu.Unlock()
+	// 若设备此前经 Remove 收到过 unmanage，重新批准须先解除抑制。
+	// OpManaged 在 Approve 返回前并行下发且等 Ack：保证线路顺序与
+	// 调用顺序一致——之后到达的 unmanage（删除）不会被更旧的
+	// manage 覆盖。课堂活动恢复仍是异步的。
+	var wg sync.WaitGroup
+	for _, id := range online {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			_, _ = s.SendCommand(id, OpManaged, nil)
+		}(id)
+	}
+	wg.Wait()
 	for _, id := range online {
 		go s.syncClientActivities(id)
 	}
@@ -706,6 +719,101 @@ func (s *Server) Reject(ids []string) int {
 	}
 	s.mu.Unlock()
 	if n > 0 {
+		s.changed()
+	}
+	return n
+}
+
+// Remove 从注册表彻底删除设备（不限待审批）：断开连接并清掉关联的
+// 屏幕墙/高清查看/广播目标/签到投票/求助/演示/文件传输等状态。
+// 设备上的 agent 还在跑的话会经发现循环重连，但只会再次注册为
+// pending 等审批——不会自动恢复课堂资格。
+//
+// 顺序很关键：先对在线设备下发解锁+停广播（并发、各自带超时），
+// 再断连删除——否则被删设备回到 pending 后收不到解锁指令，
+// 学生机可能停留在锁定态，只能靠现场紧急解锁或重新批准恢复。
+func (s *Server) Remove(ids []string) int {
+	// 尽力清场：SendCommand 等 Ack（CommandTimeout 封顶），失败的
+	// 记下日志照样继续删——UI 删除确认文案会提示教师恢复手段。
+	var wg sync.WaitGroup
+	for _, id := range ids {
+		s.mu.Lock()
+		d := s.devices[id]
+		online := s.sessions[id] != nil
+		s.mu.Unlock()
+		if d == nil || !online || d.Pending {
+			continue
+		}
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			if _, err := s.SendCommand(id, OpUnlockScreen, nil); err != nil {
+				log.Printf("lan: 删除前解锁 %s 失败: %v（学生机需现场紧急解锁）", id, err)
+			}
+			if _, err := s.SendCommand(id, OpCastStop, CastStopArgs{}); err != nil {
+				log.Printf("lan: 删除前停广播 %s 失败: %v", id, err)
+			}
+			// unmanage 放最后：先解锁/停广播再解除管控，随后断连时
+			// agent 的断线守护不再上锁（只有重新批准的 device.manage
+			// 才能把它清回去）
+			if _, err := s.SendCommand(id, OpUnmanage, nil); err != nil {
+				log.Printf("lan: 删除前解除管控 %s 失败: %v（断线守护可能仍会锁屏）", id, err)
+			}
+		}(id)
+	}
+	wg.Wait()
+
+	s.mu.Lock()
+	n := 0
+	for _, id := range ids {
+		if s.devices[id] == nil {
+			continue
+		}
+		delete(s.devices, id)
+		if cc := s.sessions[id]; cc != nil {
+			cc.sess.conn.Close()
+			delete(s.sessions, id)
+		}
+		delete(s.screens, id)
+		delete(s.screenWatch, id)
+		delete(s.hiView, id)
+		delete(s.hiFrames, id)
+		if s.focusID == id {
+			s.focusID = ""
+		}
+		delete(s.helpRequests, id)
+		if s.cast != nil {
+			delete(s.cast.targets, id)
+			delete(s.cast.tcpOnly, id)
+		}
+		if s.sign != nil {
+			delete(s.sign.recipients, id)
+			delete(s.sign.replies, id)
+		}
+		if s.poll != nil {
+			delete(s.poll.recipients, id)
+			delete(s.poll.replies, id)
+		}
+		for tid, ch := range s.fileAcks {
+			// fileAcks 键是传输 ID（f-…），按 transfers 里的 DeviceID 归属判断；
+			// close 唤醒还在等 Ack 的 fileSend goroutine，连接已断不会再有响应
+			if t := s.transfers[tid]; t != nil && t.DeviceID == id {
+				close(ch)
+				delete(s.fileAcks, tid)
+			}
+		}
+		if worker := s.frameWorkers[id]; worker != nil {
+			worker.cancel()
+			delete(s.frameWorkers, id)
+		}
+		n++
+	}
+	s.mu.Unlock()
+	if n > 0 {
+		for _, id := range ids {
+			s.cleanupIncomingForDevice(id)
+			s.stopDemoForDevice(id)
+		}
 		s.changed()
 	}
 	return n

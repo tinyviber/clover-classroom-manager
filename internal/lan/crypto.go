@@ -14,7 +14,6 @@ import (
 	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/ed25519"
-	"crypto/hkdf"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
@@ -177,11 +176,11 @@ func clientHandshake(conn net.Conn, pinned ed25519.PublicKey) (*session, ed25519
 // buildSession 由共享密钥 + 转录导出双向 AEAD 密钥。
 // client=true 表示本端是客户端：c2s 为发送方向。
 func buildSession(conn net.Conn, shared, transcript []byte, client bool) (*session, error) {
-	kC2S, err := hkdf.Key(sha256.New, shared, transcript, "lab-c2s", 32)
+	kC2S, err := hkdfKey(shared, transcript, "lab-c2s")
 	if err != nil {
 		return nil, err
 	}
-	kS2C, err := hkdf.Key(sha256.New, shared, transcript, "lab-s2c", 32)
+	kS2C, err := hkdfKey(shared, transcript, "lab-s2c")
 	if err != nil {
 		return nil, err
 	}

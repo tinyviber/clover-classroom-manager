@@ -114,7 +114,9 @@ const (
 	OpDemoStart    = "demo.start"
 	OpDemoViewer   = "demo.viewer"
 	OpDemoStop     = "demo.stop"
-	OpCollectOpen  = "collect.open" // 收取文件：学生提交到管理端接收目录
+	OpCollectOpen  = "collect.open"    // 收取文件：学生提交到管理端接收目录
+	OpUnmanage     = "device.unmanage" // 管理端删除设备前下发：解除管控，本次断线不再触发断线守护
+	OpManaged      = "device.manage"   // 教师重新批准设备后下发：清除 unmanage 抑制，恢复断线守护语义
 )
 
 type SetHelperArgs struct {

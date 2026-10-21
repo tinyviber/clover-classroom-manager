@@ -41,3 +41,25 @@ func LocalIPv4s() []string {
 	}
 	return out
 }
+
+// go1.20 兼容：min/max 内建是 go1.21 特性，agent/headless 用 go1.20 工具链构建。
+func imin(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func imin64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func imax64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}

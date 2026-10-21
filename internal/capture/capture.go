@@ -60,10 +60,10 @@ type Params struct {
 // 每隔一段采样一个像素，逐样本比较差值，变化占比低于阈值视为静止。
 // 对静态桌面/静止 PPT 这类机房常见画面，可以把流量降到接近零。
 type Fingerprinter struct {
-	last    []sample
-	lastW   int
-	lastH   int
-	has     bool
+	last  []sample
+	lastW int
+	lastH int
+	has   bool
 }
 
 type sample struct{ r, g, b uint8 }
@@ -147,12 +147,12 @@ func scaleBilinear(src image.Image, w, h int) *image.RGBA {
 		sy := float64(y)*float64(sh)/float64(h) + float64(sb.Min.Y)
 		y0 := int(sy)
 		fy := sy - float64(y0)
-		y1 := min(y0+1, sb.Max.Y-1)
+		y1 := imin(y0+1, sb.Max.Y-1)
 		for x := 0; x < w; x++ {
 			sx := float64(x)*float64(sw)/float64(w) + float64(sb.Min.X)
 			x0 := int(sx)
 			fx := sx - float64(x0)
-			x1 := min(x0+1, sb.Max.X-1)
+			x1 := imin(x0+1, sb.Max.X-1)
 			c00 := src.At(x0, y0)
 			c10 := src.At(x1, y0)
 			c01 := src.At(x0, y1)
@@ -161,4 +161,12 @@ func scaleBilinear(src image.Image, w, h int) *image.RGBA {
 		}
 	}
 	return dst
+}
+
+// go1.20 兼容：min 内建是 go1.21 特性。
+func imin(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
