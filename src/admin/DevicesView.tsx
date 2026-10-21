@@ -241,7 +241,7 @@ function DeviceRows({
           </Button>
           <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-muted text-xs font-semibold text-muted-foreground">{device.label.replace(/^[A-Za-z]+-?/, "") || device.label}</span>
           <span className="min-w-0">
-            <span className="flex flex-wrap items-center gap-1.5 font-medium text-foreground">{device.name}{device.pending && <Badge variant="outline" className="border-warning/40 bg-warning/10 text-warning">待审批</Badge>}{device.alerts > 0 && <Badge variant="destructive">{device.alerts} 告警</Badge>}</span>
+            <span className="flex flex-wrap items-center gap-1.5 font-medium text-foreground">{device.name}{device.pending && <Badge variant="outline" className="border-warning/40 bg-warning/10 text-warning">待审批</Badge>}{device.locked && <Badge variant="destructive">已锁定</Badge>}{device.castTcp && <Badge variant="outline" className="border-info/40 text-info">广播走TCP</Badge>}{(device.featErrs?.length ?? 0) > 0 && <Badge variant="outline" className="border-warning/40 bg-warning/5 text-warning">策略落地失败 {device.featErrs!.length} 项</Badge>}{device.alerts > 0 && <Badge variant="destructive">{device.alerts} 告警</Badge>}</span>
             <span className="block text-xs text-muted-foreground">{device.label}</span>
           </span>
         </div>

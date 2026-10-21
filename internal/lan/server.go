@@ -39,6 +39,12 @@ type Device struct {
 	// Pending=true 表示新注册设备还未被教师批准（enrollment）。
 	// 待批准设备不下发任何课堂指令，也不能成为广播/分发目标。
 	Pending  bool      `json:"pending,omitempty"`
+	// Locked 反映学生端真实锁定状态（教师锁或断线守护锁），由 status 上报。
+	Locked bool `json:"locked,omitempty"`
+	// FeatErrs 是 agent 侧落地失败的策略键（desired→applied 不一致时点名）。
+	FeatErrs []string `json:"featErrs,omitempty"`
+	// CastTCP 广播期间该设备走 TCP 兜底（非组播）。快照字段，广播停止即清。
+	CastTCP  bool      `json:"castTcp,omitempty"`
 	LastSeen time.Time `json:"lastSeen"`
 }
 
@@ -98,6 +104,9 @@ type Server struct {
 	recvDir        string
 	frameWorkers   map[string]*frameWorker
 	screenWatch    map[string]bool // requested thumbnail subscriptions; includes offline targets
+	hiView         map[string]bool // 单机高清查看中的设备（帧更大更清，单独路由）
+	hiFrames       map[string]ScreenFrame // devID -> 最新高清帧
+	focusID        string                 // 当前大图查看的设备
 	cast           *serverCast     // 当前教师广播会话（nil=未广播）
 	castSeq        atomic.Uint32   // 广播代数发生器（单调递增，防旧指令复活）
 }
@@ -125,6 +134,8 @@ func NewServer(id Identity, tcpPort int) *Server {
 		helpRequests:   map[string]HelpRequest{},
 		frameWorkers:   map[string]*frameWorker{},
 		screenWatch:    map[string]bool{},
+		hiView:         map[string]bool{},
+		hiFrames:       map[string]ScreenFrame{},
 	}
 }
 
@@ -209,7 +220,10 @@ func (s *Server) Devices() []Device {
 	defer s.mu.Unlock()
 	out := make([]Device, 0, len(s.devices))
 	for _, d := range s.devices {
-		out = append(out, *d)
+		dd := *d
+		// 广播 TCP 兜底标记是运行态快照（cast.tcpOnly），不持久化
+		dd.CastTCP = s.cast != nil && s.cast.tcpOnly[dd.ID]
+		out = append(out, dd)
 	}
 	return out
 }
@@ -385,7 +399,14 @@ func (s *Server) handle(cc *clientConn, m Msg) {
 	if d != nil {
 		d.LastSeen = time.Now()
 	}
+	pending := d == nil || d.Pending
 	s.mu.Unlock()
+
+	// 待审批设备只允许心跳/状态上报；上行数据（屏幕帧、文件、
+	// 求助、告警等）在审批通过前一律丢弃——审批是完整授权边界。
+	if pending && m.Type != MsgStatus {
+		return
+	}
 
 	switch m.Type {
 	case MsgStatus:
@@ -396,6 +417,8 @@ func (s *Server) handle(cc *clientConn, m Msg) {
 		if d := s.devices[cc.devID]; d != nil {
 			d.HelperOn = m.Status.HelperOn
 			d.Features = m.Status.Features
+			d.Locked = m.Status.Locked
+			d.FeatErrs = m.Status.FeatureErr
 		}
 		s.mu.Unlock()
 		s.changed()
@@ -420,7 +443,7 @@ func (s *Server) handle(cc *clientConn, m Msg) {
 			dup := s.cast != nil && s.cast.tcpOnly[cc.devID]
 			s.mu.Unlock()
 			if !dup {
-				s.MarkCastTCP(cc.devID)
+				s.MarkCastTCP(cc.devID, m.Alert.Gen)
 				log.Printf("lan: %s 组播收不到帧，改走 TCP 兜底", cc.devID)
 			}
 			return

@@ -350,10 +350,13 @@ func (s *Server) CastTargets() []string {
 }
 
 // MarkCastTCP 标记某台目标机改走 TCP 兜底（组播加入失败/丢包时）。
-func (s *Server) MarkCastTCP(id string) {
+// gen 必须与当前广播代数一致——旧代的失败回执/告警不能给新代
+// 广播的设备错标 TCP 单播。gen==0 兼容未带代数的老客户端告警，
+// 按当前代处理。
+func (s *Server) MarkCastTCP(id string, gen uint32) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.cast != nil && s.cast.targets[id] {
+	if s.cast != nil && s.cast.targets[id] && (gen == 0 || s.cast.gen == gen) {
 		s.cast.tcpOnly[id] = true
 	}
 }
@@ -393,9 +396,52 @@ func (s *Server) Screens() map[string]ScreenFrame {
 	return out
 }
 
+// ViewDevice 开关某台设备的高清单机查看（教师双击卡片看大图）。
+// hi 帧只在查看期间推给管理端，结束后恢复原缩略图订阅状态。
+func (s *Server) ViewDevice(id string, on bool) {
+	s.mu.Lock()
+	if on {
+		s.focusID = id
+		s.hiView[id] = true
+	} else {
+		if s.focusID == id {
+			s.focusID = ""
+		}
+		delete(s.hiView, id)
+		delete(s.hiFrames, id)
+	}
+	watch := s.screenWatch[id]
+	s.mu.Unlock()
+	// 查看中=On+Hi；结束查看恢复缩略图订阅状态（或关）
+	s.sendMsg(id, Msg{Type: MsgCommand, Cmd: &CommandMsg{
+		ID:   fmt.Sprintf("view-%d", s.cmdSeq.Add(1)),
+		Op:   OpScreenWatch, Args: ScreenWatchArgs{On: on || watch, Hi: on},
+	}})
+	s.changed()
+}
+
+// FocusDeviceID 当前大图查看的设备 ID（"" = 未查看）。
+func (s *Server) FocusDeviceID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.focusID
+}
+
+// FocusScreen 返回当前查看设备的最新高清帧。
+func (s *Server) FocusScreen() (ScreenFrame, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f, ok := s.hiFrames[s.focusID]
+	if !ok {
+		return ScreenFrame{}, false
+	}
+	f.JPEG = append([]byte(nil), f.JPEG...)
+	return f, true
+}
+
 func (s *Server) onScreen(devID string, m *ScreenMsg) {
 	jpeg, err := base64.StdEncoding.DecodeString(m.JPEG)
-	if err != nil || len(jpeg) == 0 || len(jpeg) > 700<<10 {
+	if err != nil || len(jpeg) == 0 || len(jpeg) > MaxCastJPEG {
 		return
 	}
 	s.mu.Lock()
@@ -404,7 +450,11 @@ func (s *Server) onScreen(devID string, m *ScreenMsg) {
 	if device != nil {
 		frame.Label, frame.Name = device.Label, device.Name
 	}
-	s.screens[devID] = frame
+	if m.Hi {
+		s.hiFrames[devID] = frame // 高清帧走单独槽，不进缩略图墙
+	} else {
+		s.screens[devID] = frame
+	}
 	s.mu.Unlock()
 	if s.OnScreens != nil {
 		s.OnScreens()
@@ -685,6 +735,7 @@ func (s *Server) syncClientActivities(deviceID string) {
 	}
 	_, raised := s.helpRequests[deviceID]
 	watch := s.screenWatch[deviceID]
+	hi := s.hiView[deviceID]
 	s.mu.Unlock()
 
 	if signArgs != nil {
@@ -709,7 +760,8 @@ func (s *Server) syncClientActivities(deviceID string) {
 		ID: fmt.Sprintf("help-%d", s.cmdSeq.Add(1)), Op: OpSetHelpState, Args: HelpStateArgs{Raised: raised},
 	}})
 	s.sendMsg(deviceID, Msg{Type: MsgCommand, Cmd: &CommandMsg{
-		ID: fmt.Sprintf("watch-%d", s.cmdSeq.Add(1)), Op: OpScreenWatch, Args: ScreenWatchArgs{On: watch},
+		ID: fmt.Sprintf("watch-%d", s.cmdSeq.Add(1)), Op: OpScreenWatch,
+		Args: ScreenWatchArgs{On: watch || hi, Hi: hi},
 	}})
 	// 广播恢复要走 SendCommand 等 ack：客户端组播加入失败会回 "tcp" 明细，
 	// 届时把它标记为 TCP 兜底目标。异步派发，不阻塞 serve 读循环。
@@ -718,7 +770,7 @@ func (s *Server) syncClientActivities(deviceID string) {
 			ack, err := s.SendCommand(deviceID, OpCastStart, args)
 			// Detail=="stale" 是客户端认出过期代数，不算失败更不该标 TCP。
 			if ack.Detail == "tcp" || (ack.Detail != "stale" && (err != nil || !ack.OK)) {
-				s.MarkCastTCP(deviceID)
+				s.MarkCastTCP(deviceID, args.Gen)
 			}
 			// 发送期间广播可能已结束/换代：复查，代数变了补对应代的
 			// cast.stop，否则客户端会守着僵尸组播与全屏窗。

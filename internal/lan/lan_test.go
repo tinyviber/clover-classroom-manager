@@ -2,6 +2,7 @@ package lan
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"testing"
@@ -145,6 +146,70 @@ func TestCastMulticastRoundTrip(t *testing.T) {
 				t.Fatal("组播帧 5s 内未收到")
 			}
 		}
+	}
+}
+
+// pending 设备的上行数据（屏幕帧/求助/文件）必须被丢弃——审批是双向边界，
+// 不只是下行指令。
+func TestPendingUpstreamBlocked(t *testing.T) {
+	id, err := GenIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(id, 47895)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	a := NewAgent("pc-pending", "TEST-PC99")
+	a.PinnedPub = srv.ID.Pub()
+	a.DirectAddr = "127.0.0.1:47895"
+	go a.Run(ctx)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if d, ok := srv.GetDevice("pc-pending"); ok && d.Online {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("agent 未上线")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	s := a.cur.Load()
+	if s == nil {
+		t.Fatal("agent 会话未建立")
+	}
+	jpeg := base64.StdEncoding.EncodeToString([]byte{0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3})
+	if err := s.send(Msg{Type: MsgScreen, Screen: &ScreenMsg{JPEG: jpeg}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.send(Msg{Type: MsgHelp, Help: &HelpMsg{Kind: "raise"}}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if len(srv.Screens()) != 0 {
+		t.Fatal("pending 设备的屏幕帧竟被收下")
+	}
+	if len(srv.HelpRequests()) != 0 {
+		t.Fatal("pending 设备的求助竟被收下")
+	}
+
+	if n := srv.Approve([]string{"pc-pending"}); n != 1 {
+		t.Fatalf("审批失败: %d", n)
+	}
+	if err := s.send(Msg{Type: MsgScreen, Screen: &ScreenMsg{JPEG: jpeg}}); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for len(srv.Screens()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("批准后屏幕帧仍未入库")
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

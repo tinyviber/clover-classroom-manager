@@ -85,6 +85,14 @@ func main() {
 			}
 		}
 	}
+	// 防护策略持久化：重启后按上次的 helperOn/features 继续生效。
+	a.PersistState = func(helperOn bool, features []string) {
+		cfg.HelperOn = &helperOn
+		cfg.Features = features
+		if err := cfg.Save(*cfgPath); err != nil {
+			log.Printf("agent[%s]: 策略回写失败: %v", cfg.ID, err)
+		}
+	}
 	log.Printf("agent[%s]: 启动 name=%s label=%s mac=%s ip=%s admin=%s",
 		cfg.ID, a.Name, a.Label, a.MAC, a.IP, a.DirectAddr)
 
@@ -136,6 +144,12 @@ func main() {
 		if ui != nil && !seen[key] {
 			seen[key] = true
 			ui.Open()
+		}
+	}
+	// 教师消息 → 托盘气泡。
+	a.OnNotify = func(text string) {
+		if tray != nil {
+			tray.Notify("教师消息", text)
 		}
 	}
 	a.OnConn = func(connected bool) {

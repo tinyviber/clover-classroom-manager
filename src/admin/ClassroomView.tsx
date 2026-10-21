@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
-  ArrowDownToLine, Check, CheckCheck, ClipboardCheck, Download, HelpCircle,
-  Lock, LockOpen, MessageSquareText, Monitor, MonitorOff, Play, Power,
-  ScreenShare, Send, Square, StopCircle, Users, Video,
+  ArrowDownToLine, Check, CheckCheck, ClipboardCheck, Download, ExternalLink,
+  HelpCircle, LayoutGrid, ListChecks, Lock, LockOpen, MessageSquareText,
+  Monitor, MonitorOff, Play, Power, Rocket, ScreenShare, Send, Square,
+  StopCircle, Users, Video,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -17,6 +18,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
 import { api, nativeRuntime } from "@/api";
+import type { Device } from "@/mygo";
 import { targetDeviceIds, useLabStore } from "@/store";
 import { bytesLabel, formatClock } from "./shared";
 
@@ -27,7 +29,7 @@ const qualityLabels: Record<string, string> = {
   low: "低质",
 };
 
-type DialogKind = "signin" | "poll" | "demo" | "transfers" | "helps" | null;
+type DialogKind = "signin" | "poll" | "demo" | "transfers" | "helps" | "notify" | "url" | "launch" | "collect" | null;
 
 export function ClassroomView() {
   const devices = useLabStore((store) => store.devices);
@@ -176,11 +178,13 @@ export function ClassroomView() {
     } catch (error) { toast.error(error instanceof Error ? error.message : "文件分发失败"); }
   };
 
-  const collect = async () => {
+  const collect = async (dir: string, glob: string) => {
     if (!targets.length) { toast.error("当前没有在线目标设备"); return; }
     try {
-      const sent = await api.collectFiles(targets);
-      toast.success(sent ? `已向 ${sent} 台设备发出收取请求` : "没有设备接受收取请求");
+      const sent = await api.collectFiles(targets, dir, glob);
+      toast.success(sent
+        ? dir ? `已向 ${sent} 台设备发起目录收取` : `已向 ${sent} 台设备发出收取请求`
+        : "没有设备接受收取请求");
     } catch (error) { toast.error(error instanceof Error ? error.message : "收取文件失败"); }
   };
 
@@ -192,20 +196,113 @@ export function ClassroomView() {
     } catch (error) { toast.error(error instanceof Error ? error.message : "锁屏操作失败"); }
   };
 
+  // action: restart|shutdown|restart-force|shutdown-force|cancel
   const power = async (action: string) => {
-    if (action !== "restart" && action !== "shutdown") return;
+    if (action === "cancel") {
+      try {
+        const n = await api.powerCancel(targets);
+        toast.success(`已向 ${n} 台设备取消关机/重启倒计时`);
+      } catch (error) { toast.error(error instanceof Error ? error.message : "取消失败"); }
+      return;
+    }
+    const force = action.endsWith("-force");
+    const base = force ? action.replace("-force", "") : action;
+    if (base !== "restart" && base !== "shutdown") return;
     if (!targets.length) { toast.error("当前没有在线目标设备"); return; }
-    const label = action === "restart" ? "重启" : "关机";
-    if (nativeRuntime && !window.confirm(`确认${label} ${targets.length} 台学生机？`)) return;
+    const label = `${force ? "强制" : ""}${base === "restart" ? "重启" : "关机"}`;
+    const hint = force
+      ? `确认【强制】${label} ${targets.length} 台学生机？未保存的学生工作将丢失。`
+      : `确认${label} ${targets.length} 台学生机？（60 秒倒计时，可取消）`;
+    if (nativeRuntime && !window.confirm(hint)) return;
     try {
-      const n = await api.powerAction(targets, action);
+      const n = await api.powerAction(targets, base, force);
       toast.success(`已向 ${n} 台设备发出${label}指令`);
     } catch (error) { toast.error(error instanceof Error ? error.message : `远程${label}失败`); }
   };
 
+  // 双击学生机卡片 → 高清单机查看；再点右上角/关闭结束。
+  const openView = (id: string) => {
+    void api.viewDevice(id, true).catch(() => toast.error("无法打开单机查看"));
+  };
+  const focusId = classroom?.focusId ?? "";
+  const focusScreen = classroom?.focusScreen;
+
+  // ---- 座位布局：拖拽设备卡到真实机房座位，行列可批量选择 ----
+  const [seatMode, setSeatMode] = useState(false);
+  const [seats, setSeats] = useState<Record<string, number[]>>({});
+  const [seatCols, setSeatCols] = useState(8);
+  useEffect(() => {
+    void api.seats().then((s) => setSeats(s)).catch(() => undefined);
+    void api.seatCols().then((c) => setSeatCols(c || 8)).catch(() => undefined);
+  }, []);
+  const saveSeat = (next: Record<string, number[]>) => {
+    setSeats(next);
+    void api.saveSeats(next).catch(() => toast.error("座位保存失败"));
+  };
+  const seatAt = (r: number, c: number) => devices.find((d) => seats[d.id]?.[0] === r && seats[d.id]?.[1] === c);
+  const selectSeatRange = (kind: "row" | "col", n: number) => {
+    const ids = Object.entries(seats)
+      .filter(([id, rc]) => (kind === "row" ? rc[0] === n : rc[1] === n) && devices.some((d) => d.id === id && d.online && !d.pending))
+      .map(([id]) => id);
+    useLabStore.setState({ selectedIds: [...new Set([...useLabStore.getState().selectedIds, ...ids])] });
+  };
+  const seatRows = useMemo(() => {
+    let max = 5;
+    for (const rc of Object.values(seats)) if ((rc[0] ?? 0) + 1 > max) max = rc[0]! + 1;
+    return max + 1; // 永远多给一行空位可拖
+  }, [seats]);
+
   const selectedOnline = devices.filter((d) => selectedIds.includes(d.id) && d.online).length;
   const activeTransfers = (classroom?.files ?? []).filter((t) => !t.done && !t.err).length;
   const helps = classroom?.helps ?? [];
+
+  // 学生机卡片：普通宫格与座位格共用。双击开高清单机查看。
+  const renderCard = (device: (typeof devices)[number], compact = false) => {
+    const frame = frames.get(device.id);
+    const selected = selectedIds.includes(device.id);
+    const age = frame ? Math.max(0, clock - frame.at) : Number.POSITIVE_INFINITY;
+    const usable = Boolean(frame && age <= 30000);
+    return (
+      <article
+        key={device.id}
+        draggable={seatMode}
+        onDragStart={seatMode ? (e) => { e.dataTransfer.setData("text/plain", device.id); e.dataTransfer.effectAllowed = "move"; } : undefined}
+        onClick={(event) => clickDevice(event, device.id)}
+        onDoubleClick={() => { if (device.online && !device.pending) openView(device.id); }}
+        className={`cursor-pointer overflow-hidden rounded-lg border bg-card select-none transition-shadow ${
+          selected ? "border-primary ring-2 ring-primary/40" : "hover:border-foreground/20"
+        } ${device.online ? "" : "opacity-60"}`}
+      >
+        <div className={`relative bg-muted/60 ${compact ? "aspect-[16/10]" : "aspect-video"}`}>
+          {usable ? (
+            <img className="size-full object-cover" src={`data:image/jpeg;base64,${frame!.jpeg}`} alt={`${device.label} 屏幕`} />
+          ) : (
+            <div className="grid size-full place-items-center text-xs text-muted-foreground">
+              {device.online ? (frame ? "画面过期" : "等待画面…") : "离线"}
+            </div>
+          )}
+          <span className={`absolute top-1.5 left-1.5 grid size-5 place-items-center rounded border text-[10px] ${
+            selected ? "border-primary bg-primary text-primary-foreground" : "border-foreground/20 bg-background/80 text-transparent"
+          }`}><Check className="size-3" /></span>
+          <span className="absolute top-1.5 right-1.5 flex gap-1">
+            {!device.online && <Badge variant="secondary">离线</Badge>}
+            {device.pending && <Badge variant="outline" className="border-warning/50 bg-warning/10 text-warning">待审批</Badge>}
+            {device.locked && <Badge variant="destructive"><Lock className="size-3" /></Badge>}
+            {device.castTcp && casting && <Badge variant="outline" className="border-info/50 text-info">TCP</Badge>}
+            {(device.featErrs?.length ?? 0) > 0 && <Badge variant="outline" className="border-warning/50 text-warning">策略异常</Badge>}
+          </span>
+        </div>
+        <div className="flex items-center gap-2 px-2.5 py-1.5">
+          <span className={`size-1.5 shrink-0 rounded-full ${device.online ? "bg-success" : "bg-muted-foreground/50"}`} />
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-xs font-medium">{device.label} · {device.name}</p>
+            <p className="truncate text-[11px] text-muted-foreground">{device.ip}</p>
+          </div>
+          {device.alerts > 0 && <Badge variant="destructive" className="px-1.5">{device.alerts}</Badge>}
+        </div>
+      </article>
+    );
+  };
 
   return (
     <div className="space-y-3">
@@ -235,7 +332,11 @@ export function ClassroomView() {
         <Button size="sm" variant="outline" onClick={() => setDialog("demo")}><Video />学生演示</Button>
         <Separator orientation="vertical" className="mx-1 h-5" />
         <Button size="sm" variant="outline" onClick={() => void pickAndSend()}><Send />分发文件</Button>
-        <Button size="sm" variant="outline" onClick={() => void collect()}><Download />收取文件</Button>
+        <Button size="sm" variant="outline" onClick={() => setDialog("collect")}><Download />收取文件</Button>
+        <Separator orientation="vertical" className="mx-1 h-5" />
+        <Button size="sm" variant="outline" onClick={() => setDialog("notify")}><Send />发消息</Button>
+        <Button size="sm" variant="outline" onClick={() => setDialog("url")}><ExternalLink />推网址</Button>
+        <Button size="sm" variant="outline" onClick={() => setDialog("launch")}><Rocket />运行程序</Button>
         <Separator orientation="vertical" className="mx-1 h-5" />
         <Button size="sm" variant="outline" onClick={() => setDialog("signin")}><ClipboardCheck />签到</Button>
         <Button size="sm" variant="outline" onClick={() => setDialog("poll")}><MessageSquareText />投票</Button>
@@ -248,10 +349,16 @@ export function ClassroomView() {
         <Select value="" onValueChange={(v) => typeof v === "string" && void power(v)}>
           <SelectTrigger className="h-8 w-[88px]"><Power className="size-3.5" /><SelectValue placeholder="电源" /></SelectTrigger>
           <SelectContent>
-            <SelectItem value="restart">远程重启</SelectItem>
-            <SelectItem value="shutdown">远程关机</SelectItem>
+            <SelectItem value="restart">远程重启（60s）</SelectItem>
+            <SelectItem value="shutdown">远程关机（60s）</SelectItem>
+            <SelectItem value="cancel">取消关机/重启</SelectItem>
+            <SelectItem value="restart-force" className="text-destructive">强制重启（危险）</SelectItem>
+            <SelectItem value="shutdown-force" className="text-destructive">强制关机（危险）</SelectItem>
           </SelectContent>
         </Select>
+        <Button size="sm" variant={seatMode ? "secondary" : "ghost"} onClick={() => setSeatMode((v) => !v)} title="按真实机房座位排列">
+          <LayoutGrid />{seatMode ? "退出座位" : "座位图"}
+        </Button>
         <div className="ml-auto flex items-center gap-1.5">
           {helps.length > 0 && (
             <Button size="sm" variant="outline" className="border-warning/40 text-warning" onClick={() => setDialog("helps")}>
@@ -264,48 +371,30 @@ export function ClassroomView() {
         </div>
       </div>
 
-      {/* 学生机宫格（含预览画面） */}
+      {/* 学生机宫格（含预览画面）/ 座位布局 */}
       {devices.length ? (
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 2xl:grid-cols-5">
-          {devices.map((device) => {
-            const frame = frames.get(device.id);
-            const selected = selectedIds.includes(device.id);
-            const age = frame ? Math.max(0, clock - frame.at) : Number.POSITIVE_INFINITY;
-            const usable = Boolean(frame && age <= 30000);
-            return (
-              <article
-                key={device.id}
-                onClick={(event) => clickDevice(event, device.id)}
-                className={`cursor-pointer overflow-hidden rounded-lg border bg-card select-none transition-shadow ${
-                  selected ? "border-primary ring-2 ring-primary/40" : "hover:border-foreground/20"
-                } ${device.online ? "" : "opacity-60"}`}
-              >
-                <div className="relative aspect-video bg-muted/60">
-                  {usable ? (
-                    <img className="size-full object-cover" src={`data:image/jpeg;base64,${frame!.jpeg}`} alt={`${device.label} 屏幕`} />
-                  ) : (
-                    <div className="grid size-full place-items-center text-xs text-muted-foreground">
-                      {device.online ? (frame ? "画面过期" : "等待画面…") : "离线"}
-                    </div>
-                  )}
-                  <span className={`absolute top-1.5 left-1.5 grid size-5 place-items-center rounded border text-[10px] ${
-                    selected ? "border-primary bg-primary text-primary-foreground" : "border-foreground/20 bg-background/80 text-transparent"
-                  }`}><Check className="size-3" /></span>
-                  {!device.online && <Badge variant="secondary" className="absolute top-1.5 right-1.5">离线</Badge>}
-                  {device.pending && <Badge variant="outline" className="absolute top-1.5 right-1.5 border-warning/50 bg-warning/10 text-warning">待审批</Badge>}
-                </div>
-                <div className="flex items-center gap-2 px-2.5 py-1.5">
-                  <span className={`size-1.5 shrink-0 rounded-full ${device.online ? "bg-success" : "bg-muted-foreground/50"}`} />
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-xs font-medium">{device.label} · {device.name}</p>
-                    <p className="truncate text-[11px] text-muted-foreground">{device.ip}</p>
-                  </div>
-                  {device.alerts > 0 && <Badge variant="destructive" className="px-1.5">{device.alerts}</Badge>}
-                </div>
-              </article>
-            );
-          })}
-        </div>
+        seatMode ? (
+          <SeatGrid
+            devices={devices} seats={seats} seatCols={seatCols} seatRows={seatRows}
+            frames={frames} selectedIds={selectedIds} clock={clock}
+            onCardClick={clickDevice} onCardDoubleClick={openView}
+            onDropSeat={(id, r, c) => {
+              const next = { ...seats, [id]: [r, c] };
+              saveSeat(next);
+            }}
+            onUnseat={(id) => {
+              const next = { ...seats };
+              delete next[id];
+              saveSeat(next);
+            }}
+            onPickRange={selectSeatRange}
+            renderCard={renderCard}
+          />
+        ) : (
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 2xl:grid-cols-5">
+            {devices.map((device) => renderCard(device))}
+          </div>
+        )
       ) : (
         <Empty className="min-h-40 border bg-muted/20"><EmptyHeader><EmptyTitle>还没有学生机</EmptyTitle><EmptyDescription>客户端上线后会显示在这里。</EmptyDescription></EmptyHeader></Empty>
       )}
@@ -331,6 +420,15 @@ export function ClassroomView() {
       <DemoDialog open={dialog === "demo"} onClose={() => setDialog(null)} targets={targets} />
       <TransfersDialog open={dialog === "transfers"} onClose={() => setDialog(null)} />
       <HelpsDialog open={dialog === "helps"} onClose={() => setDialog(null)} />
+      <NotifyDialog open={dialog === "notify"} onClose={() => setDialog(null)} targets={targets} />
+      <URLDialog open={dialog === "url"} onClose={() => setDialog(null)} targets={targets} />
+      <LaunchDialog open={dialog === "launch"} onClose={() => setDialog(null)} targets={targets} />
+      <CollectDialog open={dialog === "collect"} onClose={() => setDialog(null)} onSubmit={collect} />
+      <FocusDialog
+        deviceId={focusId}
+        screen={focusScreen ?? null}
+        onClose={() => { if (focusId) void api.viewDevice(focusId, false).catch(() => undefined); }}
+      />
     </div>
   );
 }
@@ -590,5 +688,231 @@ function HelpsDialog({ open, onClose }: { open: boolean; onClose: () => void }) 
         <HelpList helps={helps} />
       </DialogContent>
     </Dialog>
+  );
+}
+
+// ---- 新增：消息 / 网址 / 程序 / 收取 / 单机大图 / 座位布局 ----
+
+function NotifyDialog({ open, onClose, targets }: { open: boolean; onClose: () => void; targets: string[] }) {
+  const [text, setText] = useState("");
+  const send = async () => {
+    if (!text.trim()) { toast.error("请填写消息内容"); return; }
+    if (!targets.length) { toast.error("当前没有在线目标设备"); return; }
+    try {
+      const n = await api.notifyText(targets, text.trim());
+      toast.success(`消息已送达 ${n} 台学生机`);
+      setText("");
+      onClose();
+    } catch (error) { toast.error(error instanceof Error ? error.message : "发送失败"); }
+  };
+  return (
+    <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
+      <DialogContent>
+        <DialogHeader><DialogTitle>发送消息</DialogTitle><DialogDescription>消息以气泡通知出现在学生机右下角（不弹窗、不打断操作）。</DialogDescription></DialogHeader>
+        <Textarea value={text} onChange={(e) => setText(e.target.value)} rows={3} maxLength={200}
+          placeholder="例如：请把今天的作业保存到桌面后提交。" />
+        <DialogFooter>
+          <p className="mr-auto text-xs text-muted-foreground">目标：{targets.length} 台 · {text.length}/200</p>
+          <Button size="sm" onClick={() => void send()} disabled={!targets.length || !text.trim()}><Send />发送</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function URLDialog({ open, onClose, targets }: { open: boolean; onClose: () => void; targets: string[] }) {
+  const [url, setURL] = useState("");
+  const send = async () => {
+    const u = url.trim();
+    if (!/^https?:\/\//i.test(u)) { toast.error("只允许 http:// 或 https:// 网址"); return; }
+    if (!targets.length) { toast.error("当前没有在线目标设备"); return; }
+    try {
+      const n = await api.openURLFor(targets, u);
+      if (!n) toast.error("没有设备接受该网址（格式无效或全部离线）");
+      else { toast.success(`已在 ${n} 台学生机打开网址`); onClose(); }
+    } catch (error) { toast.error(error instanceof Error ? error.message : "推送网址失败"); }
+  };
+  return (
+    <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
+      <DialogContent>
+        <DialogHeader><DialogTitle>推送教学网址</DialogTitle><DialogDescription>所选学生机将用默认浏览器打开该页面。</DialogDescription></DialogHeader>
+        <Input value={url} onChange={(e) => setURL(e.target.value)} placeholder="https://example.com/lesson" />
+        <DialogFooter>
+          <p className="mr-auto text-xs text-muted-foreground">仅支持 http/https；目标 {targets.length} 台</p>
+          <Button size="sm" onClick={() => void send()} disabled={!targets.length || !url.trim()}><ExternalLink />推送</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+const launchPresets = [
+  { label: "记事本", path: "C:\\Windows\\System32\\notepad.exe" },
+  { label: "计算器", path: "C:\\Windows\\System32\\calc.exe" },
+  { label: "画图", path: "C:\\Windows\\System32\\mspaint.exe" },
+];
+
+function LaunchDialog({ open, onClose, targets }: { open: boolean; onClose: () => void; targets: string[] }) {
+  const [path, setPath] = useState(launchPresets[0]!.path);
+  const launch = async () => {
+    const p = path.trim();
+    if (!/^([a-zA-Z]:\\|\\\\).+\.exe$/i.test(p)) { toast.error("需要 .exe 的绝对路径（如 C:\\Windows\\System32\\notepad.exe）"); return; }
+    if (!targets.length) { toast.error("当前没有在线目标设备"); return; }
+    try {
+      const n = await api.launchAppFor(targets, p);
+      if (!n) toast.error("没有设备接受该指令");
+      else { toast.success(`已在 ${n} 台学生机启动程序`); onClose(); }
+    } catch (error) { toast.error(error instanceof Error ? error.message : "启动程序失败"); }
+  };
+  return (
+    <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
+      <DialogContent>
+        <DialogHeader><DialogTitle>远程启动程序</DialogTitle><DialogDescription>在所选学生机上启动一个 .exe（不经过命令行，参数不可注入）。</DialogDescription></DialogHeader>
+        <div className="flex flex-wrap gap-1.5">
+          {launchPresets.map((preset) => (
+            <Button key={preset.path} size="xs" variant={path === preset.path ? "secondary" : "outline"} onClick={() => setPath(preset.path)}>{preset.label}</Button>
+          ))}
+        </div>
+        <Input value={path} onChange={(e) => setPath(e.target.value)} placeholder="C:\\Program Files\\App\\app.exe" />
+        <DialogFooter>
+          <p className="mr-auto text-xs text-muted-foreground">cmd/PowerShell/脚本宿主类程序已被禁启；目标 {targets.length} 台</p>
+          <Button size="sm" onClick={() => void launch()} disabled={!targets.length || !path.trim()}><Rocket />启动</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function CollectDialog({ open, onClose, onSubmit }: { open: boolean; onClose: () => void; onSubmit: (dir: string, glob: string) => Promise<void> }) {
+  const [mode, setMode] = useState<"manual" | "dir">("manual");
+  const [dir, setDir] = useState("C:\\Users\\Public\\Desktop\\作业");
+  const [glob, setGlob] = useState("*.*");
+  return (
+    <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
+      <DialogContent>
+        <DialogHeader><DialogTitle>收取文件</DialogTitle><DialogDescription>收上来的文件会汇总到管理端接收目录，传输进度在「文件传输」里看。</DialogDescription></DialogHeader>
+        <div className="flex gap-2">
+          <Button size="sm" variant={mode === "manual" ? "secondary" : "outline"} onClick={() => setMode("manual")}>学生手动提交</Button>
+          <Button size="sm" variant={mode === "dir" ? "secondary" : "outline"} onClick={() => setMode("dir")}>指定目录收取</Button>
+        </div>
+        {mode === "manual" ? (
+          <p className="rounded-md bg-muted/30 px-3 py-2 text-xs text-muted-foreground">学生机收到气泡提醒，在互动页里选择文件提交。</p>
+        ) : (
+          <div className="space-y-2">
+            <label className="grid gap-1.5 text-xs font-medium">学生机目录<Input value={dir} onChange={(e) => setDir(e.target.value)} placeholder="C:\\Users\\Public\\Desktop\\作业" /></label>
+            <label className="grid gap-1.5 text-xs font-medium">匹配规则<Input value={glob} onChange={(e) => setGlob(e.target.value)} placeholder="*.* 或 *.docx" /></label>
+            <p className="text-xs text-muted-foreground">学生无需操作，匹配文件将自动上传（单机最多 64 个文件、单文件 ≤128MB）。请提前告知学生该目录会被收取。</p>
+          </div>
+        )}
+        <DialogFooter>
+          <Button size="sm" onClick={() => { void onSubmit(mode === "dir" ? dir.trim() : "", mode === "dir" ? glob.trim() : ""); onClose(); }}>
+            <Download />{mode === "dir" ? "开始收取" : "发出请求"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// FocusDialog 单机高清查看：双击设备卡打开，关闭即停 hi 帧流。
+function FocusDialog({ deviceId, screen, onClose }: { deviceId: string; screen: { deviceId: string; label: string; name: string; jpeg: string; at: number } | null; onClose: () => void }) {
+  return (
+    <Dialog open={Boolean(deviceId)} onOpenChange={(v) => !v && onClose()}>
+      <DialogContent className="max-w-5xl">
+        <DialogHeader>
+          <DialogTitle>{screen ? `${screen.label} · ${screen.name}` : "单机查看"}</DialogTitle>
+          <DialogDescription>高清画面 ~1.4fps。远程控制（接管键鼠）将在后续版本提供。</DialogDescription>
+        </DialogHeader>
+        <div className="relative aspect-video w-full overflow-hidden rounded-md bg-muted/40">
+          {screen ? (
+            <img className="size-full object-contain" src={`data:image/jpeg;base64,${screen.jpeg}`} alt={`${screen.label} 屏幕`} />
+          ) : (
+            <div className="grid size-full place-items-center text-sm text-muted-foreground">等待画面…</div>
+          )}
+        </div>
+        <DialogFooter>
+          <Button size="sm" variant="outline" onClick={onClose}><Square />结束查看</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// SeatGrid 座位模式：固定行列宫格，卡片可拖到任意格子，行/列头点击批量选择。
+function SeatGrid({
+  devices, seats, seatCols, seatRows, frames, selectedIds, clock,
+  onCardClick, onCardDoubleClick, onDropSeat, onUnseat, onPickRange, renderCard,
+}: {
+  devices: Device[];
+  seats: Record<string, number[]>;
+  seatCols: number; seatRows: number;
+  frames: Map<string, { jpeg: string; at: number }>;
+  selectedIds: string[]; clock: number;
+  onCardClick: (e: React.MouseEvent, id: string) => void;
+  onCardDoubleClick: (id: string) => void;
+  onDropSeat: (id: string, r: number, c: number) => void;
+  onUnseat: (id: string) => void;
+  onPickRange: (kind: "row" | "col", n: number) => void;
+  renderCard: (d: (typeof devices)[number], compact?: boolean) => React.ReactNode;
+}) {
+  const seated = new Set(Object.keys(seats));
+  const unseated = devices.filter((d) => !seated.has(d.id));
+  const cell = (r: number, c: number) => {
+    const device = devices.find((d) => seats[d.id]?.[0] === r && seats[d.id]?.[1] === c);
+    return (
+      <div
+        key={`${r}-${c}`}
+        className="min-h-20 rounded-md border border-dashed border-foreground/10 bg-muted/10 p-1"
+        onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; }}
+        onDrop={(e) => {
+          e.preventDefault();
+          const id = e.dataTransfer.getData("text/plain");
+          if (id && devices.some((d) => d.id === id)) onDropSeat(id, r, c);
+        }}
+      >
+        {device ? renderCard(device, true) : <div className="grid h-full place-items-center text-[10px] text-muted-foreground/50">{r + 1}-{c + 1}</div>}
+      </div>
+    );
+  };
+  const cols = Array.from({ length: seatCols }, (_, i) => i);
+  const rows = Array.from({ length: seatRows }, (_, i) => i);
+  return (
+    <div className="space-y-2">
+      <div className="grid gap-1.5" style={{ gridTemplateColumns: `24px repeat(${seatCols}, minmax(0,1fr))` }}>
+        <div />
+        {cols.map((c) => (
+          <button key={c} className="rounded py-0.5 text-center text-[10px] text-muted-foreground hover:bg-muted" title={`选择第 ${c + 1} 列`}
+            onClick={() => onPickRange("col", c)}>列{c + 1}</button>
+        ))}
+        {rows.map((r) => (
+          <Fragment key={r}>
+            <button className="rounded px-1 text-center text-[10px] text-muted-foreground hover:bg-muted" title={`选择第 ${r + 1} 行`}
+              onClick={() => onPickRange("row", r)}>{r + 1}</button>
+            {cols.map((c) => cell(r, c))}
+          </Fragment>
+        ))}
+      </div>
+      <div
+        className="rounded-md border border-dashed p-2"
+        onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; }}
+        onDrop={(e) => {
+          e.preventDefault();
+          const id = e.dataTransfer.getData("text/plain");
+          if (id && seated.has(id)) onUnseat(id);
+        }}
+      >
+        <p className="mb-1.5 text-[11px] text-muted-foreground">未排座（拖到此处移出布局）：{unseated.length} 台</p>
+        <div className="flex flex-wrap gap-1.5">
+          {unseated.map((d) => (
+            <span key={d.id} draggable
+              onDragStart={(e) => { e.dataTransfer.setData("text/plain", d.id); }}
+              onClick={(e) => onCardClick(e, d.id)}
+              className={`cursor-pointer rounded border px-2 py-1 text-xs ${selectedIds.includes(d.id) ? "border-primary bg-primary/10" : "bg-muted/40"} ${d.online ? "" : "opacity-50"}`}>
+              {d.label}
+            </span>
+          ))}
+        </div>
+      </div>
+    </div>
   );
 }

@@ -78,6 +78,11 @@ type AgentConfig struct {
 	// 可选覆盖：默认取主机名/DefaultLabel
 	Name  string `json:"name,omitempty"`
 	Label string `json:"label,omitempty"`
+
+	// 防护策略回写：教师下发的 helperOn/features 持久化，agent 重启后
+	// 仍然按上次的 desired state 生效（不然重启就把策略洗成默认值）。
+	HelperOn *bool    `json:"helperOn,omitempty"`
+	Features []string `json:"features,omitempty"`
 }
 
 // LoadAgentConfig 读客户端配置；文件不存在返回空配置（不报错）。
@@ -155,6 +160,12 @@ func (c *AgentConfig) ToAgent() *Agent {
 	a.Token = c.Token
 	a.DirectAddr = c.AdminAddr
 	a.PinnedPub = c.PubKey()
+	if c.HelperOn != nil {
+		a.SetHelper(*c.HelperOn)
+	}
+	if c.Features != nil {
+		a.SetFeatures(c.Features)
+	}
 	a.MAC, a.IP = firstNIC()
 	return a
 }

@@ -16,6 +16,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -45,14 +46,22 @@ type Agent struct {
 	// 第一次握手验证通过的那个）交给调用方落盘 client.json——否则每次
 	// 断线重发现都在重新「首次信任」，TOFU 名不副实。
 	PersistPub func(ed25519.PublicKey)
+	// PersistState 可选钩子：防护策略（helperOn + features）由管理端
+	// 下发后回写 client.json，agent 重启后仍按上次配置生效。
+	PersistState func(helperOn bool, features []string)
 	// OnPrompt 可选钩子：有新的课堂互动（"signin"/"poll"/"demo"/"collect"）待学生处理。
 	// 静默运行的客户端用它做气泡通知 + 唤起互动窗口。
 	OnPrompt func(kind, session string)
+	// OnNotify 可选钩子：教师发来的文字消息（气泡通知）。
+	OnNotify func(text string)
 	// OnConn 可选钩子：管理端会话建立/断开。
 	OnConn func(connected bool)
 
-	helperOn atomic.Bool
-	features atomic.Value // []string
+	helperOn  atomic.Bool
+	features  atomic.Value // []string
+	featErrs  atomic.Value // []string——应用失败的策略键
+	watchHiMu sync.Mutex
+	watchHi   bool // 单机高清查看模式（教师点开大图）
 
 	// guard_offline 守护：断线超时后自动锁屏。guardLocked 只记守护自己
 	// 上的锁，解锁也只解自己的（教师 screen.lock 独立管理）。
@@ -85,8 +94,17 @@ type Agent struct {
 // NewAgent 构造一个默认全开防护的 agent。
 func NewAgent(id, name string) *Agent {
 	a := &Agent{ID: id, Name: name, Version: "0.0.2", Token: RandHex(16), inFiles: map[string]*incoming{}, outgoing: map[string]chan FileMsg{}}
+	castview.OnEmergencyUnlock = func() {
+		// 管理员在学生机上按了紧急解锁组合键：记录 + 上报管理端。
+		log.Printf("agent[%s]: 本机触发紧急解锁组合键", a.ID)
+		if s := a.cur.Load(); s != nil {
+			_ = s.send(Msg{Type: MsgAlert, Alert: &AlertMsg{Kind: "emergency_unlock", Detail: "本机紧急解锁"}})
+			_ = a.pushStatus(s)
+		}
+	}
 	a.helperOn.Store(true)
 	a.features.Store([]string{})
+	a.featErrs.Store([]string{})
 	return a
 }
 
@@ -111,19 +129,23 @@ func (a *Agent) hasFeature(key string) bool {
 	return false
 }
 
-// enforce 把已启用的功能真正落地到本机。目前落地的策略：
+// enforce 把已启用的功能真正落地到本机，执行失败的键记入
+// featErrs 上报管理端（desired→applied→reported 分开）。目前落地：
 //   - lock_taskmgr：HKCU DisableTaskMgr
 //   - guard_offline：断线 15s 自动锁屏（计时在 arm/disarm 里管）
 //
 // 其余 catalog 项尚未实现，服务端目录里标 ready=false 不展示为已生效。
 func (a *Agent) enforce() {
 	on := a.helperOn.Load()
+	var errs []string
 	if err := setDisableTaskMgr(on && a.hasFeature("lock_taskmgr")); err != nil {
+		errs = append(errs, "lock_taskmgr")
 		log.Printf("agent[%s]: DisableTaskMgr 策略写入失败: %v", a.ID, err)
 	}
 	if !(on && a.hasFeature("guard_offline")) {
 		a.disarmOfflineGuard()
 	}
+	a.featErrs.Store(errs)
 }
 
 // armOfflineGuard 在会话断开后上弦：guard_offline 开启时 15s 内没
@@ -144,7 +166,7 @@ func (a *Agent) armOfflineGuard(ctx context.Context) {
 			a.guardLocked = true
 			a.guardMu.Unlock()
 			log.Printf("agent[%s]: 与管理端断线超时，锁定屏幕", a.ID)
-			castview.Lock("与管理端的连接已断开")
+			castview.GuardLock("与管理端的连接已断开")
 			return
 		}
 		a.guardMu.Unlock()
@@ -163,7 +185,7 @@ func (a *Agent) disarmOfflineGuard() {
 	a.guardLocked = false
 	a.guardMu.Unlock()
 	if locked {
-		castview.Unlock()
+		castview.GuardUnlock() // 只解守护自己的锁，教师锁不受影响
 	}
 }
 
@@ -361,8 +383,10 @@ func (a *Agent) session(ctx context.Context, addr string, pub ed25519.PublicKey)
 
 func (a *Agent) pushStatus(s *session) error {
 	return s.send(Msg{Type: MsgStatus, Status: &StatusMsg{
-		HelperOn: a.helperOn.Load(),
-		Features: a.features.Load().([]string),
+		HelperOn:   a.helperOn.Load(),
+		Features:   a.features.Load().([]string),
+		Locked:     castview.Locked(),
+		FeatureErr: a.featErrs.Load().([]string),
 	}})
 }
 
@@ -375,17 +399,19 @@ func (a *Agent) handleCmd(s *session, c CommandMsg) {
 		if b, _ := json.Marshal(c.Args); json.Unmarshal(b, &args) == nil {
 			a.helperOn.Store(args.On)
 			a.enforce()
+			a.persistState()
 		}
 	case OpSetFeatures:
 		var args SetFeaturesArgs
 		if b, _ := json.Marshal(c.Args); json.Unmarshal(b, &args) == nil {
 			a.features.Store(args.Keys)
 			a.enforce()
+			a.persistState()
 		}
 	case OpScreenWatch:
 		var args ScreenWatchArgs
 		if b, _ := json.Marshal(c.Args); json.Unmarshal(b, &args) == nil {
-			a.setWatch(args.On)
+			a.setWatch(args.On, args.Hi)
 		}
 	case OpCastStart:
 		var args CastStartArgs
@@ -433,8 +459,53 @@ func (a *Agent) handleCmd(s *session, c CommandMsg) {
 	case OpUnlockScreen:
 		castview.Unlock()
 	case OpRestart, OpShutdown:
-		if err := powerAction(c.Op); err != nil {
+		var args PowerArgs
+		if b, _ := json.Marshal(c.Args); json.Unmarshal(b, &args) == nil {
+			if err := powerAction(c.Op, args.Force); err != nil {
+				ack.OK, ack.Err = false, err.Error()
+			}
+		} else if err := powerAction(c.Op, false); err != nil {
 			ack.OK, ack.Err = false, err.Error()
+		}
+	case OpPowerCancel:
+		if err := powerCancel(); err != nil {
+			ack.OK, ack.Err = false, err.Error()
+		}
+	case OpNotify:
+		var args NotifyArgs
+		if b, _ := json.Marshal(c.Args); json.Unmarshal(b, &args) == nil {
+			text := strings.TrimSpace(args.Text)
+			if text == "" || len([]rune(text)) > 200 {
+				ack.OK, ack.Err = false, "消息为空或超过 200 字"
+				break
+			}
+			if a.OnNotify != nil {
+				a.OnNotify(text)
+			} else {
+				log.Printf("agent[%s]: 教师消息: %s", a.ID, text)
+			}
+		}
+	case OpOpenURL:
+		var args OpenURLArgs
+		if b, _ := json.Marshal(c.Args); json.Unmarshal(b, &args) == nil {
+			if err := validOpenURL(args.URL); err != nil {
+				ack.OK, ack.Err = false, err.Error()
+			} else if err := openURL(args.URL); err != nil {
+				ack.OK, ack.Err = false, err.Error()
+			}
+		} else {
+			ack.OK, ack.Err = false, "无效的 URL 参数"
+		}
+	case OpLaunchApp:
+		var args LaunchArgs
+		if b, _ := json.Marshal(c.Args); json.Unmarshal(b, &args) == nil {
+			if err := validLaunchPath(args.Path); err != nil {
+				ack.OK, ack.Err = false, err.Error()
+			} else if err := launchApp(args.Path); err != nil {
+				ack.OK, ack.Err = false, err.Error()
+			}
+		} else {
+			ack.OK, ack.Err = false, "无效的程序路径"
 		}
 	case OpSignInOpen:
 		var args SignInOpenArgs
@@ -477,7 +548,12 @@ func (a *Agent) handleCmd(s *session, c CommandMsg) {
 			a.uiMu.Lock()
 			a.collectPrompt = &args
 			a.uiMu.Unlock()
-			a.emitPrompt("collect", args.Session)
+			if args.Dir != "" {
+				// 指定目录收取：不用学生动手，按 glob 匹配自动打包上传。
+				go a.collectDir(s, args)
+			} else {
+				a.emitPrompt("collect", args.Session)
+			}
 		}
 	case OpDemoRequest:
 		var args DemoRequestArgs
@@ -575,8 +651,11 @@ type StudentDemoPrompt struct {
 }
 
 // StudentCollectPrompt 收取文件请求（学生提交一个文件给管理端）。
+// Dir/Glob 非空表示「指定目录收取」——agent 已自动匹配上传，学生无需操作。
 type StudentCollectPrompt struct {
 	Session string `json:"session"`
+	Dir     string `json:"dir,omitempty"`
+	Glob    string `json:"glob,omitempty"`
 }
 
 type StudentUIState struct {
@@ -611,7 +690,9 @@ func (a *Agent) StudentState() StudentUIState {
 		}
 	}
 	if a.collectPrompt != nil {
-		state.Collect = &StudentCollectPrompt{Session: a.collectPrompt.Session}
+		state.Collect = &StudentCollectPrompt{
+			Session: a.collectPrompt.Session, Dir: a.collectPrompt.Dir, Glob: a.collectPrompt.Glob,
+		}
 	}
 	return state
 }
@@ -729,12 +810,22 @@ func (a *Agent) StopStudentDemo() error {
 	return nil
 }
 
-func (a *Agent) setWatch(on bool) {
+// persistState 把教师下发的防护策略回写 client.json（重启后继续生效）。
+func (a *Agent) persistState() {
+	if f := a.PersistState; f != nil {
+		f(a.helperOn.Load(), a.Features())
+	}
+}
+
+// setWatch 开/关屏幕监看。hi=true 为单机高清查看：分辨率 1600 宽、
+// 质量 70、~1.4fps，帧带 Hi 标记让服务端单独路由给大图查看器。
+func (a *Agent) setWatch(on, hi bool) {
 	a.watchMu.Lock()
 	if a.watchOff != nil {
 		a.watchOff()
 		a.watchOff = nil
 	}
+	a.watchHi = hi
 	if !on {
 		a.watchMu.Unlock()
 		return
@@ -742,8 +833,12 @@ func (a *Agent) setWatch(on bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	a.watchOff = cancel
 	a.watchMu.Unlock()
+	maxW, quality, interval := 320, 45, 500*time.Millisecond
+	if hi {
+		maxW, quality, interval = 1600, 70, 700*time.Millisecond
+	}
 	go func() {
-		t := time.NewTicker(500 * time.Millisecond)
+		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
 			select {
@@ -755,11 +850,13 @@ func (a *Agent) setWatch(on bool) {
 			if s == nil {
 				continue
 			}
-			jpeg, err := capture.Frame(320, 45)
+			jpeg, err := capture.Frame(maxW, quality)
 			if err != nil {
 				continue
 			}
-			_ = s.send(Msg{Type: MsgScreen, Screen: &ScreenMsg{JPEG: base64.StdEncoding.EncodeToString(jpeg)}})
+			_ = s.send(Msg{Type: MsgScreen, Screen: &ScreenMsg{
+				JPEG: base64.StdEncoding.EncodeToString(jpeg), Hi: hi,
+			}})
 		}
 	}()
 }
@@ -875,6 +972,7 @@ func (a *Agent) startCast(s *session, args CastStartArgs) error {
 			}
 			_ = s.send(Msg{Type: MsgAlert, Alert: &AlertMsg{
 				Kind: "cast_tcp", Detail: "已加入组播但收不到广播帧",
+				Gen: a.castGen.Load(),
 			}})
 			a.stopCast()
 			return
@@ -1082,6 +1180,62 @@ func (a *Agent) SubmitFile(path string, displayName ...string) error {
 		return nil
 	case <-time.After(transferWait(info.Size())):
 		return fmt.Errorf("等待管理端完成回执超时")
+	}
+}
+
+// validOpenURL 只允许 http/https 教学网址（防 file:///javascript: 类注入）。
+func validOpenURL(u string) error {
+	if len(u) > 2048 {
+		return fmt.Errorf("网址过长")
+	}
+	p, err := url.Parse(u)
+	if err != nil || (p.Scheme != "http" && p.Scheme != "https") || p.Host == "" {
+		return fmt.Errorf("只允许 http/https 网址")
+	}
+	return nil
+}
+
+// validLaunchPath 只允许 .exe 绝对路径（exec 直接调起，参数不可注入），
+// 并挡掉 cmd/powershell/mshta 等高危壳程序。
+func validLaunchPath(p string) error {
+	if !filepath.IsAbs(p) || !strings.EqualFold(filepath.Ext(p), ".exe") {
+		return fmt.Errorf("只允许 .exe 绝对路径")
+	}
+	switch strings.ToLower(filepath.Base(p)) {
+	case "cmd.exe", "powershell.exe", "pwsh.exe", "wscript.exe", "cscript.exe",
+		"mshta.exe", "reg.exe", "rundll32.exe", "regsvr32.exe", "bitsadmin.exe",
+		"certutil.exe", "msiexec.exe", "wmic.exe", "shutdown.exe":
+		return fmt.Errorf("该程序不允许远程启动")
+	}
+	if _, err := os.Stat(p); err != nil {
+		return fmt.Errorf("程序不存在: %w", err)
+	}
+	return nil
+}
+
+// collectDir 指定目录收取：按 Glob 匹配目录下文件逐个自动上传，
+// 全部完成后清掉收取提示。上限 64 个文件防止误收整盘。
+func (a *Agent) collectDir(s *session, args CollectOpenArgs) {
+	pattern := args.Glob
+	if pattern == "" {
+		pattern = "*"
+	}
+	matches, err := filepath.Glob(filepath.Join(args.Dir, pattern))
+	if err != nil || len(matches) == 0 {
+		log.Printf("agent[%s]: 收取目录 %q 无匹配文件", a.ID, args.Dir)
+		return
+	}
+	if len(matches) > 64 {
+		matches = matches[:64]
+	}
+	for _, p := range matches {
+		info, err := os.Stat(p)
+		if err != nil || !info.Mode().IsRegular() || info.Size() > MaxStudentUploadSize {
+			continue
+		}
+		if err := a.SubmitFile(p); err != nil {
+			log.Printf("agent[%s]: 收取上传 %s 失败: %v", a.ID, p, err)
+		}
 	}
 }
 

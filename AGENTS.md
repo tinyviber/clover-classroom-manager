@@ -51,16 +51,22 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -H wi
   - `proto.go` 消息信封（hello/status/command/ack/alert）与 UDP 发现信标格式
   - `server.go` 管理端：UDP :47822 应答发现、TCP :47823 接客户端、
     设备注册表持久化（registry.json，1s 防抖原子写）、`SendCommand` 等 Ack；
-    新设备一律注册 pending（enrollment），教师 `Approve` 后才能收指令/
-    进广播目标（演示模式 `Server.AutoApprove` 跳过）；握手+hello 阶段
+    新设备一律注册 pending（enrollment），教师 `Approve` 后才有课堂资格
+    ——下行指令与上行数据（屏幕帧/文件/求助/告警）双向拦截，只放行
+    status 心跳（演示模式 `Server.AutoApprove` 跳过）；握手+hello 阶段
     各有 10s deadline 且未认证连接数上限 64，防局域网资源耗尽
   - `agent.go` 学生机 agent：UDP 广播发现（或直接 `AdminAddr`）→ 握手
     （pin 管理端公钥，空则 TOFU——首连学到的公钥经 `PersistPub` 回写
     client.json）→ hello → 3s 心跳 + 指令执行；ack 之前先推 status，
-    保证服务端 SendCommand 返回时注册表已更新；`OnPrompt`/`OnConn`
-    钩子供托盘气泡与按需唤起互动页；`enforce()` 把已启用功能落到
+    保证服务端 SendCommand 返回时注册表已更新；`OnPrompt`/`OnConn`/
+    `OnNotify`（教师消息气泡）/`PersistState`（helperOn/features 回写
+    client.json，重启后策略继续生效）钩子；`enforce()` 把已启用功能落到
     本机（`enforce_windows.go` 的 DisableTaskMgr、guard_offline
-    断线锁屏）；`castGen` 广播代数拒绝过期 cast.start/stop
+    断线锁屏），落地失败的键经 `StatusMsg.FeatureErr` 上报；
+    `castGen` 广播代数拒绝过期 cast.start/stop；`screen.watch` 带
+    `hi` 标记进单机高清模式（1600px/~1.4fps，`ScreenMsg.Hi` 路由到
+    服务端 hiFrames 而非缩略图墙）；`collect.open` 带 `dir`/`glob`
+    时按目录匹配自动上传（collectDir），空则弹互动页
   - `mcast.go` 屏幕广播组播通道（仿极域）：教师端把 AES-256-GCM 加密帧
     切片组播到 239.42.4.23:47824，一次发送全班接收；每数据报另附
     HMAC-SHA256 截断 tag（HKDF 派生密钥），伪造分片无法污染重组器；
@@ -75,7 +81,12 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -H wi
 - `internal/capture/` — 屏幕捕获（robotgo）：`Grab`/`Encode`（画质档参数）
   与 `Fingerprinter` 画面指纹（静止桌面跳帧，广播心跳 4s 一保）
 - `internal/castview/` — 学生机原生广播画面：`viewer_windows.go` Win32
-  全屏/窗口渲染 + 顶部悬浮工具条（模式切换/退出），其他平台为 no-op
+  全屏/窗口渲染 + 顶部悬浮工具条（模式切换/退出），其他平台为 no-op。
+  状态机三分：广播(mode/visible)、教师锁(teachLock)、守护锁(guardLock)
+  互独立，`syncState` 统一算输入锁/窗口形态/工具条；全屏或任一锁定
+  → 低级钩子吞键鼠（工具条矩形内放行）+ 藏任务栏。
+  紧急解锁：Ctrl+Alt+Shift+F12 三秒内连按三次（OnEmergencyUnlock 上报
+  管理端并记日志），是管理端失联/进程异常时管理员的本机兜底
 - `internal/trayicon/` — agent 用无 cgo Win32 系统托盘（菜单/气泡/提示），
   `trayicon_stub.go` 为非 Windows 平台 no-op；`clover.ico` embed 进 exe
 - `internal/studentui/` — 学生本机回环 HTTP 互动页（签到/投票/举手/
@@ -102,7 +113,9 @@ Windows `%AppData%\lab-assistant`。
 - `admin.key` — 管理端 Ed25519 身份，首启生成后复用（客户端 pin 的就是它）
 - `registry.json` — 设备注册表，1s 防抖写盘；重启后设备保留且标离线
 - `client.json`（学生机侧）— agent.exe 同目录，installer 部署；含
-  adminAddr/adminPub/token/id/room，agent 首启 `-id` 固化 id+token
+  adminAddr/adminPub/token/id/room + 回写的 helperOn/features 策略，
+  agent 首启 `-id` 固化 id+token
+- `seats.json`（管理端）— 座位布局（设备 ID → [行,列] + 列数）
 
 ## 分发流程（机房还原软件）
 
