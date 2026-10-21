@@ -140,6 +140,8 @@ func main() {
 		labsvc.SeedRegistry(srv) // 首启种子；之后以持久化注册表为准
 	}
 	host := &mygoHost{}
+	// 发行构建（-tags=embedagent）把 agent.exe 编进二进制，导出安装包优先用它
+	labsvc.EmbeddedAgent = embeddedAgent
 	lab := labsvc.New(srv, host, dataDir)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

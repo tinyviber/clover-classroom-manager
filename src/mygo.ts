@@ -284,8 +284,9 @@ export const Lab = {
     return call("Lab.RejectDevices", ids);
   },
   /**
-   * RemoveDevices 从注册表删除任意设备（在线的先断开）。agent 重连后
-   * 只能重新注册为待审批，不会自动恢复课堂资格。
+   * RemoveDevices 从注册表删除任意设备（在线的先下发解锁/停广播再断开）。
+   * agent 重连后只能重新注册为待审批，不会自动恢复课堂资格。
+   * 同时清掉座位布局里的陈旧条目。
    */
   removeDevices(ids: string[]): Promise<number> {
     return call("Lab.RemoveDevices", ids);

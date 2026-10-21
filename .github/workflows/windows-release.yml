@@ -44,15 +44,19 @@ jobs:
       - name: Type-check frontend
         run: bun run typecheck
 
-      - name: Build management app
-        run: bunx mygo build -platform windows/amd64 -o build
-
       - name: Build client agent
         run: |
-          mkdir -p build/client-agent
-          # agent 需兼容 Win7：go1.20 是最后官方支持 Win7 的 Go，配合 agent.go.mod 降版依赖
-          GOTOOLCHAIN=go1.20.14 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=agent.go.mod -trimpath -ldflags="-s -w -H windowsgui" -o build/client-agent/agent.exe ./cmd/client
-          python3 -c "import struct; d=open('build/client-agent/agent.exe','rb').read(); o=struct.unpack_from('<I',d,0x3C)[0]; assert struct.unpack_from('<H',d,o+64)[0]<=6, 'agent.exe PE min OS > 6.1, breaks Windows 7'"
+          mkdir -p packaging/windows
+          # agent 需兼容 Win7：go1.20 是最后官方支持 Win7 的 Go，配合 agent.go.mod 降版依赖；
+          # 产出到 packaging/windows/agent.exe 供管理端 -tags=embedagent 嵌入
+          GOTOOLCHAIN=go1.20.14 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=agent.go.mod -trimpath -ldflags="-s -w -H windowsgui" -o packaging/windows/agent.exe ./cmd/client
+          python3 -c "import struct; d=open('packaging/windows/agent.exe','rb').read(); o=struct.unpack_from('<I',d,0x3C)[0]; assert struct.unpack_from('<H',d,o+64)[0]<=6, 'agent.exe PE min OS > 6.1, breaks Windows 7'"
+
+      - name: Build management app
+        run: bunx mygo build -platform windows/amd64 -o build
+        env:
+          CGO_ENABLED: "0"
+          GOFLAGS: "-tags=embedagent"
 
       - name: Build headless manager (Windows 7+)
         run: |
@@ -81,7 +85,7 @@ jobs:
 
           release_dir="dist/release"
           manager_dir="dist/manager-package"
-          agent_exe="build/client-agent/agent.exe"
+          agent_exe="packaging/windows/agent.exe"
           headless_exe="build/manager-headless/manager-headless.exe"
           mkdir -p "$release_dir" "$manager_dir"
 
@@ -132,9 +136,9 @@ jobs:
           body: |
             三叶草（Clover）局域网课堂管理的 Windows x64 版本。
 
-            - 管理端 EXE：教师机运行，需 Windows 10+（mygo/WebView2）。
+            - 管理端 EXE：教师机运行，需 Windows 10+（mygo/WebView2）。学生端 agent 已嵌在程序内，「分发客户端」导出安装包时写入当前管理端地址和公钥。
             - 管理端 headless EXE：无窗口管理端，教师用浏览器打开同一套管理界面，可在 Windows 7 运行。
-            - 管理端 ZIP：内含桌面管理端、Win7 headless 管理端与学生端 agent.exe——客户端安装包由管理端「分发客户端」自动生成（已写入管理端地址和公钥），不单发。
+            - 管理端 ZIP：内含桌面管理端、Win7 headless 管理端与学生端 agent.exe——客户端安装包由管理端自动生成，不单发。
             - `SHA256SUMS.txt`：发布文件校验和。
 
             管理端 GUI 需 Windows 10+；headless 管理端与学生端 agent 为 Windows 7+。首次连接前请使用管理端导出的配置固定公钥；安装说明见 ZIP 内 README。
