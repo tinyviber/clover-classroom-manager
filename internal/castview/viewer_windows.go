@@ -15,6 +15,7 @@ import (
 	_ "image/jpeg"
 	"runtime"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/lxn/win"
@@ -31,33 +32,57 @@ const (
 )
 
 var (
-	mu      sync.Mutex
-	hwnd    win.HWND
-	bar     win.HWND
-	btnM    win.HWND
-	img     *image.RGBA // 最新解码帧
-	mode    string      // 目标模式
-	visible bool        // 有窗口在显示（隐藏时 Frame 不解码省 CPU）
-	locked  bool        // screen.lock 黑屏锁定（无退出按钮，键鼠全锁）
-	lockWhy string
-	cmds    = make(chan func(), 16)
-	frames  = make(chan []byte, 1) // 单槽：只解最新帧
-	once    sync.Once
+	mu        sync.Mutex
+	hwnd      win.HWND
+	bar       win.HWND
+	btnM      win.HWND
+	img       *image.RGBA // 最新解码帧
+	mode      string      // 广播模式 fullscreen|window（与锁定无关）
+	visible   bool        // 广播窗在显示（隐藏时 Frame 不解码省 CPU）
+	teachLock bool        // screen.lock 教师锁
+	guardLock bool        // 断线守护锁（与教师锁独立，互不误解锁）
+	teachWhy  string
+	guardWhy  string
+	cmds      = make(chan func(), 16)
+	frames    = make(chan []byte, 1) // 单槽：只解最新帧
+	once      sync.Once
 )
 
 // OnExit 学生端悬浮条「退出广播」回调（隐藏窗口之外的动作由调用方决定，
 // 例如 agent 用来停掉组播接收）。在窗口线程上被调，实现里不许阻塞。
 var OnExit func()
 
+// OnEmergencyUnlock 紧急解锁组合键（Ctrl+Alt+Shift+F12 ×3）触发时回调，
+// 供 agent 上报管理端。不许阻塞。
+var OnEmergencyUnlock func()
+
+// locked 任一锁生效（mu 内）。教师锁与守护锁独立释放。
+func locked() bool { return teachLock || guardLock }
+
+func lockReason() string {
+	if teachLock {
+		return teachWhy
+	}
+	return guardWhy
+}
+
+// Locked 供外部（agent 状态上报）查询当前是否处于锁定态。
+func Locked() bool {
+	mu.Lock()
+	defer mu.Unlock()
+	return locked()
+}
+
 var (
 	gdi32     = windows.NewLazySystemDLL("gdi32.dll")
 	stretchDI = gdi32.NewProc("StretchDIBits")
 	user32    = windows.NewLazySystemDLL("user32.dll")
-	setTextW  = user32.NewProc("SetWindowTextW")
-	setHookW  = user32.NewProc("SetWindowsHookExW")
-	unhookW   = user32.NewProc("UnhookWindowsHookEx")
-	callNextH = user32.NewProc("CallNextHookEx")
-	findWinW  = user32.NewProc("FindWindowW")
+	setTextW      = user32.NewProc("SetWindowTextW")
+	setHookW      = user32.NewProc("SetWindowsHookExW")
+	unhookW       = user32.NewProc("UnhookWindowsHookEx")
+	callNextH     = user32.NewProc("CallNextHookEx")
+	findWinW      = user32.NewProc("FindWindowW")
+	getAsyncKeyW  = user32.NewProc("GetAsyncKeyState")
 )
 
 // ---- 全屏输入锁定（仿极域：广播时锁死学生机键鼠）----
@@ -76,8 +101,29 @@ const (
 var (
 	kbdHookH, mouHookH uintptr
 	taskbarHidden      bool
-	kbdCb              = windows.NewCallback(kbdHookProc)
-	mouCb              = windows.NewCallback(mouseHookProc)
+	kbdCb, mouCb       uintptr
+)
+
+// 回调在 init 里建而非 var 初始化——kbdHookProc→emergencyUnlock→
+// syncState→lockInput 会指回 kbdCb，var 级初始化有环。
+func init() {
+	kbdCb = windows.NewCallback(kbdHookProc)
+	mouCb = windows.NewCallback(mouseHookProc)
+}
+
+// 紧急解锁：Ctrl+Alt+Shift+F12 在 3 秒内连按 3 次。锁死状态下管理员
+// 的本机兜底通道（教师端异常关闭/断网时救机器）。仍会被吞掉不传给系统。
+const (
+	vkF12     = 0x7B
+	vkControl = 0x11
+	vkShift   = 0x10
+	vkMenu    = 0x12 // Alt
+)
+
+var (
+	panicN    int
+	panicLast time.Time
+	f12Held   bool // 按住 F12 的自动重复不算一次按键
 )
 
 func kbdHookProc(code int32, wp, lp uintptr) uintptr {
@@ -85,7 +131,51 @@ func kbdHookProc(code int32, wp, lp uintptr) uintptr {
 		r, _, _ := callNextH.Call(0, uintptr(code), wp, lp)
 		return r
 	}
+	vk := *(*uint32)(unsafe.Pointer(lp))
+	if wp == win.WM_KEYUP || wp == win.WM_SYSKEYUP {
+		if vk == vkF12 {
+			f12Held = false
+		}
+		return 1
+	}
+	if wp == win.WM_KEYDOWN || wp == win.WM_SYSKEYDOWN {
+		if vk != vkF12 {
+			return 1
+		}
+		if f12Held {
+			return 1 // 长按自动重复不计
+		}
+		f12Held = true
+		down := func(vk int32) bool {
+			r, _, _ := getAsyncKeyW.Call(uintptr(vk))
+			return r&0x8000 != 0
+		}
+		if down(vkControl) && down(vkShift) && down(vkMenu) {
+			now := time.Now()
+			if now.Sub(panicLast) > 3*time.Second {
+				panicN = 0
+			}
+			panicLast = now
+			panicN++
+			if panicN >= 3 {
+				panicN = 0
+				emergencyUnlock()
+			}
+		}
+	}
 	return 1 // 吞掉所有按键
+}
+
+// emergencyUnlock 本机紧急解锁：两类锁全清 + 恢复任务栏（窗口线程上跑）。
+func emergencyUnlock() {
+	mu.Lock()
+	teachLock, guardLock = false, false
+	teachWhy, guardWhy = "", ""
+	mu.Unlock()
+	enqueue(syncState)
+	if f := OnEmergencyUnlock; f != nil {
+		go f() // 钩子回调里不许阻塞，异步上报
+	}
 }
 
 func mouseHookProc(code int32, wp, lp uintptr) uintptr {
@@ -136,15 +226,20 @@ func unlockInput() {
 		unhookW.Call(mouHookH)
 		mouHookH = 0
 	}
-	if taskbarHidden {
-		for _, cls := range []string{"Shell_TrayWnd", "Shell_SecondaryTrayWnd"} {
-			p, _ := windows.UTF16PtrFromString(cls)
-			if h, _, _ := findWinW.Call(uintptr(unsafe.Pointer(p)), 0); h != 0 {
-				win.ShowWindow(win.HWND(h), win.SW_SHOW)
-			}
-		}
-		taskbarHidden = false
+	restoreTaskbar()
+}
+
+func restoreTaskbar() {
+	if !taskbarHidden {
+		return
 	}
+	for _, cls := range []string{"Shell_TrayWnd", "Shell_SecondaryTrayWnd"} {
+		p, _ := windows.UTF16PtrFromString(cls)
+		if h, _, _ := findWinW.Call(uintptr(unsafe.Pointer(p)), 0); h != 0 {
+			win.ShowWindow(win.HWND(h), win.SW_SHOW)
+		}
+	}
+	taskbarHidden = false
 }
 
 type atom = win.ATOM
@@ -163,6 +258,7 @@ func enqueue(fn func()) {
 }
 
 // Show 打开/切换广播窗。mode: "fullscreen" | "window"。
+// 锁定态下广播照常收流（画面被黑屏盖住，输入仍锁）。
 func Show(m string) {
 	mu.Lock()
 	mode = m
@@ -172,14 +268,14 @@ func Show(m string) {
 		go windowThread()
 		go decodeThread()
 	})
-	enqueue(func() { applyMode() })
+	enqueue(syncState)
 }
 
 // Frame 喂一帧 JPEG。解码在专门 goroutine 上跑（不占调用方的
 // UDP/TCP 读循环），窗口隐藏时直接丢弃省 CPU。
 func Frame(jpeg []byte) {
 	mu.Lock()
-	v := visible && !locked // 锁定态黑屏盖着广播，不解码省 CPU
+	v := visible && !locked() // 锁定态黑屏盖着广播，不解码省 CPU
 	mu.Unlock()
 	if !v {
 		return
@@ -216,78 +312,100 @@ func decodeThread() {
 	}
 }
 
-// Lock 黑屏锁定（screen.lock）：全屏黑 + 锁键鼠，工具条不给学生
-// 「退出」的机会。和广播共用窗口线程，后进的全屏广播照样显示画面
-// （锁输入仍然生效，画面被黑帧盖住）。
+// Lock 教师黑屏锁定（screen.lock）。
 func Lock(reason string) {
 	mu.Lock()
-	locked = true
-	lockWhy = reason
-	mode = "fullscreen"
-	visible = true
-	img = nil
+	teachLock, teachWhy = true, reason
 	mu.Unlock()
 	once.Do(func() {
 		go windowThread()
 		go decodeThread()
 	})
-	enqueue(func() { applyMode() })
+	enqueue(syncState)
 }
 
-// Unlock 解除黑屏锁定（screen.unlock）。
+// Unlock 解除教师锁（screen.unlock）。守护锁仍在则保持锁定。
 func Unlock() {
 	mu.Lock()
-	locked = false
-	lockWhy = ""
+	teachLock, teachWhy = false, ""
 	mu.Unlock()
-	enqueue(func() { hideAll() })
+	enqueue(syncState)
 }
 
-// Close 关闭广播窗与工具条（学生端「退出广播」也是走这里）。
-// 黑屏锁定状态下 Close 只收广播，不解锁——锁归 screen.unlock 管。
+// GuardLock/GuardUnlock 断线守护锁：独立于教师锁，重连只解守护锁。
+func GuardLock(reason string) {
+	mu.Lock()
+	guardLock, guardWhy = true, reason
+	mu.Unlock()
+	once.Do(func() {
+		go windowThread()
+		go decodeThread()
+	})
+	enqueue(syncState)
+}
+
+func GuardUnlock() {
+	mu.Lock()
+	guardLock, guardWhy = false, ""
+	mu.Unlock()
+	enqueue(syncState)
+}
+
+// Close 只收广播（学生端「退出广播」也走这里），不影响任何锁定。
 func Close() {
-	enqueue(func() { hideAll() })
+	mu.Lock()
+	visible = false
+	mu.Unlock()
+	enqueue(syncState)
 }
 
+// hideAll 等同于 Close 的内部入口。
 func hideAll() {
 	mu.Lock()
-	h, b := hwnd, bar
-	l := locked
-	img = nil
-	if !l {
-		visible = false
-	}
+	visible = false
 	mu.Unlock()
-	if b != 0 {
-		win.ShowWindow(b, win.SW_HIDE)
-	}
-	if l {
-		// 锁定态：只收广播画面，黑屏窗和键鼠锁保留到 screen.unlock
-		if h != 0 {
-			lockInput()
-			win.InvalidateRect(h, nil, true)
-		}
-		return
-	}
-	unlockInput()
-	if h != 0 {
-		win.ShowWindow(h, win.SW_HIDE)
-	}
+	syncState()
 }
 
-// applyMode 在窗口线程内按 mode 调整（或创建）窗口与悬浮工具条。
-func applyMode() {
+// syncState 是唯一的状态汇点（窗口线程上跑）：广播、教师锁、守护锁
+// 三组输入在这里算出四个输出，任何状态变化都统一走它：
+//   wantVisible   = 广播中 || 任一锁定
+//   wantFullscreen = 任一锁定 || 广播模式为 fullscreen
+//   wantInputLock = 任一锁定 || （广播中且 fullscreen）
+//   wantBar       = 广播中 && 无锁定（锁定不给学生工具条）
+func syncState() {
 	mu.Lock()
-	m := mode
+	l := locked()
+	wantVisible := visible || l
+	wantFullscreen := l || mode == "fullscreen"
+	wantInputLock := l || (visible && mode == "fullscreen")
+	wantBar := visible && !l
 	h := hwnd
 	mu.Unlock()
+
 	sw, sh := win.GetSystemMetrics(win.SM_CXSCREEN), win.GetSystemMetrics(win.SM_CYSCREEN)
 	style := uint32(win.WS_OVERLAPPEDWINDOW)
 	x, y, w, ht := int32(60), int32(40), sw-120, sh-80
-	if m == "fullscreen" {
+	if wantFullscreen {
 		style = win.WS_POPUP
 		x, y, w, ht = 0, 0, sw, sh
 	}
+
+	if !wantVisible {
+		if h != 0 {
+			win.ShowWindow(h, win.SW_HIDE)
+		}
+		mu.Lock()
+		b := bar
+		img = nil
+		mu.Unlock()
+		if b != 0 {
+			win.ShowWindow(b, win.SW_HIDE)
+		}
+		unlockInput()
+		return
+	}
+
 	if h == 0 {
 		h = createWindow(style, x, y, w, ht)
 		if h == 0 {
@@ -303,22 +421,22 @@ func applyMode() {
 	}
 	win.ShowWindow(h, win.SW_SHOW)
 	win.InvalidateRect(h, nil, true)
-	mu.Lock()
-	l := locked
-	mu.Unlock()
-	if m == "fullscreen" {
+
+	if wantInputLock {
 		lockInput()
 	} else {
 		unlockInput()
 	}
-	if l {
+	if wantBar {
+		showBar()
+	} else {
+		mu.Lock()
 		b := bar
+		mu.Unlock()
 		if b != 0 {
-			win.ShowWindow(b, win.SW_HIDE) // 锁定态不给学生工具条
+			win.ShowWindow(b, win.SW_HIDE)
 		}
-		return
 	}
-	showBar()
 }
 
 // ---- 悬浮工具条（仿极域顶栏）----
@@ -410,7 +528,7 @@ func barProc(h win.HWND, umsg uint32, wp, lp uintptr) uintptr {
 				mode = "fullscreen"
 			}
 			mu.Unlock()
-			applyMode()
+			syncState()
 		case btnExit:
 			hideAll()
 			if f := OnExit; f != nil {
@@ -444,10 +562,11 @@ func drawText(hdc win.HDC, s []uint16, rc *win.RECT, format uint32) {
 
 func windowThread() {
 	runtime.LockOSThread()
+	defer restoreTaskbar() // 线程死了钩子自动拆，但任务栏藏过的要还回去
 	// Create the first window before entering GetMessage. Show may enqueue its
 	// follow-up mode update before hwnd exists, in which case there is no HWND
 	// to wake with PostMessage; starting here makes the first call visible.
-	applyMode()
+	syncState()
 	mu.Lock()
 	h := hwnd
 	mu.Unlock()
@@ -507,9 +626,10 @@ func wndProc(h win.HWND, umsg uint32, wp, lp uintptr) uintptr {
 	case win.WM_CLOSE:
 		mu.Lock()
 		isFS := mode == "fullscreen"
+		l := locked()
 		mu.Unlock()
-		if isFS {
-			return 0 // 全屏广播不可关（退出走工具条）
+		if isFS || l {
+			return 0 // 全屏广播/锁定态不可关（退出走工具条或 screen.unlock）
 		}
 		win.ShowWindow(h, win.SW_HIDE)
 		mu.Lock()
@@ -534,7 +654,7 @@ func wndProc(h win.HWND, umsg uint32, wp, lp uintptr) uintptr {
 func paint(hdc win.HDC, rc win.RECT) {
 	mu.Lock()
 	src := img
-	l, why := locked, lockWhy
+	l, why := locked(), lockReason()
 	mu.Unlock()
 	if l {
 		win.SetTextColor(hdc, 0x00DDDDDD)

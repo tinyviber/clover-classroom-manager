@@ -84,6 +84,8 @@ function seed(): Device[] {
       alerts: 0,
       features: [...core],
       pending: false,
+      locked: false,
+      castTcp: false,
       lastSeen: "刚刚",
     });
   }
@@ -103,6 +105,7 @@ const state = {
     screenWatchIds: [],
     signIn: { open: false, id: "", deadline: 0, targetIds: [], sent: 0, replies: [], online: 22 },
     files: [],
+    collects: [],
     helps: [],
     poll: { open: false, id: "", question: "", options: [], deadline: 0, targetIds: [], sent: 0, replies: [] },
     demo: { state: "", sessionId: "", sourceId: "", sourceLabel: "", targetIds: [], requestedAt: "", err: "" },
@@ -110,10 +113,21 @@ const state = {
     castTargetIds: [],
     castQuality: "better",
     castTitle: "",
+    focusId: "",
   } as ClassroomState,
   watching: new Set<string>(),
   screenTimer: 0,
 };
+const seatStore = { cols: 8, seats: {} as Record<string, number[]> };
+
+// 与 main.go validCollectDir / agent 白名单一致：浏览器 mock 也要拒掉越界目录，
+// 否则「指定目录收取」的失败提示只在真机上才出现。
+function allowedCollectDir(dir: string): boolean {
+  if (!dir || dir.includes("..") || dir.startsWith("\\\\")) return false;
+  const low = dir.replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
+  const roots = ["c:/users/public", "c:/labhelper/homework"];
+  return roots.some((root) => low === root || low.startsWith(`${root}/`));
+}
 const listeners = new Set<(d: Device[]) => void>();
 const emit = () => listeners.forEach((cb) => cb([...state.devices]));
 const classroomListeners = new Set<(s: ClassroomState) => void>();
@@ -208,16 +222,47 @@ export const mockLab = {
   },
   async castStop() { state.classroom.castMode = ""; state.classroom.castTargetIds = []; emitClassroom(); },
   async castSetQuality(level: string) { state.classroom.castQuality = level; emitClassroom(); },
-  async collectFiles(ids: string[]) {
+  async collectFiles(ids: string[], dir: string, _glob: string) {
+    if (dir && !allowedCollectDir(dir)) return -1;
     const targets = state.devices.filter((device) => device.online && ids.includes(device.id));
     return targets.length;
   },
   async screenLock(ids: string[], _on: boolean) {
     return state.devices.filter((d) => d.online && ids.includes(d.id)).length;
   },
-  async powerAction(ids: string[], _action: string) {
+  async powerAction(ids: string[], _action: string, _force: boolean) {
     return state.devices.filter((d) => d.online && ids.includes(d.id)).length;
   },
+  async powerCancel(ids: string[]) {
+    return state.devices.filter((d) => d.online && ids.includes(d.id)).length;
+  },
+  async notifyText(ids: string[], _text: string) {
+    return state.devices.filter((d) => d.online && ids.includes(d.id)).length;
+  },
+  async openURLFor(ids: string[], _url: string) {
+    return state.devices.filter((d) => d.online && ids.includes(d.id)).length;
+  },
+  async launchAppFor(ids: string[], _path: string) {
+    return state.devices.filter((d) => d.online && ids.includes(d.id)).length;
+  },
+  async viewDevice(id: string, on: boolean) {
+    state.classroom.focusId = on ? id : "";
+    emitClassroom();
+    if (on) {
+      mockScreen(id);
+      const frame = state.classroom.screens.find((item) => item.deviceId === id);
+      if (frame) state.classroom.focusScreen = { ...frame };
+      emitClassroom();
+    } else {
+      state.classroom.focusScreen = undefined;
+    }
+    emitClassroom();
+    return true;
+  },
+  async seats() { return { ...seatStore.seats }; },
+  async seatCols() { return seatStore.cols; },
+  async setSeatCols(cols: number) { seatStore.cols = cols; },
+  async saveSeats(seats: Record<string, number[]>) { seatStore.seats = { ...seats }; },
   async focusAdmin() {},
   async signInStart(seconds: number, ids: string[]) {
     const online = state.devices.filter((device) => device.online && (!ids.length || ids.includes(device.id)));

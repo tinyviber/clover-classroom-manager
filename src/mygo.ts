@@ -13,6 +13,17 @@ export interface AdminInfo {
   dataDir: string;
 }
 
+/** ClassroomCollectResult 是一台设备的目录收取回执（结构化结果，不是传输进度）。 */
+export interface ClassroomCollectResult {
+  id: string;
+  deviceId: string;
+  label: string;
+  /** ok / empty / denied / quota / fail */
+  stat: string;
+  detail: string;
+  at: string;
+}
+
 export interface ClassroomDemo {
   state: string;
   sessionId: string;
@@ -84,6 +95,7 @@ export interface ClassroomState {
   screenWatchIds: string[];
   signIn: ClassroomSignIn;
   files: ClassroomFileProgress[];
+  collects: ClassroomCollectResult[];
   helps: ClassroomHelpRequest[];
   poll: ClassroomPoll;
   demo: ClassroomDemo;
@@ -92,6 +104,9 @@ export interface ClassroomState {
   castQuality: string;
   /** 窗口模式共享的窗口标题 */
   castTitle: string;
+  /** 正在高清查看的设备 */
+  focusId: string;
+  focusScreen?: ScreenFrame;
 }
 
 /** Device 是给 UI 的设备视图。 */
@@ -108,6 +123,12 @@ export interface Device {
   features: string[];
   /** 待审批的新注册设备 */
   pending: boolean;
+  /** 学生端真实锁定状态（status 上报） */
+  locked: boolean;
+  /** FeatErrs 是 agent 落地失败的策略键（applied≠desired 时点名显示） */
+  featErrs?: string[];
+  /** 广播时该设备走 TCP 兜底而非组播 */
+  castTcp: boolean;
   lastSeen: string;
 }
 
@@ -188,9 +209,13 @@ export const Lab = {
   clearHelp(deviceID: string): Promise<void> {
     return call("Lab.ClearHelp", deviceID);
   },
-  /** CollectFiles 让所选学生机弹出「提交文件」请求（托盘气泡 + 互动页）。 */
-  collectFiles(ids: string[]): Promise<number> {
-    return call("Lab.CollectFiles", ids);
+  /**
+   * CollectFiles 发起文件收取。dir 为空=学生手动选择提交（弹互动页）；
+   * dir 非空=按 glob 从学生机指定目录自动收取（学生无需操作）。
+   * 返回 -1 表示目录不在允许范围（collectRoots 白名单外）。
+   */
+  collectFiles(ids: string[], dir: string, glob: string): Promise<number> {
+    return call("Lab.CollectFiles", ids, dir, glob);
   },
   demoStart(sourceID: string, targetIDs: string[]): Promise<boolean> {
     return call("Lab.DemoStart", sourceID, targetIDs);
@@ -214,8 +239,20 @@ export const Lab = {
   focusAdmin(): Promise<void> {
     return call("Lab.FocusAdmin");
   },
+  /** LaunchAppFor 让所选学生机启动一个 .exe（绝对路径，学生端再做校验）。 */
+  launchAppFor(ids: string[], path: string): Promise<number> {
+    return call("Lab.LaunchAppFor", ids, path);
+  },
+  /** NotifyText 给学生机发教师消息（托盘气泡）。返回成功台数。 */
+  notifyText(ids: string[], text: string): Promise<number> {
+    return call("Lab.NotifyText", ids, text);
+  },
   openRecvDir(): Promise<string> {
     return call("Lab.OpenRecvDir");
+  },
+  /** OpenURLFor 让所选学生机用默认浏览器打开教学网址（仅 http/https）。 */
+  openURLFor(ids: string[], rawURL: string): Promise<number> {
+    return call("Lab.OpenURLFor", ids, rawURL);
   },
   pickFiles(): Promise<string[]> {
     return call("Lab.PickFiles");
@@ -226,13 +263,25 @@ export const Lab = {
   pollStop(): Promise<void> {
     return call("Lab.PollStop");
   },
-  /** PowerAction 远程重启/关机学生机。action: "restart" | "shutdown"。 */
-  powerAction(ids: string[], action: string): Promise<number> {
-    return call("Lab.PowerAction", ids, action);
+  /**
+   * PowerAction 远程重启/关机学生机。action: "restart" | "shutdown"。
+   * force=false 为普通关机（60s 倒计时、可取消）；force=true 5s 强关
+   * （有数据丢失风险，UI 须二次确认）。
+   */
+  powerAction(ids: string[], action: string, force: boolean): Promise<number> {
+    return call("Lab.PowerAction", ids, action, force);
+  },
+  /** PowerCancel 取消学生机上进行中的关机/重启倒计时（shutdown /a）。 */
+  powerCancel(ids: string[]): Promise<number> {
+    return call("Lab.PowerCancel", ids);
   },
   /** RejectDevices 拒绝待注册设备：移出注册表并断开连接。 */
   rejectDevices(ids: string[]): Promise<number> {
     return call("Lab.RejectDevices", ids);
+  },
+  /** SaveSeats 保存座位布局（拖拽结果整体回写）。 */
+  saveSeats(seats: Record<string, number[]>): Promise<void> {
+    return call("Lab.SaveSeats", seats);
   },
   /**
    * Scan re-discovers devices on the LAN. 发现是被动的（agent 自己找来），
@@ -244,6 +293,14 @@ export const Lab = {
   /** ScreenLock 锁定/解锁学生机屏幕（黑屏 + 锁键鼠，学生端无退出途径）。 */
   screenLock(ids: string[], on: boolean): Promise<number> {
     return call("Lab.ScreenLock", ids, on);
+  },
+  /** SeatCols 布局列数（教室常见 6-8 列）。 */
+  seatCols(): Promise<number> {
+    return call("Lab.SeatCols");
+  },
+  /** Seats 返回座位布局（设备 ID → [行,列]）。 */
+  seats(): Promise<Record<string, number[]>> {
+    return call("Lab.Seats");
   },
   sendFiles(ids: string[], paths: string[]): Promise<number> {
     return call("Lab.SendFiles", ids, paths);
@@ -259,11 +316,19 @@ export const Lab = {
   setHelper(ids: string[], on: boolean): Promise<number> {
     return call("Lab.SetHelper", ids, on);
   },
+  /** SetSeatCols 设置布局列数（会影响把 index 还原成行列）。 */
+  setSeatCols(cols: number): Promise<void> {
+    return call("Lab.SetSeatCols", cols);
+  },
   signInStart(seconds: number, ids: string[]): Promise<number> {
     return call("Lab.SignInStart", seconds, ids);
   },
   signInStop(): Promise<void> {
     return call("Lab.SignInStop");
+  },
+  /** ViewDevice 开关某台学生机的高清大图查看（双击卡片）。返回是否有目标。 */
+  viewDevice(id: string, on: boolean): Promise<boolean> {
+    return call("Lab.ViewDevice", id, on);
   },
   /** WatchScreens toggles low-rate thumbnail capture for the selected online devices. */
   watchScreens(ids: string[], on: boolean): Promise<void> {

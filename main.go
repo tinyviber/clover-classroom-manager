@@ -4,8 +4,10 @@ import (
 	"context"
 	"embed"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -113,6 +115,10 @@ type Device struct {
 	Alerts   int      `json:"alerts"`
 	Features []string `json:"features"`
 	Pending  bool     `json:"pending"` // 待审批的新注册设备
+	Locked   bool     `json:"locked"`  // 学生端真实锁定状态（status 上报）
+	// FeatErrs 是 agent 落地失败的策略键（applied≠desired 时点名显示）
+	FeatErrs []string `json:"featErrs,omitempty"`
+	CastTCP  bool     `json:"castTcp"` // 广播时该设备走 TCP 兜底而非组播
 	LastSeen string   `json:"lastSeen"`
 }
 
@@ -121,6 +127,7 @@ func toView(d lan.Device) Device {
 		ID: d.ID, Name: d.Name, Label: d.Label, IP: d.IP, MAC: d.MAC,
 		Online: d.Online, HelperOn: d.HelperOn, Version: d.Version,
 		Alerts: d.Alerts, Features: d.Features, Pending: d.Pending,
+		Locked: d.Locked, FeatErrs: d.FeatErrs, CastTCP: d.CastTCP,
 		LastSeen: d.LastSeenText(),
 	}
 }
@@ -134,9 +141,13 @@ type Lab struct {
 	castMu      sync.Mutex
 	classroomMu sync.Mutex // 序列化教师广播与学生演示的启停/冲突检查。
 	castCancel  context.CancelFunc
-	castQuality string // 画质档："perfect"|"better"|"normal"|"low"
-	castTitle   string // 窗口广播钉住的共享窗口标题（""=非窗口模式）
+	castQuality string       // 画质档："perfect"|"better"|"normal"|"low"
+	castTitle   string       // 窗口广播钉住的共享窗口标题（""=非窗口模式）
 	castBar     *mygo.Window // 广播悬浮控制条（Panel 小窗）
+
+	seatMu   sync.Mutex
+	seatMap  map[string][2]int // 设备 ID → [行,列] 座位布局（持久化 seats.json）
+	seatCols int               // 布局列数（默认 8）
 }
 
 // ScreenFrame is a base64 JPEG thumbnail for the management view.
@@ -178,6 +189,16 @@ type ClassroomFileProgress struct {
 	At       string `json:"at"`
 }
 
+// ClassroomCollectResult 是一台设备的目录收取回执（结构化结果，不是传输进度）。
+type ClassroomCollectResult struct {
+	ID       string `json:"id"`
+	DeviceID string `json:"deviceId"`
+	Label    string `json:"label"`
+	Stat     string `json:"stat"` // ok / empty / denied / quota / fail
+	Detail   string `json:"detail"`
+	At       string `json:"at"`
+}
+
 type ClassroomHelpRequest struct {
 	DeviceID string `json:"deviceId"`
 	Label    string `json:"label"`
@@ -215,17 +236,20 @@ type ClassroomDemo struct {
 
 // ClassroomState is the push snapshot for classroom activities.
 type ClassroomState struct {
-	Screens        []ScreenFrame           `json:"screens"`
-	ScreenWatchIDs []string                `json:"screenWatchIds"`
-	SignIn         ClassroomSignIn         `json:"signIn"`
-	Files          []ClassroomFileProgress `json:"files"`
-	Helps          []ClassroomHelpRequest  `json:"helps"`
-	Poll           ClassroomPoll           `json:"poll"`
-	Demo           ClassroomDemo           `json:"demo"`
-	CastMode       string                  `json:"castMode"`
-	CastTargetIDs  []string                `json:"castTargetIds"`
-	CastQuality    string                  `json:"castQuality"`
-	CastTitle      string                  `json:"castTitle"` // 窗口模式共享的窗口标题
+	Screens        []ScreenFrame            `json:"screens"`
+	ScreenWatchIDs []string                 `json:"screenWatchIds"`
+	SignIn         ClassroomSignIn          `json:"signIn"`
+	Files          []ClassroomFileProgress  `json:"files"`
+	Collects       []ClassroomCollectResult `json:"collects"`
+	Helps          []ClassroomHelpRequest   `json:"helps"`
+	Poll           ClassroomPoll            `json:"poll"`
+	Demo           ClassroomDemo            `json:"demo"`
+	CastMode       string                   `json:"castMode"`
+	CastTargetIDs  []string                 `json:"castTargetIds"`
+	CastQuality    string                   `json:"castQuality"`
+	CastTitle      string                   `json:"castTitle"` // 窗口模式共享的窗口标题
+	FocusID        string                   `json:"focusId"`   // 正在高清查看的设备
+	FocusScreen    *ScreenFrame             `json:"focusScreen,omitempty"`
 }
 
 // Devices returns the current device list.
@@ -295,7 +319,9 @@ func (l *Lab) ScreenLock(ids []string, on bool) int {
 }
 
 // PowerAction 远程重启/关机学生机。action: "restart" | "shutdown"。
-func (l *Lab) PowerAction(ids []string, action string) int {
+// force=false 为普通关机（60s 倒计时、可取消）；force=true 5s 强关
+// （有数据丢失风险，UI 须二次确认）。
+func (l *Lab) PowerAction(ids []string, action string, force bool) int {
 	op := lan.OpRestart
 	switch action {
 	case "shutdown":
@@ -304,7 +330,124 @@ func (l *Lab) PowerAction(ids []string, action string) int {
 	default:
 		return 0
 	}
-	return l.broadcast(ids, op, nil)
+	return l.broadcast(ids, op, lan.PowerArgs{Force: force})
+}
+
+// PowerCancel 取消学生机上进行中的关机/重启倒计时（shutdown /a）。
+func (l *Lab) PowerCancel(ids []string) int {
+	return l.broadcast(ids, lan.OpPowerCancel, nil)
+}
+
+// NotifyText 给学生机发教师消息（托盘气泡）。返回成功台数。
+func (l *Lab) NotifyText(ids []string, text string) int {
+	text = strings.TrimSpace(text)
+	if text == "" || len([]rune(text)) > 200 {
+		return 0
+	}
+	return l.broadcast(ids, lan.OpNotify, lan.NotifyArgs{Text: text})
+}
+
+// OpenURLFor 让所选学生机用默认浏览器打开教学网址（仅 http/https）。
+func (l *Lab) OpenURLFor(ids []string, rawURL string) int {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return 0
+	}
+	return l.broadcast(ids, lan.OpOpenURL, lan.OpenURLArgs{URL: u.String()})
+}
+
+// LaunchAppFor 让所选学生机启动一个 .exe（绝对路径，学生端再做校验）。
+func (l *Lab) LaunchAppFor(ids []string, path string) int {
+	path = strings.TrimSpace(path)
+	if path == "" || !strings.HasSuffix(strings.ToLower(path), ".exe") {
+		return 0
+	}
+	return l.broadcast(ids, lan.OpLaunchApp, lan.LaunchArgs{Path: path})
+}
+
+// ViewDevice 开关某台学生机的高清大图查看（双击卡片）。返回是否有目标。
+func (l *Lab) ViewDevice(id string, on bool) bool {
+	if id == "" {
+		return false
+	}
+	l.srv.ViewDevice(id, on)
+	scheduleClassroomPush(l)
+	return true
+}
+
+// Seats 返回座位布局（设备 ID → [行,列]）。
+func (l *Lab) Seats() map[string][2]int {
+	l.seatMu.Lock()
+	defer l.seatMu.Unlock()
+	out := make(map[string][2]int, len(l.seatMap))
+	for id, rc := range l.seatMap {
+		out[id] = rc
+	}
+	return out
+}
+
+// SeatCols 布局列数（教室常见 6-8 列）。
+func (l *Lab) SeatCols() int {
+	l.seatMu.Lock()
+	defer l.seatMu.Unlock()
+	return l.seatCols
+}
+
+// SetSeatCols 设置布局列数（会影响把 index 还原成行列）。
+func (l *Lab) SetSeatCols(cols int) {
+	if cols < 2 || cols > 20 {
+		return
+	}
+	l.seatMu.Lock()
+	l.seatCols = cols
+	l.seatMu.Unlock()
+	l.saveSeats()
+}
+
+// SaveSeats 保存座位布局（拖拽结果整体回写）。
+func (l *Lab) SaveSeats(seats map[string][2]int) {
+	l.seatMu.Lock()
+	l.seatMap = seats
+	l.seatMu.Unlock()
+	l.saveSeats()
+}
+
+func (l *Lab) seatsPath() string { return filepath.Join(l.dataDir, "seats.json") }
+
+func (l *Lab) loadSeats() {
+	b, err := os.ReadFile(l.seatsPath())
+	if err != nil {
+		return
+	}
+	var saved struct {
+		Cols  int               `json:"cols"`
+		Seats map[string][2]int `json:"seats"`
+	}
+	if json.Unmarshal(b, &saved) != nil {
+		return
+	}
+	l.seatMu.Lock()
+	if saved.Cols >= 2 && saved.Cols <= 20 {
+		l.seatCols = saved.Cols
+	}
+	if saved.Seats != nil {
+		l.seatMap = saved.Seats
+	}
+	l.seatMu.Unlock()
+}
+
+func (l *Lab) saveSeats() {
+	l.seatMu.Lock()
+	saved := struct {
+		Cols  int               `json:"cols"`
+		Seats map[string][2]int `json:"seats"`
+	}{Cols: l.seatCols, Seats: l.seatMap}
+	l.seatMu.Unlock()
+	b, err := json.MarshalIndent(saved, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(l.seatsPath(), b, 0o600)
 }
 
 // ApproveDevices 批准待注册设备（enrollment）。返回批准的台数。
@@ -547,7 +690,8 @@ func main() {
 	if len(srv.Devices()) == 0 && demoAgents > 0 {
 		seedRegistry(srv) // 首启种子；之后以持久化注册表为准
 	}
-	lab := &Lab{srv: srv, dataDir: dataDir}
+	lab := &Lab{srv: srv, dataDir: dataDir, seatMap: map[string][2]int{}, seatCols: 8}
+	lab.loadSeats()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if err := srv.Run(ctx); err != nil {
@@ -635,11 +779,12 @@ func (l *Lab) ClassroomState() ClassroomState {
 		Screens:        make([]ScreenFrame, 0, len(frames)),
 		ScreenWatchIDs: l.srv.ScreenWatchTargets(),
 		Files:          make([]ClassroomFileProgress, 0),
+		Collects:       make([]ClassroomCollectResult, 0),
 		Helps:          make([]ClassroomHelpRequest, 0),
 		CastMode:       l.CastMode(),
 		CastTargetIDs:  l.srv.CastTargets(),
 		CastQuality:    l.quality(),
-		CastTitle:     l.castTitleForUI(),
+		CastTitle:      l.castTitleForUI(),
 	}
 	for _, frame := range frames {
 		state.Screens = append(state.Screens, ScreenFrame{
@@ -671,6 +816,12 @@ func (l *Lab) ClassroomState() ClassroomState {
 			Err: transfer.Err, At: activityTime(transfer.At),
 		})
 	}
+	for _, result := range l.srv.CollectResults() {
+		state.Collects = append(state.Collects, ClassroomCollectResult{
+			ID: result.ID, DeviceID: result.DeviceID, Label: result.Label,
+			Stat: result.Stat, Detail: result.Detail, At: activityTime(result.At),
+		})
+	}
 	for _, request := range l.srv.HelpRequests() {
 		state.Helps = append(state.Helps, ClassroomHelpRequest{
 			DeviceID: request.DeviceID, Label: request.Label, Name: request.Name, At: activityTime(request.At),
@@ -694,6 +845,14 @@ func (l *Lab) ClassroomState() ClassroomState {
 		State: demo.State, SessionID: demo.SessionID, SourceID: demo.SourceID,
 		SourceLabel: demo.SourceLabel, TargetIDs: append([]string{}, demo.TargetIDs...),
 		RequestedAt: activityTime(demo.RequestedAt), Err: demo.Err,
+	}
+
+	state.FocusID = l.srv.FocusDeviceID()
+	if f, ok := l.srv.FocusScreen(); ok {
+		state.FocusScreen = &ScreenFrame{
+			DeviceID: f.DeviceID, Label: f.Label, Name: f.Name,
+			JPEG: base64.StdEncoding.EncodeToString(f.JPEG), At: f.At.UnixMilli(),
+		}
 	}
 	return state
 }
@@ -804,7 +963,7 @@ func (l *Lab) CastStart(mode string, ids []string) bool {
 			ack, err := l.srv.SendCommand(id, lan.OpCastStart, args)
 			// "stale" 是客户端认出过期代数——不是失败，不该标 TCP 兜底。
 			if ack.Detail == "tcp" || (ack.Detail != "stale" && (err != nil || !ack.OK)) {
-				l.srv.MarkCastTCP(id)
+				l.srv.MarkCastTCP(id, args.Gen)
 			}
 			// 广播期间被停/换代：补对应代数的 cast.stop 防僵尸全屏窗。
 			if cur, still := l.srv.CastArgs(id); !still || cur.Gen != args.Gen {
@@ -850,16 +1009,42 @@ func (l *Lab) CastStop() {
 
 func (l *Lab) CastMode() string { return l.srv.CastMode() }
 
-// CollectFiles 让所选学生机弹出「提交文件」请求（托盘气泡 + 互动页）。
-func (l *Lab) CollectFiles(ids []string) int {
-	session := "c-" + strconv.FormatInt(time.Now().Unix(), 36)
+// validCollectDir 教师端预检：目录必须在 lan.AllowedCollectRoots
+// 白名单下（agent 侧还会再验——管理端拦截只是 UX，agent 是安全边界）。
+func validCollectDir(dir string) bool {
+	if dir == "" || strings.Contains(dir, "..") || strings.HasPrefix(dir, `\\`) {
+		return false
+	}
+	low := strings.ToLower(filepath.ToSlash(dir))
+	for _, root := range lan.AllowedCollectRoots {
+		r := strings.ToLower(filepath.ToSlash(filepath.Clean(root)))
+		if low == r || strings.HasPrefix(low, r+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// CollectFiles 发起文件收取。dir 为空=学生手动选择提交（弹互动页）；
+// dir 非空=按 glob 从学生机指定目录自动收取（学生无需操作）。
+// 返回 -1 表示目录不在允许范围（collectRoots 白名单外）。
+func (l *Lab) CollectFiles(ids []string, dir, glob string) int {
+	session := "c-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	dir = strings.TrimSpace(dir)
+	if len(dir) > 512 || len(glob) > 128 {
+		return 0
+	}
+	if dir != "" && !validCollectDir(dir) {
+		return -1
+	}
+	args := lan.CollectOpenArgs{Session: session, Dir: dir, Glob: strings.TrimSpace(glob)}
 	var sent atomic.Int32
 	var wg sync.WaitGroup
 	for _, id := range l.srv.OnlineIDs(ids) {
 		wg.Add(1)
 		go func(id string) {
 			defer wg.Done()
-			if _, err := l.srv.SendCommand(id, lan.OpCollectOpen, lan.CollectOpenArgs{Session: session}); err == nil {
+			if _, err := l.srv.SendCommand(id, lan.OpCollectOpen, args); err == nil {
 				sent.Add(1)
 			}
 		}(id)

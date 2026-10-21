@@ -16,6 +16,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,7 +36,9 @@ type Agent struct {
 	// PinnedPub 管理端公钥。nil 表示 TOFU：信任第一个应答的信标。
 	PinnedPub ed25519.PublicKey
 	// DirectAddr 形如 "192.168.31.1:47823"，先直连；失败后回退到 UDP 发现。
+	// 只能在构造期赋值；运行期（含 UDP 发现更新）一律走 directMu。
 	DirectAddr string
+	directMu   sync.RWMutex
 	// RecvDir 教师下发文件的落盘目录（默认 exe 旁 recv/）。
 	RecvDir string
 
@@ -45,14 +48,21 @@ type Agent struct {
 	// 第一次握手验证通过的那个）交给调用方落盘 client.json——否则每次
 	// 断线重发现都在重新「首次信任」，TOFU 名不副实。
 	PersistPub func(ed25519.PublicKey)
+	// PersistState 可选钩子：防护策略（helperOn + features）由管理端
+	// 下发后回写 client.json，agent 重启后仍按上次配置生效。
+	PersistState func(helperOn bool, features []string)
 	// OnPrompt 可选钩子：有新的课堂互动（"signin"/"poll"/"demo"/"collect"）待学生处理。
 	// 静默运行的客户端用它做气泡通知 + 唤起互动窗口。
 	OnPrompt func(kind, session string)
+	// OnNotify 可选钩子：教师发来的文字消息（气泡通知）。
+	OnNotify func(text string)
 	// OnConn 可选钩子：管理端会话建立/断开。
 	OnConn func(connected bool)
 
 	helperOn atomic.Bool
 	features atomic.Value // []string
+	featErrs atomic.Value // []string——应用失败的策略键
+	watchHi  bool         // 单机高清查看模式（教师点开大图），watchMu 保护
 
 	// guard_offline 守护：断线超时后自动锁屏。guardLocked 只记守护自己
 	// 上的锁，解锁也只解自己的（教师 screen.lock 独立管理）。
@@ -60,9 +70,24 @@ type Agent struct {
 	guardTimer  *time.Timer
 	guardLocked bool
 
+	// pendingAlerts 离线时缓存的告警（紧急解锁发生在断网时也要在
+	// 重连后送达管理端），下条会话建立时 flush。
+	pendMu     sync.Mutex
+	pendAlerts []AlertMsg
+
 	// castGen 当前广播代数：只接受更大代的 cast.start，小于等于当前代的
 	// cast.stop 才生效。每条 TCP 会话结束时清零（服务端换代语义按会话计）。
 	castGen atomic.Uint32
+
+	// powerTimer 关机/重启的 agent 侧可取消倒计时：Windows 的
+	// shutdown /t>0 隐含 /f 强关应用，所以普通关机是我们自己的定时器，
+	// 到期执行不带 /f 的 shutdown /t 0（应用可拒绝）。power.cancel 停它。
+	// powerGen 是排程代数：回调只在 gen 仍是当前代时才执行，防止旧
+	// 定时器回调把新排程清掉或错过取消窗口。timer 一旦进入执行阶段
+	// （gen 消费）就不能再取消——取消接口如实返回 false。
+	powerMu    sync.Mutex
+	powerTimer *time.Timer
+	powerGen   uint64
 
 	cur           atomic.Pointer[session] // 当前会话（SubmitFile 用）
 	watchMu       sync.Mutex
@@ -85,8 +110,10 @@ type Agent struct {
 // NewAgent 构造一个默认全开防护的 agent。
 func NewAgent(id, name string) *Agent {
 	a := &Agent{ID: id, Name: name, Version: "0.0.2", Token: RandHex(16), inFiles: map[string]*incoming{}, outgoing: map[string]chan FileMsg{}}
+	castview.OnEmergencyUnlock = a.onEmergencyUnlock
 	a.helperOn.Store(true)
 	a.features.Store([]string{})
+	a.featErrs.Store([]string{})
 	return a
 }
 
@@ -111,20 +138,27 @@ func (a *Agent) hasFeature(key string) bool {
 	return false
 }
 
-// enforce 把已启用的功能真正落地到本机。目前落地的策略：
+// enforce 把已启用的功能真正落地到本机，执行失败的键记入
+// featErrs 上报管理端（desired→applied→reported 分开）。目前落地：
 //   - lock_taskmgr：HKCU DisableTaskMgr
 //   - guard_offline：断线 15s 自动锁屏（计时在 arm/disarm 里管）
 //
 // 其余 catalog 项尚未实现，服务端目录里标 ready=false 不展示为已生效。
 func (a *Agent) enforce() {
 	on := a.helperOn.Load()
+	var errs []string
 	if err := setDisableTaskMgr(on && a.hasFeature("lock_taskmgr")); err != nil {
+		errs = append(errs, "lock_taskmgr")
 		log.Printf("agent[%s]: DisableTaskMgr 策略写入失败: %v", a.ID, err)
 	}
 	if !(on && a.hasFeature("guard_offline")) {
 		a.disarmOfflineGuard()
 	}
+	a.featErrs.Store(errs)
 }
+
+// offlineGuardDelay 断线守护上弦后的锁屏延迟（测试可缩短）。
+var offlineGuardDelay = 15 * time.Second
 
 // armOfflineGuard 在会话断开后上弦：guard_offline 开启时 15s 内没
 // 重连成功就锁屏（防拔网线脱控）。ctx 结束（agent 退出）不上弦。
@@ -137,14 +171,14 @@ func (a *Agent) armOfflineGuard(ctx context.Context) {
 	if a.guardLocked || a.guardTimer != nil {
 		return
 	}
-	a.guardTimer = time.AfterFunc(15*time.Second, func() {
+	a.guardTimer = time.AfterFunc(offlineGuardDelay, func() {
 		a.guardMu.Lock()
 		a.guardTimer = nil
 		if a.offlineGuardOn() {
 			a.guardLocked = true
 			a.guardMu.Unlock()
 			log.Printf("agent[%s]: 与管理端断线超时，锁定屏幕", a.ID)
-			castview.Lock("与管理端的连接已断开")
+			castview.GuardLock("与管理端的连接已断开")
 			return
 		}
 		a.guardMu.Unlock()
@@ -163,12 +197,64 @@ func (a *Agent) disarmOfflineGuard() {
 	a.guardLocked = false
 	a.guardMu.Unlock()
 	if locked {
-		castview.Unlock()
+		castview.GuardUnlock() // 只解守护自己的锁，教师锁不受影响
 	}
 }
 
 func (a *Agent) offlineGuardOn() bool {
 	return a.helperOn.Load() && a.hasFeature("guard_offline")
+}
+
+// onEmergencyUnlock 本机紧急解锁（Ctrl+Alt+Shift+F12×3，管理员恢复通道）：
+// ① 同步解开 agent 侧的守护锁标记——不然 a.guardLocked 滞留会让
+// armOfflineGuard 永远不再上弦，解锁就成了一次性豁免；
+// ② 上报告警，离线则缓存到重连后补发。
+func (a *Agent) onEmergencyUnlock() {
+	log.Printf("agent[%s]: 本机触发紧急解锁组合键", a.ID)
+	a.disarmOfflineGuard() // 与 castview 的解锁保持一致，守护下次断线仍生效
+	a.reportAlert(AlertMsg{Kind: "emergency_unlock", Detail: "本机紧急解锁"})
+	if s := a.cur.Load(); s != nil {
+		_ = a.pushStatus(s)
+	}
+}
+
+// ReportAlert 供 agent 宿主（cmd/client）上报自定义告警（如策略回写失败）。
+func (a *Agent) ReportAlert(kind, detail string) {
+	a.reportAlert(AlertMsg{Kind: kind, Detail: detail})
+}
+
+// reportAlert 上报告警；离线时缓存（上限 8 条防膨胀），重连补发。
+func (a *Agent) reportAlert(alert AlertMsg) {
+	if s := a.cur.Load(); s != nil {
+		if err := s.send(Msg{Type: MsgAlert, Alert: &alert}); err == nil {
+			return
+		}
+	}
+	a.pendMu.Lock()
+	if len(a.pendAlerts) < 8 {
+		a.pendAlerts = append(a.pendAlerts, alert)
+	}
+	a.pendMu.Unlock()
+}
+
+// flushAlerts 逐条补发离线缓存的告警；发送失败时把【未发出】的放回
+// 队列等下条会话再试——重连即断的抖动不能永久丢紧急解锁告警。
+func (a *Agent) flushAlerts(s *session) {
+	for {
+		a.pendMu.Lock()
+		if len(a.pendAlerts) == 0 {
+			a.pendMu.Unlock()
+			return
+		}
+		alert := a.pendAlerts[0]
+		a.pendMu.Unlock()
+		if err := s.send(Msg{Type: MsgAlert, Alert: &alert}); err != nil {
+			return // 连接又挂了：整个队列（含本条）保留下次重发
+		}
+		a.pendMu.Lock()
+		a.pendAlerts = a.pendAlerts[1:]
+		a.pendMu.Unlock()
+	}
 }
 
 // Run 主循环：发现→连接→会话，断线重来。
@@ -183,14 +269,14 @@ func (a *Agent) Run(ctx context.Context) {
 		}
 		if err := a.session(ctx, addr, pub); err != nil {
 			log.Printf("agent[%s]: 会话结束: %v", a.ID, err)
-			if ctx.Err() == nil && a.DirectAddr != "" && a.PinnedPub != nil {
+			if ctx.Err() == nil && a.directAddr() != "" && a.PinnedPub != nil {
 				discoverCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 				foundAddr, foundPub, discoverErr := a.discoverBroadcast(discoverCtx, false)
 				cancel()
 				if discoverErr == nil && a.PinnedPub.Equal(foundPub) {
-					if foundAddr != a.DirectAddr {
-						log.Printf("agent[%s]: 管理端地址已更新 %s → %s", a.ID, a.DirectAddr, foundAddr)
-						a.DirectAddr = foundAddr
+					if foundAddr != a.directAddr() {
+						log.Printf("agent[%s]: 管理端地址已更新 %s → %s", a.ID, a.directAddr(), foundAddr)
+						a.setDirectAddr(foundAddr)
 					}
 				} else if discoverErr != nil {
 					log.Printf("agent[%s]: UDP 发现回退失败: %v", a.ID, discoverErr)
@@ -201,10 +287,22 @@ func (a *Agent) Run(ctx context.Context) {
 	}
 }
 
+func (a *Agent) directAddr() string {
+	a.directMu.RLock()
+	defer a.directMu.RUnlock()
+	return a.DirectAddr
+}
+
+func (a *Agent) setDirectAddr(addr string) {
+	a.directMu.Lock()
+	a.DirectAddr = addr
+	a.directMu.Unlock()
+}
+
 // discover 广播找管理端，返回 (tcpAddr, adminPub)。
 func (a *Agent) discover(ctx context.Context) (string, ed25519.PublicKey, error) {
-	if a.DirectAddr != "" && a.PinnedPub != nil {
-		return a.DirectAddr, a.PinnedPub, nil
+	if addr := a.directAddr(); addr != "" && a.PinnedPub != nil {
+		return addr, a.PinnedPub, nil
 	}
 	return a.discoverBroadcast(ctx, true)
 }
@@ -222,6 +320,18 @@ func (a *Agent) discoverBroadcast(ctx context.Context, useConfiguredAddr bool) (
 		return "", nil, err
 	}
 	defer pc.Close()
+	// 调用方的超时（断线后的 3s 回退）必须能打断 ReadFromUDP。
+	// 否则一次读超时刚好卡在 ctx 到期前，循环会再挂上一个 3s deadline，
+	// 发现可以拖到 6s，重连和测试都会错过窗口。
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = pc.Close()
+		case <-done:
+		}
+	}()
 	uc := pc.(*net.UDPConn)
 
 	bcast := &net.UDPAddr{IP: net.IPv4bcast, Port: UDPPort}
@@ -243,8 +353,8 @@ func (a *Agent) discoverBroadcast(ctx context.Context, useConfiguredAddr bool) (
 				continue
 			}
 			addr := fmt.Sprintf("%s:%d", src.IP.String(), b.TCPPort)
-			if useConfiguredAddr && a.DirectAddr != "" {
-				addr = a.DirectAddr
+			if useConfiguredAddr && a.directAddr() != "" {
+				addr = a.directAddr()
 			}
 			return addr, pub, nil
 		}
@@ -306,6 +416,7 @@ func (a *Agent) session(ctx context.Context, addr string, pub ed25519.PublicKey)
 	a.cur.Store(sess)
 	a.emitConn(true)
 	a.disarmOfflineGuard() // 重连成功，解除断线锁屏守护
+	a.flushAlerts(sess)    // 补发断线期间缓存的告警（紧急解锁等）
 
 	done := make(chan struct{})
 	defer close(done)
@@ -361,8 +472,10 @@ func (a *Agent) session(ctx context.Context, addr string, pub ed25519.PublicKey)
 
 func (a *Agent) pushStatus(s *session) error {
 	return s.send(Msg{Type: MsgStatus, Status: &StatusMsg{
-		HelperOn: a.helperOn.Load(),
-		Features: a.features.Load().([]string),
+		HelperOn:   a.helperOn.Load(),
+		Features:   a.features.Load().([]string),
+		Locked:     castview.Locked(),
+		FeatureErr: a.featErrs.Load().([]string),
 	}})
 }
 
@@ -375,17 +488,19 @@ func (a *Agent) handleCmd(s *session, c CommandMsg) {
 		if b, _ := json.Marshal(c.Args); json.Unmarshal(b, &args) == nil {
 			a.helperOn.Store(args.On)
 			a.enforce()
+			a.persistState()
 		}
 	case OpSetFeatures:
 		var args SetFeaturesArgs
 		if b, _ := json.Marshal(c.Args); json.Unmarshal(b, &args) == nil {
 			a.features.Store(args.Keys)
 			a.enforce()
+			a.persistState()
 		}
 	case OpScreenWatch:
 		var args ScreenWatchArgs
 		if b, _ := json.Marshal(c.Args); json.Unmarshal(b, &args) == nil {
-			a.setWatch(args.On)
+			a.setWatch(args.On, args.Hi)
 		}
 	case OpCastStart:
 		var args CastStartArgs
@@ -433,8 +548,55 @@ func (a *Agent) handleCmd(s *session, c CommandMsg) {
 	case OpUnlockScreen:
 		castview.Unlock()
 	case OpRestart, OpShutdown:
-		if err := powerAction(c.Op); err != nil {
+		var args PowerArgs
+		_ = json.Unmarshal(mustJSON(c.Args), &args)
+		if err := a.schedulePower(c.Op, args.Force); err != nil {
 			ack.OK, ack.Err = false, err.Error()
+		}
+	case OpPowerCancel:
+		// 两个通道都算：agent 侧普通倒计时 + 系统级 force 关机
+		// （shutdown /a）。任一路径真正取消成功就算成功——教师看到的是
+		// 是否还有关机在进行，而不是哪一层取消了它。
+		canceled := a.cancelScheduledPower()
+		sysErr := powerCancel() // /a 没有可取消的关机时返回非零
+		if !canceled && sysErr != nil {
+			ack.OK, ack.Err = false, "没有可取消的关机倒计时（未排程或已开始执行）"
+		}
+	case OpNotify:
+		var args NotifyArgs
+		if b, _ := json.Marshal(c.Args); json.Unmarshal(b, &args) == nil {
+			text := strings.TrimSpace(args.Text)
+			if text == "" || len([]rune(text)) > 200 {
+				ack.OK, ack.Err = false, "消息为空或超过 200 字"
+				break
+			}
+			if a.OnNotify != nil {
+				a.OnNotify(text)
+			} else {
+				log.Printf("agent[%s]: 教师消息: %s", a.ID, text)
+			}
+		}
+	case OpOpenURL:
+		var args OpenURLArgs
+		if b, _ := json.Marshal(c.Args); json.Unmarshal(b, &args) == nil {
+			if err := validOpenURL(args.URL); err != nil {
+				ack.OK, ack.Err = false, err.Error()
+			} else if err := openURL(args.URL); err != nil {
+				ack.OK, ack.Err = false, err.Error()
+			}
+		} else {
+			ack.OK, ack.Err = false, "无效的 URL 参数"
+		}
+	case OpLaunchApp:
+		var args LaunchArgs
+		if b, _ := json.Marshal(c.Args); json.Unmarshal(b, &args) == nil {
+			if err := validLaunchPath(args.Path); err != nil {
+				ack.OK, ack.Err = false, err.Error()
+			} else if err := launchApp(args.Path); err != nil {
+				ack.OK, ack.Err = false, err.Error()
+			}
+		} else {
+			ack.OK, ack.Err = false, "无效的程序路径"
 		}
 	case OpSignInOpen:
 		var args SignInOpenArgs
@@ -477,7 +639,12 @@ func (a *Agent) handleCmd(s *session, c CommandMsg) {
 			a.uiMu.Lock()
 			a.collectPrompt = &args
 			a.uiMu.Unlock()
-			a.emitPrompt("collect", args.Session)
+			if args.Dir != "" {
+				// 指定目录收取：不用学生动手，按 glob 匹配自动打包上传。
+				go a.collectDir(s, args)
+			} else {
+				a.emitPrompt("collect", args.Session)
+			}
 		}
 	case OpDemoRequest:
 		var args DemoRequestArgs
@@ -575,20 +742,23 @@ type StudentDemoPrompt struct {
 }
 
 // StudentCollectPrompt 收取文件请求（学生提交一个文件给管理端）。
+// Dir/Glob 非空表示「指定目录收取」——agent 已自动匹配上传，学生无需操作。
 type StudentCollectPrompt struct {
 	Session string `json:"session"`
+	Dir     string `json:"dir,omitempty"`
+	Glob    string `json:"glob,omitempty"`
 }
 
 type StudentUIState struct {
-	Connected   bool                   `json:"connected"`
-	Name        string                 `json:"name"`
-	Label       string                 `json:"label"`
-	SignIn      *StudentSignPrompt     `json:"signIn,omitempty"`
-	Poll        *StudentPollPrompt     `json:"poll,omitempty"`
-	Collect     *StudentCollectPrompt  `json:"collect,omitempty"`
-	HelpRaised  bool                   `json:"helpRaised"`
-	Demo        *StudentDemoPrompt     `json:"demo,omitempty"`
-	DemoRunning bool                   `json:"demoRunning"`
+	Connected   bool                  `json:"connected"`
+	Name        string                `json:"name"`
+	Label       string                `json:"label"`
+	SignIn      *StudentSignPrompt    `json:"signIn,omitempty"`
+	Poll        *StudentPollPrompt    `json:"poll,omitempty"`
+	Collect     *StudentCollectPrompt `json:"collect,omitempty"`
+	HelpRaised  bool                  `json:"helpRaised"`
+	Demo        *StudentDemoPrompt    `json:"demo,omitempty"`
+	DemoRunning bool                  `json:"demoRunning"`
 }
 
 func (a *Agent) StudentState() StudentUIState {
@@ -611,7 +781,9 @@ func (a *Agent) StudentState() StudentUIState {
 		}
 	}
 	if a.collectPrompt != nil {
-		state.Collect = &StudentCollectPrompt{Session: a.collectPrompt.Session}
+		state.Collect = &StudentCollectPrompt{
+			Session: a.collectPrompt.Session, Dir: a.collectPrompt.Dir, Glob: a.collectPrompt.Glob,
+		}
 	}
 	return state
 }
@@ -729,12 +901,22 @@ func (a *Agent) StopStudentDemo() error {
 	return nil
 }
 
-func (a *Agent) setWatch(on bool) {
+// persistState 把教师下发的防护策略回写 client.json（重启后继续生效）。
+func (a *Agent) persistState() {
+	if f := a.PersistState; f != nil {
+		f(a.helperOn.Load(), a.Features())
+	}
+}
+
+// setWatch 开/关屏幕监看。hi=true 为单机高清查看：分辨率 1600 宽、
+// 质量 70、~1.4fps，帧带 Hi 标记让服务端单独路由给大图查看器。
+func (a *Agent) setWatch(on, hi bool) {
 	a.watchMu.Lock()
 	if a.watchOff != nil {
 		a.watchOff()
 		a.watchOff = nil
 	}
+	a.watchHi = hi
 	if !on {
 		a.watchMu.Unlock()
 		return
@@ -742,8 +924,12 @@ func (a *Agent) setWatch(on bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	a.watchOff = cancel
 	a.watchMu.Unlock()
+	maxW, quality, interval := 320, 45, 500*time.Millisecond
+	if hi {
+		maxW, quality, interval = 1600, 70, 700*time.Millisecond
+	}
 	go func() {
-		t := time.NewTicker(500 * time.Millisecond)
+		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
 			select {
@@ -755,11 +941,13 @@ func (a *Agent) setWatch(on bool) {
 			if s == nil {
 				continue
 			}
-			jpeg, err := capture.Frame(320, 45)
+			jpeg, err := capture.Frame(maxW, quality)
 			if err != nil {
 				continue
 			}
-			_ = s.send(Msg{Type: MsgScreen, Screen: &ScreenMsg{JPEG: base64.StdEncoding.EncodeToString(jpeg)}})
+			_ = s.send(Msg{Type: MsgScreen, Screen: &ScreenMsg{
+				JPEG: base64.StdEncoding.EncodeToString(jpeg), Hi: hi,
+			}})
 		}
 	}()
 }
@@ -875,6 +1063,7 @@ func (a *Agent) startCast(s *session, args CastStartArgs) error {
 			}
 			_ = s.send(Msg{Type: MsgAlert, Alert: &AlertMsg{
 				Kind: "cast_tcp", Detail: "已加入组播但收不到广播帧",
+				Gen: a.castGen.Load(),
 			}})
 			a.stopCast()
 			return
@@ -1082,6 +1271,230 @@ func (a *Agent) SubmitFile(path string, displayName ...string) error {
 		return nil
 	case <-time.After(transferWait(info.Size())):
 		return fmt.Errorf("等待管理端完成回执超时")
+	}
+}
+
+// powerDelay 普通关机/重启的 agent 侧倒计时（测试可缩短）。
+var powerDelay = 60 * time.Second
+
+// doPowerAction 是 powerAction 的调用接缝，测试可替换以免真的执行关机。
+var doPowerAction = powerAction
+
+// schedulePower 普通模式只上定时器（到期执行不带 /f 的关机）；
+// force 模式直接 5s 强关。重复下发或强制模式会先作废旧排程
+// （gen+1 使旧回调即使已进入也不会再执行）。
+func (a *Agent) schedulePower(op string, force bool) error {
+	a.powerMu.Lock()
+	a.powerGen++
+	gen := a.powerGen
+	if a.powerTimer != nil {
+		a.powerTimer.Stop()
+		a.powerTimer = nil
+	}
+	a.powerMu.Unlock()
+
+	if force {
+		return doPowerAction(op, true)
+	}
+	a.powerMu.Lock()
+	defer a.powerMu.Unlock()
+	if a.powerGen != gen {
+		return nil // 排程窗口内又被取消了
+	}
+	a.powerTimer = time.AfterFunc(powerDelay, func() {
+		a.powerMu.Lock()
+		if a.powerGen != gen || a.powerTimer == nil {
+			// 已被更新排程取代或被取消：本回调作废，且绝不能把
+			// 别人的 powerTimer 置 nil。
+			a.powerMu.Unlock()
+			return
+		}
+		a.powerTimer = nil
+		a.powerGen++ // 进入执行阶段：此后取消返回 false
+		a.powerMu.Unlock()
+		if err := doPowerAction(op, false); err != nil {
+			log.Printf("agent[%s]: 执行远程关机/重启失败: %v", a.ID, err)
+		}
+	})
+	log.Printf("agent[%s]: %s 将在 %s 后执行（可用 power.cancel 取消）", a.ID, op, powerDelay)
+	return nil
+}
+
+// cancelScheduledPower 停掉 agent 侧的普通关机倒计时。
+// 返回 false 表示没有进行中的倒计时——可能从未排程，也可能已进入
+// 执行阶段（回调一旦开始执行 doPowerAction 就无法撤回了）。
+func (a *Agent) cancelScheduledPower() bool {
+	a.powerMu.Lock()
+	defer a.powerMu.Unlock()
+	if a.powerTimer == nil {
+		return false
+	}
+	a.powerTimer.Stop()
+	a.powerTimer = nil
+	a.powerGen++
+	log.Printf("agent[%s]: 关机/重启倒计时已取消", a.ID)
+	return true
+}
+
+func mustJSON(v any) []byte {
+	b, _ := json.Marshal(v)
+	return b
+}
+
+// validOpenURL 只允许 http/https 教学网址（防 file:///javascript: 类注入）。
+func validOpenURL(u string) error {
+	if len(u) > 2048 {
+		return fmt.Errorf("网址过长")
+	}
+	p, err := url.Parse(u)
+	if err != nil || (p.Scheme != "http" && p.Scheme != "https") || p.Host == "" {
+		return fmt.Errorf("只允许 http/https 网址")
+	}
+	return nil
+}
+
+// validLaunchPath 只允许 .exe 绝对路径（exec 直接调起，参数不可注入），
+// 并挡掉 cmd/powershell/mshta 等高危壳程序。
+func validLaunchPath(p string) error {
+	if !filepath.IsAbs(p) || !strings.EqualFold(filepath.Ext(p), ".exe") {
+		return fmt.Errorf("只允许 .exe 绝对路径")
+	}
+	switch strings.ToLower(filepath.Base(p)) {
+	case "cmd.exe", "powershell.exe", "pwsh.exe", "wscript.exe", "cscript.exe",
+		"mshta.exe", "reg.exe", "rundll32.exe", "regsvr32.exe", "bitsadmin.exe",
+		"certutil.exe", "msiexec.exe", "wmic.exe", "shutdown.exe":
+		return fmt.Errorf("该程序不允许远程启动")
+	}
+	if _, err := os.Stat(p); err != nil {
+		return fmt.Errorf("程序不存在: %w", err)
+	}
+	return nil
+}
+
+// AllowedCollectRoots 指定目录收取允许的根目录白名单（管理端与 agent
+// 双侧强制——管理端拦截只是 UX，agent 才是安全边界）。只放学校预设的
+// 作业目录：不开放整个 C:\LabHelper，因为 client.json 的身份 token
+// 也在安装目录里。变量形态便于测试注入临时根目录。
+var AllowedCollectRoots = []string{`C:\Users\Public`, `C:\LabHelper\Homework`}
+
+// collectPathInRoots 原始路径必须在白名单内——不解析符号链接的版本。
+func collectPathInRoots(p string) bool {
+	low := strings.ToLower(filepath.ToSlash(filepath.Clean(p)))
+	for _, root := range AllowedCollectRoots {
+		r := strings.ToLower(filepath.ToSlash(filepath.Clean(root)))
+		if low == r || strings.HasPrefix(low, r+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// collectDirAllowed 目录校验：原始路径和解析后的真实路径【都】必须
+// 在白名单内，防止「白名单目录里的 junction 指出去」逃逸；目录本身
+// 是链接到白名单内的快捷方式时，原始路径也必须在白名单内。
+// EvalSymlinks 失败视为不可证明安全——拒绝。
+func collectDirAllowed(clean string) bool {
+	if !collectPathInRoots(clean) {
+		return false
+	}
+	resolved, err := filepath.EvalSymlinks(clean)
+	if err != nil {
+		return false
+	}
+	return collectPathInRoots(resolved)
+}
+
+// collectFileAllowed 文件级校验：目录合法不代表里面的文件合法——
+// 文件本身可以是符号链接指向白名单外（os.Stat 会跟随，直接读目标）。
+func collectFileAllowed(p string) bool {
+	if !collectPathInRoots(p) {
+		return false
+	}
+	resolved, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		return false
+	}
+	return collectPathInRoots(resolved)
+}
+
+// collectDir 指定目录收取：按 Glob 匹配目录下文件逐个自动上传。
+// 限额：尝试 ≤64 个文件、总量 ≤256MB、单文件 ≤128MB；结果经 "collect"
+// 告警带 Stat 结果码回执（ok/empty/denied/quota/fail）。
+func (a *Agent) collectDir(s *session, args CollectOpenArgs) {
+	report := func(stat, detail string) {
+		a.reportAlert(AlertMsg{Kind: "collect", Detail: detail, Stat: stat})
+	}
+	clean := filepath.Clean(args.Dir)
+	if !filepath.IsAbs(clean) || strings.Contains(args.Dir, "..") || strings.HasPrefix(clean, `\\`) {
+		report("denied", "目录收取失败：路径无效")
+		return
+	}
+	if !collectDirAllowed(clean) {
+		report("denied", fmt.Sprintf("目录收取失败：%s 不在允许范围", clean))
+		return
+	}
+	pattern := args.Glob
+	if pattern == "" {
+		pattern = "*"
+	}
+	if strings.Contains(pattern, "..") || strings.ContainsAny(pattern, `/\\`) {
+		report("denied", "目录收取失败：匹配规则无效")
+		return
+	}
+	matches, err := filepath.Glob(filepath.Join(clean, pattern))
+	if err != nil || len(matches) == 0 {
+		report("empty", fmt.Sprintf("目录 %s 无匹配文件", clean))
+		return
+	}
+	const maxFiles, maxTotal = 64, 256 << 20
+	var total int64
+	attempted, sent, failed, skipped := 0, 0, 0, 0
+	for _, p := range matches {
+		if attempted >= maxFiles || total >= maxTotal {
+			break
+		}
+		if !collectFileAllowed(p) {
+			skipped++ // 符号链接逃出白名单等：不计尝试，静默跳过
+			continue
+		}
+		info, err := os.Stat(p)
+		if err != nil || !info.Mode().IsRegular() || info.Size() > MaxStudentUploadSize {
+			skipped++
+			continue
+		}
+		if total+info.Size() > maxTotal {
+			break
+		}
+		attempted++
+		if err := a.SubmitFile(p); err != nil {
+			failed++
+			log.Printf("agent[%s]: 收取上传 %s 失败: %v", a.ID, p, err)
+			continue
+		}
+		sent++
+		total += info.Size()
+	}
+	limited := attempted >= maxFiles || total >= maxTotal || attempted+skipped < len(matches)
+	suffix := func() string {
+		if limited {
+			return fmt.Sprintf("，已达上限（匹配 %d 个）", len(matches))
+		}
+		return ""
+	}
+	switch {
+	case sent == 0 && failed > 0:
+		report("fail", fmt.Sprintf("目录收取失败：%d 个文件均上传失败%s", failed, suffix()))
+	case sent == 0:
+		report("empty", fmt.Sprintf("目录 %s 没有可收取的文件", clean))
+	case failed > 0:
+		// partial：部分文件上传失败——教师一眼看出不是全部完成。
+		report("partial", fmt.Sprintf("目录收取部分完成：已提交 %d 个文件（%.1f MB，%d 个失败%s）", sent, float64(total)/(1<<20), failed, suffix()))
+	default:
+		stat := "ok"
+		if limited {
+			stat = "quota"
+		}
+		report(stat, fmt.Sprintf("目录收取完成：已提交 %d 个文件（%.1f MB%s）", sent, float64(total)/(1<<20), suffix()))
 	}
 }
 

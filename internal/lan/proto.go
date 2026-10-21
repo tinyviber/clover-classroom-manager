@@ -72,11 +72,14 @@ type HelloMsg struct {
 	Token   string `json:"token"` // enrollment token：首次上线由管理端记住
 }
 
-// StatusMsg 周期上报。
+// StatusMsg 周期上报。Locked 反映学生端实际锁定状态（教师锁或守护锁），
+// FeatureErr 是落地失败的策略键——管理端展示的是 applied 而非 desired。
 type StatusMsg struct {
-	HelperOn bool     `json:"on"`
-	Features []string `json:"features"`
-	Uptime   int64    `json:"uptime"`
+	HelperOn   bool     `json:"on"`
+	Features   []string `json:"features"`
+	Uptime     int64    `json:"uptime"`
+	Locked     bool     `json:"locked,omitempty"`
+	FeatureErr []string `json:"featErr,omitempty"`
 }
 
 // CommandMsg 管理端下发。Op 取值见下方常量。
@@ -87,14 +90,18 @@ type CommandMsg struct {
 }
 
 const (
-	OpSetHelper   = "helper.set"   // args: {"on": true}
-	OpSetFeatures = "features.set" // args: {"keys": [...]}
-	OpLockScreen  = "screen.lock"   // args: {"reason": "..."}——黑屏+锁键鼠
+	OpSetHelper    = "helper.set"   // args: {"on": true}
+	OpSetFeatures  = "features.set" // args: {"keys": [...]}
+	OpLockScreen   = "screen.lock"  // args: {"reason": "..."}——黑屏+锁键鼠
 	OpUnlockScreen = "screen.unlock"
-	OpRestart     = "helper.restart" // 学生机重启（shutdown /r）
-	OpShutdown    = "helper.shutdown" // 学生机关机（shutdown /s）
+	OpRestart      = "helper.restart"  // 学生机重启（shutdown /r）
+	OpShutdown     = "helper.shutdown" // 学生机关机（shutdown /s）
+	OpPowerCancel  = "power.cancel"    // shutdown /a 取消倒计时关机/重启
+	OpNotify       = "notify"          // args: {"text"}——教师文字消息（气泡）
+	OpOpenURL      = "url.open"        // args: {"url"}——仅 http/https
+	OpLaunchApp    = "app.launch"      // args: {"path"}——仅 .exe 绝对路径
 
-	OpScreenWatch  = "screen.watch" // args: {"on": bool}——开/关缩略图流
+	OpScreenWatch  = "screen.watch" // args: {"on": bool, "hi": bool}——缩略图流/单机高清
 	OpCastStart    = "cast.start"   // args: CastStartArgs（含组播会话参数）
 	OpCastStop     = "cast.stop"
 	OpSignInOpen   = "signin.open" // args: {"session": "...", "deadline": unix}
@@ -122,6 +129,27 @@ type LockScreenArgs struct {
 	Reason string `json:"reason"`
 }
 
+// PowerArgs 电源操作。Force=false 为普通关机/重启（60s 倒计时、
+// 应用可拒绝、学生可 shutdown /a 取消）；Force=true 立即强制。
+type PowerArgs struct {
+	Force bool `json:"force,omitempty"`
+}
+
+// NotifyArgs 教师文字消息（学生端气泡）。
+type NotifyArgs struct {
+	Text string `json:"text"`
+}
+
+// OpenURLArgs 一键打开教学网址（仅 http/https）。
+type OpenURLArgs struct {
+	URL string `json:"url"`
+}
+
+// LaunchArgs 远程启动程序（.exe 绝对路径，参数不支持）。
+type LaunchArgs struct {
+	Path string `json:"path"`
+}
+
 // AckMsg 对 Command 的应答。Detail 携带可选补充信息
 // （如 cast.start 应答里的 "tcp"=组播不可用、走 TCP 兜底）。
 type AckMsg struct {
@@ -131,22 +159,30 @@ type AckMsg struct {
 	Detail string `json:"detail,omitempty"`
 }
 
-// AlertMsg 客户端主动上报的脱控事件。
+// AlertMsg 客户端主动上报的脱控事件。Gen 用于 cast_tcp 告警携带本机
+// 当前广播代数——服务端只在代数匹配时才切换 TCP 兜底，避免旧代
+// 告警把新一代广播错标为单播。
 type AlertMsg struct {
-	Kind   string `json:"kind"` // net_down / proc_killed / usb_detected / ...
+	Kind   string `json:"kind"` // net_down / proc_killed / usb_detected / cast_tcp / emergency_unlock / ...
 	Detail string `json:"detail"`
+	Gen    uint32 `json:"gen,omitempty"`
+	// Stat 是结构化结果码：目录收取回执用它区分 ok/empty/denied/
+	// quota/partial/fail，管理端不再从展示文本里猜成败。
+	Stat string `json:"stat,omitempty"`
 }
 
 // ---- v0.0.2：屏幕 / 广播 / 签到 / 文件 ----
 
-// ScreenWatchArgs 开关客户端的缩略图上报。
+// ScreenWatchArgs 开关客户端的缩略图上报；Hi=true 切到单机高清查看模式。
 type ScreenWatchArgs struct {
 	On bool `json:"on"`
+	Hi bool `json:"hi,omitempty"`
 }
 
-// ScreenMsg C→S 缩略图帧（JPEG，base64）。
+// ScreenMsg C→S 屏幕帧（JPEG，base64）。Hi 标记大图查看帧。
 type ScreenMsg struct {
 	JPEG string `json:"j"`
+	Hi   bool   `json:"hi,omitempty"`
 }
 
 // CastStartArgs 广播模式 + 组播会话参数。
@@ -167,9 +203,12 @@ type CastStopArgs struct {
 	Gen uint32 `json:"gen,omitempty"`
 }
 
-// CollectOpenArgs 收取文件请求：学生端弹出提交界面。
+// CollectOpenArgs 收取文件请求。Dir 为空=学生手动选择提交；
+// Dir 非空=按 Glob 自动匹配目录文件直接上传（无需学生操作）。
 type CollectOpenArgs struct {
 	Session string `json:"session"`
+	Dir     string `json:"dir,omitempty"`
+	Glob    string `json:"glob,omitempty"`
 }
 
 // CastMsg S→C 广播帧（JPEG，base64）。

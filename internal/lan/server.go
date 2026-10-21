@@ -25,20 +25,26 @@ import (
 
 // Device 是注册表里的设备条目（含离线）。
 type Device struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Label     string    `json:"label"`
-	IP        string    `json:"ip"`
-	MAC       string    `json:"mac"`
-	Version   string    `json:"version"`
-	Online    bool      `json:"online"`
-	HelperOn  bool      `json:"helperOn"`
-	Features  []string  `json:"features"`
-	Alerts    int       `json:"alerts"`
-	TokenHash string    `json:"tokenHash,omitempty"`
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	Label     string   `json:"label"`
+	IP        string   `json:"ip"`
+	MAC       string   `json:"mac"`
+	Version   string   `json:"version"`
+	Online    bool     `json:"online"`
+	HelperOn  bool     `json:"helperOn"`
+	Features  []string `json:"features"`
+	Alerts    int      `json:"alerts"`
+	TokenHash string   `json:"tokenHash,omitempty"`
 	// Pending=true 表示新注册设备还未被教师批准（enrollment）。
 	// 待批准设备不下发任何课堂指令，也不能成为广播/分发目标。
-	Pending  bool      `json:"pending,omitempty"`
+	Pending bool `json:"pending,omitempty"`
+	// Locked 反映学生端真实锁定状态（教师锁或断线守护锁），由 status 上报。
+	Locked bool `json:"locked,omitempty"`
+	// FeatErrs 是 agent 侧落地失败的策略键（desired→applied 不一致时点名）。
+	FeatErrs []string `json:"featErrs,omitempty"`
+	// CastTCP 广播期间该设备走 TCP 兜底（非组播）。快照字段，广播停止即清。
+	CastTCP  bool      `json:"castTcp,omitempty"`
 	LastSeen time.Time `json:"lastSeen"`
 }
 
@@ -75,6 +81,13 @@ type Server struct {
 	// 都能直接混入课堂。
 	AutoApprove bool
 
+	// boundPort 是实际监听的 TCP 端口（TCPPort=0 时为内核分配值）。
+	boundPort atomic.Int32
+	// disableDiscover 跳过 UDP :47822 发现应答。测试用来隔离这个全局端口：
+	// 上一个 Server 还占着时新的会空等，而「故意把直连指到死端口」也会被
+	// 信标立刻改回真实地址，把断线场景测穿。
+	disableDiscover bool
+
 	mu        sync.Mutex
 	devices   map[string]*Device     // id -> device
 	sessions  map[string]*clientConn // id -> 在线会话
@@ -92,14 +105,18 @@ type Server struct {
 	demo           *demoState             // 唯一学生演示活动
 	helpRequests   map[string]HelpRequest
 	transfers      map[string]*FileProgress // 文件传输记录
+	collectResults []CollectResult          // 目录收取逐设备回执（最新 100 条）
 	inFiles        map[string]*incoming     // 接收中的学生提交
 	inReservations map[string]incomingReservation
 	fileAcks       map[string]chan FileMsg
 	recvDir        string
 	frameWorkers   map[string]*frameWorker
-	screenWatch    map[string]bool // requested thumbnail subscriptions; includes offline targets
-	cast           *serverCast     // 当前教师广播会话（nil=未广播）
-	castSeq        atomic.Uint32   // 广播代数发生器（单调递增，防旧指令复活）
+	screenWatch    map[string]bool        // requested thumbnail subscriptions; includes offline targets
+	hiView         map[string]bool        // 单机高清查看中的设备（帧更大更清，单独路由）
+	hiFrames       map[string]ScreenFrame // devID -> 最新高清帧
+	focusID        string                 // 当前大图查看的设备
+	cast           *serverCast            // 当前教师广播会话（nil=未广播）
+	castSeq        atomic.Uint32          // 广播代数发生器（单调递增，防旧指令复活）
 }
 
 // serverCast 是一次屏幕广播：组播主通道 + TCP 兜底目标集合。
@@ -125,6 +142,8 @@ func NewServer(id Identity, tcpPort int) *Server {
 		helpRequests:   map[string]HelpRequest{},
 		frameWorkers:   map[string]*frameWorker{},
 		screenWatch:    map[string]bool{},
+		hiView:         map[string]bool{},
+		hiFrames:       map[string]ScreenFrame{},
 	}
 }
 
@@ -209,7 +228,10 @@ func (s *Server) Devices() []Device {
 	defer s.mu.Unlock()
 	out := make([]Device, 0, len(s.devices))
 	for _, d := range s.devices {
-		out = append(out, *d)
+		dd := *d
+		// 广播 TCP 兜底标记是运行态快照（cast.tcpOnly），不持久化
+		dd.CastTCP = s.cast != nil && s.cast.tcpOnly[dd.ID]
+		out = append(out, dd)
 	}
 	return out
 }
@@ -230,7 +252,9 @@ func (s *Server) GetDevice(id string) (Device, bool) {
 // 或另一台机器上的管理端退出后本机接管）。
 func (s *Server) Run(ctx context.Context) error {
 	go s.tcpLoop(ctx)
-	go s.discoverLoop(ctx)
+	if !s.disableDiscover {
+		go s.discoverLoop(ctx)
+	}
 	go s.sweeper(ctx)
 	return nil
 }
@@ -240,10 +264,12 @@ func (s *Server) tcpLoop(ctx context.Context) {
 	for ctx.Err() == nil {
 		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", s.TCPPort))
 		if err != nil {
-			time.Sleep(3 * time.Second)
+			sleepCtx(ctx, 3*time.Second)
 			continue
 		}
-		log.Printf("lan: TCP 监听 :%d", s.TCPPort)
+		// TCPPort=0 时记录内核分配的真实端口（测试/信标取这里）。
+		s.boundPort.Store(int32(ln.Addr().(*net.TCPAddr).Port))
+		log.Printf("lan: TCP 监听 :%d", ln.Addr().(*net.TCPAddr).Port)
 		s.acceptLoop(ctx, ln)
 		// acceptLoop 返回说明监听失败或 ctx 结束
 	}
@@ -279,31 +305,57 @@ func (s *Server) acceptLoop(ctx context.Context, ln net.Listener) {
 
 // ---- UDP 发现应答 ----
 
+// effectivePort 返回对外广播的 TCP 端口：TCPPort=0 时用内核分配值。
+func (s *Server) effectivePort() int {
+	if p := s.boundPort.Load(); p != 0 {
+		return int(p)
+	}
+	return s.TCPPort
+}
+
 func (s *Server) discoverLoop(ctx context.Context) {
-	beacon := encodeBeacon(s.TCPPort, s.ID.Pub())
 	buf := make([]byte, 256)
 	for ctx.Err() == nil {
-		// 与 tcpLoop 同理：端口被占就等一会儿再抢
+		// 与 tcpLoop 同理：端口被占就等一会儿再抢。
 		c, err := net.ListenUDP("udp4", &net.UDPAddr{Port: UDPPort})
 		if err != nil {
-			time.Sleep(3 * time.Second)
+			sleepCtx(ctx, 3*time.Second)
 			continue
 		}
 		log.Printf("lan: UDP 发现监听 :%d", UDPPort)
-		for ctx.Err() == nil {
-			c.SetReadDeadline(deadline(2))
-			n, src, err := c.ReadFromUDP(buf)
-			if err != nil {
-				if ctx.Err() != nil {
-					break
-				}
+		s.serveDiscover(ctx, c, buf)
+		_ = c.Close()
+	}
+}
+
+// serveDiscover 应答发现广播，ctx 结束时立刻关掉套接字。
+// 读超时最多 2s，若只靠超时退出，热重启和下一个测试会空等这段时间，
+// 期间旧公钥的信标还会把新 agent 的发现结果带偏。
+func (s *Server) serveDiscover(ctx context.Context, c *net.UDPConn, buf []byte) {
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = c.Close()
+		case <-done:
+		}
+	}()
+	for ctx.Err() == nil {
+		_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, src, err := c.ReadFromUDP(buf)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
-			if string(buf[:min(n, len(DiscoverMagic))]) == DiscoverMagic {
-				c.WriteToUDP(beacon, src)
-			}
+			return
 		}
-		c.Close()
+		if string(buf[:min(n, len(DiscoverMagic))]) == DiscoverMagic {
+			_, _ = c.WriteToUDP(encodeBeacon(s.effectivePort(), s.ID.Pub()), src)
+		}
 	}
 }
 
@@ -385,7 +437,14 @@ func (s *Server) handle(cc *clientConn, m Msg) {
 	if d != nil {
 		d.LastSeen = time.Now()
 	}
+	pending := d == nil || d.Pending
 	s.mu.Unlock()
+
+	// 待审批设备只允许心跳/状态上报；上行数据（屏幕帧、文件、
+	// 求助、告警等）在审批通过前一律丢弃——审批是完整授权边界。
+	if pending && m.Type != MsgStatus {
+		return
+	}
 
 	switch m.Type {
 	case MsgStatus:
@@ -396,6 +455,8 @@ func (s *Server) handle(cc *clientConn, m Msg) {
 		if d := s.devices[cc.devID]; d != nil {
 			d.HelperOn = m.Status.HelperOn
 			d.Features = m.Status.Features
+			d.Locked = m.Status.Locked
+			d.FeatErrs = m.Status.FeatureErr
 		}
 		s.mu.Unlock()
 		s.changed()
@@ -413,6 +474,26 @@ func (s *Server) handle(cc *clientConn, m Msg) {
 		if m.Alert == nil {
 			return
 		}
+		if m.Alert.Kind == "collect" {
+			// 目录收取的逐设备结果进独立的 CollectResult 列表（不伪装成
+			// 文件传输——"无匹配/权限不足/超限"都不是 100% 传输成功）。
+			s.mu.Lock()
+			label := ""
+			if d := s.devices[cc.devID]; d != nil {
+				label = d.Label
+			}
+			s.collectResults = append(s.collectResults, CollectResult{
+				ID:       fmt.Sprintf("%s-%d", cc.devID, time.Now().UnixNano()),
+				DeviceID: cc.devID, Label: label,
+				Stat: m.Alert.Stat, Detail: m.Alert.Detail, At: time.Now(),
+			})
+			if len(s.collectResults) > 100 {
+				s.collectResults = s.collectResults[len(s.collectResults)-100:]
+			}
+			s.mu.Unlock()
+			s.changed()
+			return
+		}
 		if m.Alert.Kind == "cast_tcp" {
 			// 组播帧收不到：把这机改走 TCP 兜底，不计入纪律告警。
 			// 已是 TCP 兜底的目标重复上报直接忽略（告警可被伪造）。
@@ -420,7 +501,7 @@ func (s *Server) handle(cc *clientConn, m Msg) {
 			dup := s.cast != nil && s.cast.tcpOnly[cc.devID]
 			s.mu.Unlock()
 			if !dup {
-				s.MarkCastTCP(cc.devID)
+				s.MarkCastTCP(cc.devID, m.Alert.Gen)
 				log.Printf("lan: %s 组播收不到帧，改走 TCP 兜底", cc.devID)
 			}
 			return
