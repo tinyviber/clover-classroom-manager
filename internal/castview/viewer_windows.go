@@ -543,8 +543,9 @@ func barProc(h win.HWND, umsg uint32, wp, lp uintptr) uintptr {
 	return win.DefWindowProc(h, umsg, wp, lp)
 }
 
-// drawText 走 gdi32 DrawTextW（lxn/win 未导出）。
-var drawTextW = gdi32.NewProc("DrawTextW")
+// drawText 走 user32 DrawTextW（lxn/win 未导出）。它不在 gdi32 里，
+// 从 gdi32 取会在第一次绘制锁定提示时直接 panic。
+var drawTextW = user32.NewProc("DrawTextW")
 
 func drawText(hdc win.HDC, s []uint16, rc *win.RECT, format uint32) {
 	if len(s) == 0 {

@@ -35,6 +35,11 @@ jobs:
       - name: Install frontend dependencies
         run: bun install --frozen-lockfile
 
+      # 组播回环和 UDP 发现会被 Windows 防火墙丢掉。这台 runner 用完即弃。
+      - name: Disable Windows Firewall for LAN tests
+        shell: pwsh
+        run: netsh advfirewall set allprofiles state off
+
       - name: go vet
         run: go vet ./...
         env:

@@ -12,12 +12,12 @@ import (
 )
 
 func makeJunction(link, target string) error {
-	// mklink 是 cmd 内建命令。/J 建目录联接，普通用户对自己的目录就能建，
-	// 不需要开发人员模式（符号链接才要）。整段交给 cmd /c，避免路径含空格时被拆开。
-	script := fmt.Sprintf(`mklink /J "%s" "%s"`, link, target)
-	out, err := exec.Command("cmd.exe", "/c", script).CombinedOutput()
+	// mklink 是 cmd 内建命令。/J 建目录联接，普通用户对自己的目录就能建。
+	// 参数必须分开传：把整段带引号的命令交给 cmd /c 时，cmd 会剥掉首尾引号，
+	// 路径被改坏，报 “filename syntax is incorrect”。
+	out, err := exec.Command("cmd.exe", "/c", "mklink", "/J", link, target).CombinedOutput()
 	if err != nil {
-		return &os.PathError{Op: "mklink", Path: strings.TrimSpace(string(out)), Err: err}
+		return fmt.Errorf("mklink /J: %w (%s)", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
