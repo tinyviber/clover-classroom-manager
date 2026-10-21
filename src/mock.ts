@@ -375,6 +375,7 @@ export const mockLab = {
     };
   },
   async exportClientPackage(_addr: string) { return ""; },
+  async exportClientPackageTo(_dir: string, _addr: string) {},
   async approveDevices(ids: string[]) {
     let n = 0;
     for (const d of state.devices) if (ids.includes(d.id) && d.pending) { d.pending = false; n++; }
