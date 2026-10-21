@@ -562,3 +562,32 @@ func TestDiscoverReleasesPortPromptly(t *testing.T) {
 	cancel()
 	waitFor(t, time.Second, "取消后立即释放 UDP 发现端口", func() bool { return !udpDiscoveryBound() })
 }
+
+// Remove 删除任意已注册设备：在线会话断开、注册表清除；
+// agent 仍在跑会重连，但只能回到 pending 等审批，不会自动恢复资格。
+func TestRemoveDevice(t *testing.T) {
+	srv, stopSrv := startTestServer(t)
+	defer stopSrv()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	startTestAgent(t, ctx, srv, "pc-del", "TEST-DEL") // 已批准在线
+	if n := srv.Remove([]string{"pc-del"}); n != 1 {
+		t.Fatalf("Remove 应删 1 台: %d", n)
+	}
+	if _, ok := srv.GetDevice("pc-del"); ok {
+		t.Fatal("设备删除后仍在注册表")
+	}
+	// agent 还在跑：重连后只能以 pending 回归
+	waitFor(t, 10*time.Second, "agent 重连为 pending", func() bool {
+		d, ok := srv.GetDevice("pc-del")
+		return ok && d.Pending
+	})
+	if _, err := srv.SendCommand("pc-del", OpSetHelper, SetHelperArgs{On: true}); err == nil {
+		t.Fatal("重连后的 pending 设备竟能收到课堂指令")
+	}
+	// 再删一次（pending 也删得掉）+ 不存在的 id 安全跳过
+	if n := srv.Remove([]string{"pc-del", "no-such"}); n != 1 {
+		t.Fatalf("重注册的设备应再计 1: %d", n)
+	}
+}

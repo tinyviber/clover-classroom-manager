@@ -151,7 +151,7 @@ func NewCastSender(p CastSessionParams, ifIP net.IP) (*CastSender, error) {
 }
 
 // multicastOutIP 用 UDP connect 探测内核会给该组播组选的源地址
-//（即默认路由的出口 IP）；失败时退回第一张局域网 IPv4。
+// （即默认路由的出口 IP）；失败时退回第一张局域网 IPv4。
 func multicastOutIP(conn *net.UDPConn, group net.IP) net.IP {
 	probe, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: group, Port: CastUDPPort})
 	if err == nil {

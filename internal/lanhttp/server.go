@@ -2,11 +2,12 @@
 // 而不是 mygo WebView——供 headless 管理端（如 Windows 7 教师机）使用。
 //
 // 端点：
-//   POST /api/call            {"m":"Lab.Devices","a":[...]} → 反射调用 Lab 方法
-//   GET  /api/events?k=TOKEN  SSE：{type:"devices"|"classroom",data:...}
-//   POST /api/upload?name=    浏览器选中的分发文件 → 服务器落盘，返回 {path}
-//   GET  /api/client-package?addr=&k= → 生成安装包 zip 下载
-//   GET  /*                   静态前端（*.html 注入 __LAB_HEADLESS__ token）
+//
+//	POST /api/call            {"m":"Lab.Devices","a":[...]} → 反射调用 Lab 方法
+//	GET  /api/events?k=TOKEN  SSE：{type:"devices"|"classroom",data:...}
+//	POST /api/upload?name=    浏览器选中的分发文件 → 服务器落盘，返回 {path}
+//	GET  /api/client-package?addr=&k= → 生成安装包 zip 下载
+//	GET  /*                   静态前端（*.html 注入 __LAB_HEADLESS__ token）
 //
 // 鉴权：/api/* 走 X-Lab-Token 头，SSE/下载走 ?k=（EventSource/链接不能带头）。
 // token 每次启动随机生成并注入所服务的页面——防的是局域网里裸打 API。
@@ -124,8 +125,8 @@ func (s *Server) OpenPath(dir string) {
 
 // ---- 事件推送（SSE）------------------------------------------------------------
 
-func (s *Server) EmitDevices(devs []labsvc.Device)              { s.push("devices", devs) }
-func (s *Server) EmitClassroom(st labsvc.ClassroomState)         { s.push("classroom", st) }
+func (s *Server) EmitDevices(devs []labsvc.Device)       { s.push("devices", devs) }
+func (s *Server) EmitClassroom(st labsvc.ClassroomState) { s.push("classroom", st) }
 
 func (s *Server) push(eventType string, data any) {
 	payload, err := json.Marshal(map[string]any{"type": eventType, "data": data})

@@ -388,5 +388,11 @@ export const mockLab = {
     if (state.devices.length !== before) emit();
     return before - state.devices.length;
   },
+  async removeDevices(ids: string[]) {
+    const before = state.devices.length;
+    state.devices = state.devices.filter((d) => !ids.includes(d.id));
+    if (state.devices.length !== before) emit();
+    return before - state.devices.length;
+  },
   async clearAlerts(_id: string) {},
 };

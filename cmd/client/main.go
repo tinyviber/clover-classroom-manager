@@ -36,11 +36,20 @@ import (
 func main() {
 	cfgPath := flag.String("config", "", "client.json 路径（默认 exe 同目录）")
 	printID := flag.Bool("id", false, "只打印本机 ID 后退出")
+	castMode := flag.Bool("castview", false, "广播窗子进程模式（agent 内部拉起，勿手动运行）")
 	flag.Parse()
+
+	// 广播窗子进程入口：先于单实例锁与配置读取（无 client.json 也要能跑），
+	// stderr 已由父进程接进 agent.log，panic/log 都留痕。
+	if *castMode {
+		os.Exit(castview.RunHost())
+	}
 
 	// 日志必须在任何 Fatalf 之前建立：windowsgui 下 stderr 无处去，
 	// 配置坏了也要在 agent.log 里留痕。
-	setupLog()
+	logFile := setupLog()
+	captureStderr(logFile)     // runtime panic 不走 log 包，连 stderr 一起接管
+	castview.ErrSink = logFile // viewer 子进程 stderr 进同一个文件
 
 	// 单实例在身份生成之前：两个并发首启不能各写一份 client.json。
 	if !singleInstance() {
@@ -114,6 +123,11 @@ func main() {
 	// 学生端悬浮条「退出广播」：停掉组播接收（TCP 兜底帧进来也因
 	// 窗口隐藏被解码层丢弃，几乎零 CPU）。
 	castview.OnExit = func() { a.StopCast() }
+	// viewer 子进程异常退出 → 上报管理端（子进程存活需求内会自动重拉，
+	// 这里主要给教师留一条可见痕迹）。
+	castview.OnChildDied = func(err error) {
+		a.ReportAlert("castview", "广播窗进程异常退出: "+err.Error())
+	}
 	tray, _ := trayicon.New(trayicon.IconICO, "三叶草课堂助手")
 	if tray != nil {
 		defer tray.Close()
@@ -212,14 +226,15 @@ func saveAgentState(path string, helperOn bool, features []string) error {
 }
 
 // setupLog 把日志写到用户可写的数据目录（安装目录 ACL 是只读的）。
-func setupLog() {
+// 返回打开的日志文件；失败时返回 nil（调用方按无日志继续跑）。
+func setupLog() *os.File {
 	base, err := os.UserCacheDir()
 	if err != nil || base == "" {
-		return
+		return nil
 	}
 	dir := filepath.Join(base, "LabHelper")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return
+		return nil
 	}
 	path := filepath.Join(dir, "agent.log")
 	if st, err := os.Stat(path); err == nil && st.Size() > 256<<10 {
@@ -227,8 +242,9 @@ func setupLog() {
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
-		return
+		return nil
 	}
 	log.SetOutput(f)
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	return f
 }

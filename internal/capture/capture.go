@@ -60,10 +60,10 @@ type Params struct {
 // 每隔一段采样一个像素，逐样本比较差值，变化占比低于阈值视为静止。
 // 对静态桌面/静止 PPT 这类机房常见画面，可以把流量降到接近零。
 type Fingerprinter struct {
-	last    []sample
-	lastW   int
-	lastH   int
-	has     bool
+	last  []sample
+	lastW int
+	lastH int
+	has   bool
 }
 
 type sample struct{ r, g, b uint8 }

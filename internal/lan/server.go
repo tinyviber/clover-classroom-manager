@@ -711,6 +711,39 @@ func (s *Server) Reject(ids []string) int {
 	return n
 }
 
+// Remove 从注册表彻底删除设备（不限待审批）：断开连接并清掉关联的
+// 屏幕墙/帧工作队列/演示等状态。设备上的 agent 还在跑的话会经发现
+// 循环重连，但只会再次注册为 pending 等审批——不会自动恢复课堂资格。
+func (s *Server) Remove(ids []string) int {
+	s.mu.Lock()
+	n := 0
+	for _, id := range ids {
+		if s.devices[id] == nil {
+			continue
+		}
+		delete(s.devices, id)
+		if cc := s.sessions[id]; cc != nil {
+			cc.sess.conn.Close()
+			delete(s.sessions, id)
+		}
+		delete(s.screens, id)
+		if worker := s.frameWorkers[id]; worker != nil {
+			worker.cancel()
+			delete(s.frameWorkers, id)
+		}
+		n++
+	}
+	s.mu.Unlock()
+	if n > 0 {
+		for _, id := range ids {
+			s.cleanupIncomingForDevice(id)
+			s.stopDemoForDevice(id)
+		}
+		s.changed()
+	}
+	return n
+}
+
 func (s *Server) changed() {
 	s.schedulePersist()
 	if s.OnChange != nil {

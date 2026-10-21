@@ -13,7 +13,9 @@ import (
 	"bytes"
 	"image"
 	_ "image/jpeg"
+	"log"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"time"
 	"unsafe"
@@ -48,13 +50,13 @@ var (
 	once      sync.Once
 )
 
-// OnExit 学生端悬浮条「退出广播」回调（隐藏窗口之外的动作由调用方决定，
-// 例如 agent 用来停掉组播接收）。在窗口线程上被调，实现里不许阻塞。
-var OnExit func()
-
-// OnEmergencyUnlock 紧急解锁组合键（Ctrl+Alt+Shift+F12 ×3）触发时回调，
-// 供 agent 上报管理端。不许阻塞。
-var OnEmergencyUnlock func()
+// 回调 panic 兜底：Win32 回调里 panic 逃逸出 Go 栈帧即进程 fatal，
+// 子进程里也要能记日志留现场（stderr 已被父进程接进 agent.log）。
+func guardPanic(where string) {
+	if r := recover(); r != nil {
+		log.Printf("castview: %s panic: %v\n%s", where, r, debug.Stack())
+	}
+}
 
 // locked 任一锁生效（mu 内）。教师锁与守护锁独立释放。
 func locked() bool { return teachLock || guardLock }
@@ -66,23 +68,23 @@ func lockReason() string {
 	return guardWhy
 }
 
-// Locked 供外部（agent 状态上报）查询当前是否处于锁定态。
-func Locked() bool {
+// lockedState 当前锁定态（host 侧状态上报用）。
+func lockedState() bool {
 	mu.Lock()
 	defer mu.Unlock()
 	return locked()
 }
 
 var (
-	gdi32     = windows.NewLazySystemDLL("gdi32.dll")
-	stretchDI = gdi32.NewProc("StretchDIBits")
-	user32    = windows.NewLazySystemDLL("user32.dll")
-	setTextW      = user32.NewProc("SetWindowTextW")
-	setHookW      = user32.NewProc("SetWindowsHookExW")
-	unhookW       = user32.NewProc("UnhookWindowsHookEx")
-	callNextH     = user32.NewProc("CallNextHookEx")
-	findWinW      = user32.NewProc("FindWindowW")
-	getAsyncKeyW  = user32.NewProc("GetAsyncKeyState")
+	gdi32        = windows.NewLazySystemDLL("gdi32.dll")
+	stretchDI    = gdi32.NewProc("StretchDIBits")
+	user32       = windows.NewLazySystemDLL("user32.dll")
+	setTextW     = user32.NewProc("SetWindowTextW")
+	setHookW     = user32.NewProc("SetWindowsHookExW")
+	unhookW      = user32.NewProc("UnhookWindowsHookEx")
+	callNextH    = user32.NewProc("CallNextHookEx")
+	findWinW     = user32.NewProc("FindWindowW")
+	getAsyncKeyW = user32.NewProc("GetAsyncKeyState")
 )
 
 // ---- 全屏输入锁定（仿极域：广播时锁死学生机键鼠）----
@@ -127,6 +129,7 @@ var (
 )
 
 func kbdHookProc(code int32, wp, lp uintptr) uintptr {
+	defer guardPanic("kbdHook")
 	if code < 0 {
 		r, _, _ := callNextH.Call(0, uintptr(code), wp, lp)
 		return r
@@ -179,6 +182,7 @@ func emergencyUnlock() {
 }
 
 func mouseHookProc(code int32, wp, lp uintptr) uintptr {
+	defer guardPanic("mouseHook")
 	if code < 0 {
 		r, _, _ := callNextH.Call(0, uintptr(code), wp, lp)
 		return r
@@ -233,13 +237,19 @@ func restoreTaskbar() {
 	if !taskbarHidden {
 		return
 	}
+	showTaskbar()
+	taskbarHidden = false
+}
+
+// showTaskbar 无条件恢复任务栏/开始菜单显示。父进程在子进程异常退出时
+// 也用它兜底（跨进程操作顶层窗口是合法的）。
+func showTaskbar() {
 	for _, cls := range []string{"Shell_TrayWnd", "Shell_SecondaryTrayWnd"} {
 		p, _ := windows.UTF16PtrFromString(cls)
 		if h, _, _ := findWinW.Call(uintptr(unsafe.Pointer(p)), 0); h != 0 {
 			win.ShowWindow(win.HWND(h), win.SW_SHOW)
 		}
 	}
-	taskbarHidden = false
 }
 
 type atom = win.ATOM
@@ -257,9 +267,9 @@ func enqueue(fn func()) {
 	}
 }
 
-// Show 打开/切换广播窗。mode: "fullscreen" | "window"。
+// showView 打开/切换广播窗。mode: "fullscreen" | "window"。
 // 锁定态下广播照常收流（画面被黑屏盖住，输入仍锁）。
-func Show(m string) {
+func showView(m string) {
 	mu.Lock()
 	mode = m
 	visible = true
@@ -271,9 +281,9 @@ func Show(m string) {
 	enqueue(syncState)
 }
 
-// Frame 喂一帧 JPEG。解码在专门 goroutine 上跑（不占调用方的
+// pushFrame 喂一帧 JPEG。解码在专门 goroutine 上跑（不占调用方的
 // UDP/TCP 读循环），窗口隐藏时直接丢弃省 CPU。
-func Frame(jpeg []byte) {
+func pushFrame(jpeg []byte) {
 	mu.Lock()
 	v := visible && !locked() // 锁定态黑屏盖着广播，不解码省 CPU
 	mu.Unlock()
@@ -296,6 +306,7 @@ func Frame(jpeg []byte) {
 
 // decodeThread 从单槽队列取最新 JPEG 解码成 RGBA 并触发重绘。
 func decodeThread() {
+	defer guardPanic("decodeThread")
 	for jpeg := range frames {
 		src, _, err := image.Decode(bytes.NewReader(jpeg))
 		if err != nil {
@@ -312,8 +323,8 @@ func decodeThread() {
 	}
 }
 
-// Lock 教师黑屏锁定（screen.lock）。
-func Lock(reason string) {
+// setTeachLock 教师黑屏锁定（screen.lock）。
+func setTeachLock(reason string) {
 	mu.Lock()
 	teachLock, teachWhy = true, reason
 	mu.Unlock()
@@ -324,16 +335,16 @@ func Lock(reason string) {
 	enqueue(syncState)
 }
 
-// Unlock 解除教师锁（screen.unlock）。守护锁仍在则保持锁定。
-func Unlock() {
+// clearTeachLock 解除教师锁（screen.unlock）。守护锁仍在则保持锁定。
+func clearTeachLock() {
 	mu.Lock()
 	teachLock, teachWhy = false, ""
 	mu.Unlock()
 	enqueue(syncState)
 }
 
-// GuardLock/GuardUnlock 断线守护锁：独立于教师锁，重连只解守护锁。
-func GuardLock(reason string) {
+// setGuardLock/clearGuardLock 断线守护锁：独立于教师锁，重连只解守护锁。
+func setGuardLock(reason string) {
 	mu.Lock()
 	guardLock, guardWhy = true, reason
 	mu.Unlock()
@@ -344,15 +355,15 @@ func GuardLock(reason string) {
 	enqueue(syncState)
 }
 
-func GuardUnlock() {
+func clearGuardLock() {
 	mu.Lock()
 	guardLock, guardWhy = false, ""
 	mu.Unlock()
 	enqueue(syncState)
 }
 
-// Close 只收广播（学生端「退出广播」也走这里），不影响任何锁定。
-func Close() {
+// closeView 只收广播（学生端「退出广播」也走这里），不影响任何锁定。
+func closeView() {
 	mu.Lock()
 	visible = false
 	mu.Unlock()
@@ -369,10 +380,11 @@ func hideAll() {
 
 // syncState 是唯一的状态汇点（窗口线程上跑）：广播、教师锁、守护锁
 // 三组输入在这里算出四个输出，任何状态变化都统一走它：
-//   wantVisible   = 广播中 || 任一锁定
-//   wantFullscreen = 任一锁定 || 广播模式为 fullscreen
-//   wantInputLock = 任一锁定 || （广播中且 fullscreen）
-//   wantBar       = 广播中 && 无锁定（锁定不给学生工具条）
+//
+//	wantVisible   = 广播中 || 任一锁定
+//	wantFullscreen = 任一锁定 || 广播模式为 fullscreen
+//	wantInputLock = 任一锁定 || （广播中且 fullscreen）
+//	wantBar       = 广播中 && 无锁定（锁定不给学生工具条）
 func syncState() {
 	mu.Lock()
 	l := locked()
@@ -505,6 +517,7 @@ func createBar(x, y int32, owner win.HWND) win.HWND {
 }
 
 func barProc(h win.HWND, umsg uint32, wp, lp uintptr) uintptr {
+	defer guardPanic("barProc")
 	switch umsg {
 	case win.WM_PAINT:
 		var ps win.PAINTSTRUCT
@@ -561,6 +574,7 @@ func drawText(hdc win.HDC, s []uint16, rc *win.RECT, format uint32) {
 // ---- 窗口线程与 WndProc ----
 
 func windowThread() {
+	defer guardPanic("windowThread")
 	runtime.LockOSThread()
 	defer restoreTaskbar() // 线程死了钩子自动拆，但任务栏藏过的要还回去
 	// Create the first window before entering GetMessage. Show may enqueue its
@@ -602,6 +616,7 @@ func createWindow(style uint32, x, y, w, h int32) win.HWND {
 }
 
 func wndProc(h win.HWND, umsg uint32, wp, lp uintptr) uintptr {
+	defer guardPanic("wndProc")
 	switch umsg {
 	case wmFrame:
 		for {

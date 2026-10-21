@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/tinyviber/clover-classroom-manager/internal/castview"
 	"github.com/tinyviber/clover-classroom-manager/internal/lan"
 )
 
@@ -53,6 +54,9 @@ func SpawnDemoAgents(ctx context.Context, srv *lan.Server, n int) {
 	if n <= 0 {
 		return
 	}
+	// 演示 agent 与管理端同进程：广播窗子进程化会拿管理端 exe 去起
+	// -castview，必须禁掉（真实 agent.exe 不受影响）。
+	castview.Disabled.Store(true)
 	offline := map[int]bool{11: true, 15: true, 20: true}
 	helperOff := map[int]bool{4: true, 9: true}
 	for i := 1; i <= n && i <= 24; i++ {

@@ -23,8 +23,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/tinyviber/clover-classroom-manager/internal/lanhttp"
 	"github.com/tinyviber/clover-classroom-manager/internal/labsvc"
+	"github.com/tinyviber/clover-classroom-manager/internal/lanhttp"
 )
 
 // 前端产物由构建脚本拷入本目录（bun run build:web → cp -r dist/. cmd/manager-headless/dist/）。

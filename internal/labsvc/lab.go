@@ -25,15 +25,15 @@ import (
 // Host 是前端壳对 Lab 提供平台副作用的接口：
 // mygo 桌面端弹原生对话框/悬浮条/窗口管理；headless 端改为 SSE 推送 + 浏览器唤起。
 type Host interface {
-	MinimizeMain()          // 广播开始：收起管理端主窗（headless no-op）
-	ShowMain()              // 广播结束：恢复主窗（headless no-op）
-	FocusAdmin()            // 唤起管理端界面（headless：再开一个浏览器页）
-	OpenCastBar()           // 打开广播悬浮条（headless no-op，主页面已有控制）
-	CloseCastBar()          // 关闭广播悬浮条
-	PickFiles() []string    // 选要分发的文件（headless 走浏览器上传，返回 nil）
-	PickExportDir() string  // 选安装包输出目录（headless 走 zip 下载，返回 ""）
-	OpenPath(dir string)    // 系统文件管理器打开目录
-	EmitDevices([]Device)   // 设备列表变更事件 → 全部视图
+	MinimizeMain()                // 广播开始：收起管理端主窗（headless no-op）
+	ShowMain()                    // 广播结束：恢复主窗（headless no-op）
+	FocusAdmin()                  // 唤起管理端界面（headless：再开一个浏览器页）
+	OpenCastBar()                 // 打开广播悬浮条（headless no-op，主页面已有控制）
+	CloseCastBar()                // 关闭广播悬浮条
+	PickFiles() []string          // 选要分发的文件（headless 走浏览器上传，返回 nil）
+	PickExportDir() string        // 选安装包输出目录（headless 走 zip 下载，返回 ""）
+	OpenPath(dir string)          // 系统文件管理器打开目录
+	EmitDevices([]Device)         // 设备列表变更事件 → 全部视图
 	EmitClassroom(ClassroomState) // 课堂快照事件 → 全部视图
 }
 
@@ -497,6 +497,10 @@ func (l *Lab) ApproveDevices(ids []string) int { return l.srv.Approve(ids) }
 
 // RejectDevices 拒绝待注册设备：移出注册表并断开连接。
 func (l *Lab) RejectDevices(ids []string) int { return l.srv.Reject(ids) }
+
+// RemoveDevices 从注册表删除任意设备（在线的先断开）。agent 重连后
+// 只能重新注册为待审批，不会自动恢复课堂资格。
+func (l *Lab) RemoveDevices(ids []string) int { return l.srv.Remove(ids) }
 
 // ClearAlerts resets a device's alert counter.
 func (l *Lab) ClearAlerts(id string) { l.srv.ClearAlerts(id) }

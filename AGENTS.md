@@ -97,10 +97,16 @@ GOTOOLCHAIN=go1.21.13 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=
   - `sockopt_{unix,windows}.go` 平台 socket 选项（Windows 的 SetsockoptInt 签名不同）
 - `internal/capture/` — 屏幕捕获（robotgo）：`Grab`/`Encode`（画质档参数）
   与 `Fingerprinter` 画面指纹（静止桌面跳帧，广播心跳 4s 一保）
-- `internal/castview/` — 学生机原生广播画面：`viewer_windows.go` Win32
-  全屏/窗口渲染 + 顶部悬浮工具条（模式切换/退出），其他平台为 no-op。
-  状态机三分：广播(mode/visible)、教师锁(teachLock)、守护锁(guardLock)
-  互独立，`syncState` 统一算输入锁/窗口形态/工具条；全屏或任一锁定
+- `internal/castview/` — 学生机广播画面，**进程隔离架构**（防 Win32/
+  钩子/逐帧解码崩溃面拖死 agent 本体）：agent 按需拉起
+  `agent.exe -castview` 子进程，stdio 走 `proto.go` 的长度前缀协议
+  （opFrame/opShow/opLock/… 下行，evExit/evUnlock/evLocked 上行）。
+  `client_windows.go` 是父进程侧单例（期望状态回放、异常退出自动
+  重拉、兜底还任务栏、OnChildDied 告警）；`host_windows.go` 是子进程
+  入口（stdin 断开即自毁，不留锁死的孤儿全屏窗）；
+  `viewer_windows.go` 是窗口实现：Win32 全屏/窗口渲染 + 顶部悬浮
+  工具条（模式切换/退出），状态机三分（广播/教师锁/守护锁），
+  `syncState` 统一算输入锁/窗口形态/工具条；全屏或任一锁定
   → 低级钩子吞键鼠（工具条矩形内放行）+ 藏任务栏。
   紧急解锁：Ctrl+Alt+Shift+F12 三秒内连按三次（F12 长按自动重复
   不计数）。解锁同步 disarm agent 侧守护标记——本次断线期不再上锁
@@ -112,9 +118,11 @@ GOTOOLCHAIN=go1.21.13 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=
   演示确认/提交文件）：服务常驻但**不自动开浏览器**，`UI.Open()` 按需唤起
   （托盘菜单或新课堂活动气泡）；loopback + token 双重校验
 - `cmd/client/main.go` — 学生机静默 agent 入口（GUI 子系统，无控制台）：
-  读 client.json → 日志写 `%LOCALAPPDATA%\LabHelper\agent.log` →
-  命名互斥体单实例 → 系统托盘（三叶草）+ 气泡通知 → `studentui` 按需唤起。
-  `-id` 只打印身份后退出，供 install.bat 首启固化。
+  读 client.json → 日志写 `%LOCALAPPDATA%\LabHelper\agent.log`（stderr
+  也经 SetStdHandle 接管进同一文件，panic 留堆栈）→ 命名互斥体单实例
+  → 系统托盘（三叶草）+ 气泡通知 → `studentui` 按需唤起。
+  `-id` 只打印身份后退出，供 install.bat 首启固化；
+  `-castview` 是广播窗子进程模式（agent 内部拉起，跳过单实例锁与配置）。
 - `index.html` + `src/main.tsx` + `src/admin/` — React 管理端 UI：
   课堂宫格（预览+选择+快捷工具条，`ClassroomView.tsx`）、设备列表与客户端分发。
 - `castbar.html` + `src/castbar-entry.tsx` + `src/castbar/` — 管理端广播
