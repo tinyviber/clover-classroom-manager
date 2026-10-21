@@ -1,0 +1,86 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows vet, test, and build
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: go vet
+        run: go vet ./...
+        env:
+          CGO_ENABLED: "0"
+
+      - name: go test
+        run: go test ./...
+        env:
+          CGO_ENABLED: "0"
+
+      # 竞态检测器在 Windows 上要 CGO 和 gcc。UCRT64 的 mingw 能编过 Go 的 race runtime。
+      # path-type: inherit 保留 setup-go / setup-bun 已经放进 PATH 的工具。
+      - name: Set up mingw gcc
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: mingw-w64-ucrt-x86_64-gcc
+          path-type: inherit
+
+      - name: go test -race
+        run: go test -race ./...
+        env:
+          CGO_ENABLED: "1"
+          CC: gcc
+
+      - name: Type-check and build frontend
+        run: bun run build:web
+
+      - name: Build management app
+        run: bunx mygo build -platform windows/amd64 -o build
+        env:
+          CGO_ENABLED: "0"
+
+      - name: Build client agent
+        shell: pwsh
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          New-Item -ItemType Directory -Force -Path build/windows-amd64 | Out-Null
+          go build -trimpath -ldflags="-s -w -H windowsgui" -o build/windows-amd64/agent.exe ./cmd/client
+          if (-not (Test-Path build/windows-amd64/lab-assistant.exe)) {
+            Get-ChildItem -Recurse build | Select-Object FullName
+            throw "mygo did not produce build/windows-amd64/lab-assistant.exe"
+          }
+          if (-not (Test-Path build/windows-amd64/agent.exe)) {
+            throw "missing build/windows-amd64/agent.exe"
+          }
+          Get-Item build/windows-amd64/*.exe | Format-Table Name, Length

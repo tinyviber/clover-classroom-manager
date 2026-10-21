@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -493,22 +494,31 @@ func TestCollectDirConstraints(t *testing.T) {
 	defer func() { AllowedCollectRoots = oldRoots }()
 
 	// 目录链接逃逸：白名单目录里的符号链接指向外面 → 拒绝。
+	// Windows 上创建符号链接需要管理员或开发人员模式。权限不足时跳过
+	// 这一段，目录 junction 逃逸由 TestCollectWindowsJunctionAndSymlink 覆盖。
 	escape := filepath.Join(dir, "escape")
 	if err := os.Symlink(outside, escape); err != nil {
-		t.Fatalf("建符号链接失败: %v", err)
-	}
-	a.collectDir(nil, CollectOpenArgs{Dir: escape, Glob: "*"})
-	if stat, d := alertResult(); stat != "denied" {
-		t.Fatalf("目录符号链接逃逸未被拒: stat=%q %q", stat, d)
-	}
+		if !symlinkPrivilegeDenied(err) {
+			t.Fatalf("建符号链接失败: %v", err)
+		}
+		t.Logf("跳过符号链接逃逸（当前进程不能创建符号链接）: %v", err)
+	} else {
+		a.collectDir(nil, CollectOpenArgs{Dir: escape, Glob: "*"})
+		if stat, d := alertResult(); stat != "denied" {
+			t.Fatalf("目录符号链接逃逸未被拒: stat=%q %q", stat, d)
+		}
 
-	// 文件级逃逸：目录合法但文件是链接 → 跳过不计尝试。
-	secret := filepath.Join(outside, "secret.txt")
-	if err := os.WriteFile(secret, []byte("secret"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(secret, filepath.Join(dir, "linked.txt")); err != nil {
-		t.Fatalf("建文件链接失败: %v", err)
+		// 文件级逃逸：目录合法但文件是链接 → 跳过不计尝试。
+		secret := filepath.Join(outside, "secret.txt")
+		if err := os.WriteFile(secret, []byte("secret"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(secret, filepath.Join(dir, "linked.txt")); err != nil {
+			if !symlinkPrivilegeDenied(err) {
+				t.Fatalf("建文件链接失败: %v", err)
+			}
+			t.Logf("跳过文件符号链接（当前进程不能创建符号链接）: %v", err)
+		}
 	}
 
 	// 越界语法被拒
@@ -529,6 +539,43 @@ func TestCollectDirConstraints(t *testing.T) {
 	} else if !strings.Contains(d, "1 个文件") {
 		t.Fatalf("链接文件竟被计入尝试: %q", d)
 	}
+}
+
+func TestNormalizeCollectPath(t *testing.T) {
+	old := AllowedCollectRoots
+	AllowedCollectRoots = []string{`C:\Users\Public`, `C:\LabHelper\Homework`}
+	t.Cleanup(func() { AllowedCollectRoots = old })
+
+	for _, p := range []string{
+		`C:\Users\Public\Homework`,
+		`c:\users\public\homework`,
+		`\\?\C:\Users\Public\Homework`,
+		`\??\C:\LabHelper\Homework\a.txt`,
+	} {
+		if !collectPathInRoots(p) {
+			t.Fatalf("合法路径被拒: %s", p)
+		}
+	}
+	for _, p := range []string{
+		`C:\Users\PublicX`,
+		`\\?\C:\Users\PublicX`,
+		`\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\Users\Public`,
+		`\\server\share\Users\Public`,
+	} {
+		if collectPathInRoots(p) {
+			t.Fatalf("白名单外路径被接受: %s", p)
+		}
+	}
+}
+
+// symlinkPrivilegeDenied 只在 Windows 上把「没有创建符号链接的权限」当成环境限制。
+// 其他错误（以及非 Windows）仍是测试失败。
+func symlinkPrivilegeDenied(err error) bool {
+	if err == nil || runtime.GOOS != "windows" {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "privilege") || os.IsPermission(err)
 }
 
 // udpDiscoveryBound 探测 UDP 发现端口是否已被占用。探测本身会短暂 bind，

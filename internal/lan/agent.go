@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1377,11 +1378,30 @@ func validLaunchPath(p string) error {
 // 也在安装目录里。变量形态便于测试注入临时根目录。
 var AllowedCollectRoots = []string{`C:\Users\Public`, `C:\LabHelper\Homework`}
 
+// normalizeCollectPath 把 Windows 扩展路径前缀去掉再做大小写/斜杠无关比较。
+// EvalSymlinks / Readlink 有时给出 \\?\C:\... 或 \??\C:\...，不剥掉的话
+// 合法作业目录会被误判为白名单外。比较用 path.Clean（只认 /），这样
+// 管理端在非 Windows 上做同一套预检时，反斜杠也不会被当成普通字符。
+func normalizeCollectPath(p string) string {
+	switch {
+	case strings.HasPrefix(p, `\\?\UNC\`):
+		p = `\\` + p[len(`\\?\UNC\`):]
+	case strings.HasPrefix(p, `\\?\`), strings.HasPrefix(p, `\??\`):
+		p = p[4:]
+	}
+	p = strings.ReplaceAll(p, `\`, `/`)
+	return strings.ToLower(path.Clean(p))
+}
+
+// WithinCollectRoots 判断路径是否等于某个收取白名单根，或位于其下。
+// 不解析符号链接；调用方要另对 EvalSymlinks 的结果再验一次。
+func WithinCollectRoots(p string) bool { return collectPathInRoots(p) }
+
 // collectPathInRoots 原始路径必须在白名单内——不解析符号链接的版本。
 func collectPathInRoots(p string) bool {
-	low := strings.ToLower(filepath.ToSlash(filepath.Clean(p)))
+	low := normalizeCollectPath(p)
 	for _, root := range AllowedCollectRoots {
-		r := strings.ToLower(filepath.ToSlash(filepath.Clean(root)))
+		r := normalizeCollectPath(root)
 		if low == r || strings.HasPrefix(low, r+"/") {
 			return true
 		}

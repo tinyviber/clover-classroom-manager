@@ -1015,14 +1015,7 @@ func validCollectDir(dir string) bool {
 	if dir == "" || strings.Contains(dir, "..") || strings.HasPrefix(dir, `\\`) {
 		return false
 	}
-	low := strings.ToLower(filepath.ToSlash(dir))
-	for _, root := range lan.AllowedCollectRoots {
-		r := strings.ToLower(filepath.ToSlash(filepath.Clean(root)))
-		if low == r || strings.HasPrefix(low, r+"/") {
-			return true
-		}
-	}
-	return false
+	return lan.WithinCollectRoots(dir)
 }
 
 // CollectFiles 发起文件收取。dir 为空=学生手动选择提交（弹互动页）；
