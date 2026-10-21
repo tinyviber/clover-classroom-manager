@@ -1,4 +1,4 @@
-package main
+package labsvc
 
 import (
 	"os"
@@ -15,7 +15,7 @@ func TestWriteClientPackage(t *testing.T) {
 	}
 	srv := lan.NewServer(id, lan.TCPPort)
 	dir := filepath.Join(t.TempDir(), "client-package")
-	if err := writeClientPackage(dir, srv, ""); err != nil {
+	if err := WriteClientPackage(dir, srv, ""); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"client.json", "install.bat", "README.txt"} {

@@ -23,29 +23,44 @@ go test ./...          # 后端测试（lan 协议端到端 + 安装包导出）
 mkdir -p build/windows-amd64
 GOTOOLCHAIN=go1.21.13 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=agent.go.mod -trimpath -ldflags="-s -w -H windowsgui" -o build/windows-amd64/agent.exe ./cmd/client
                        # 交叉编译学生机 agent：go1.21 是最后支持 Win7 的 Go，配 agent.go.mod
-                       # 的降版依赖，产物 PE 最低版本 6.1（Win7+ 通吃；管理端仍需 Win10+）。
+                       # 的降版依赖，产物 PE 最低版本 6.1（Win7+ 通吃）。
                        # -H windowsgui 无控制台窗口；导出安装包会带上它
+bun run build:web && cp -r dist/. cmd/manager-headless/dist/
+GOTOOLCHAIN=go1.21.13 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=agent.go.mod -trimpath -ldflags="-s -w" -o build/windows-amd64/manager-headless.exe ./cmd/manager-headless
+                       # headless 管理端（Win7 教师机）：无窗口进程 + 浏览器 UI，embed 前端产物；
+                       # 与桌面管理端共用 %AppData%\lab-assistant 数据目录（身份/注册表互通）
 ```
 
 `.github/workflows/windows-release.yml` 在 `main`/`master` push 和 PR 时构建校验；推送 `v*` 标签时，
-会发布管理端 EXE、含 agent 的管理端 ZIP、学生端 EXE、客户端安装模板 ZIP 和 SHA256 校验清单。
+发布管理端 EXE（Win10+）、headless 管理端 EXE（Win7+）、含 agent+headless 的管理端 ZIP
+与 SHA256 校验清单——学生端安装包由管理端「分发客户端」自动生成，不单发。
 `build/` 与 `dist/` 均为本地产物目录，不提交到仓库。
 
 ## 结构
 
-- `main.go` — `Lab` 服务（`mygo.Bind` 暴露给前端）：设备列表、功能目录、
+- `internal/labsvc/` — `Lab` 服务核心（与前端壳解耦）：设备列表、功能目录、
   批量启停 `SetHelper`、单机勾选 `SetFeatures`、模板套用 `ApplyTemplate`、
   扫描 `Scan`、课堂快照 `ClassroomState`、屏幕墙 `WatchScreens`、广播
   `CastStart`/`CastStop`/`CastSetQuality`、签到 `SignInStart/Stop`、
   分发 `SendFiles`/`PickFiles`/`OpenRecvDir`、收文件 `CollectFiles`、
   投票 `PollStart/Stop`、求助 `ClearHelp`、学生演示 `DemoStart/Stop`、
-  分发 `AdminInfo`/`ExportClientPackage`、`FocusAdmin`（悬浮条唤起主窗）。
-  广播开始时主窗最小化并弹出 `castbar.html` 悬浮条（Panel 无边框小窗），
-  管理端常驻系统托盘（三叶草图标）。全部经 `lan.Server.SendCommand`
-  下发到在线 agent；注册表变化经 `srv.OnChange` → `DevicesChanged` /
-  `ClassroomChanged` 事件推给所有窗口。
-  `spawnDemoAgents` 可在进程内跑 loopback agent；默认关闭，设置
-  `LAB_DEMO_AGENTS=21` 显式开启 21 个演示客户端。
+  分发 `AdminInfo`/`ExportClientPackage`/`ExportClientPackageTo`、
+  `FocusAdmin`。平台副作用走 `Host` 接口（窗口管理/对话框/悬浮条/事件推送），
+  全部指令经 `lan.Server.SendCommand` 下发。`clientpkg/` 为安装包模板
+  （embed；原 packaging/windows/client-package/）。`NewServer`/`New`/
+  `SpawnDemoAgents` 为两个入口共享的装配逻辑（`LAB_DEMO_AGENTS=21` 开演示）。
+- `main.go` — mygo 桌面入口：`mygoHost`（labsvc.Host 的桌面实现：原生对话框、
+  castbar Panel 悬浮条、窗口最小化/唤起、每窗口事件 Emit）+ 窗口/托盘装配 +
+  `mygo.Bind(lab)`。广播开始时主窗最小化并弹出 `castbar.html` 悬浮条，
+  管理端常驻系统托盘（三叶草图标）。
+- `internal/lanhttp/` — headless 的 `labsvc.Host` + HTTP 桥：`POST /api/call`
+  反射分发 Lab 方法、`GET /api/events` SSE 推 devices/classroom、
+  `/api/upload` 教师文件上传、`/api/client-package` 生成安装包 zip 下载、
+  静态前端（注入 `__LAB_HEADLESS__` token，/api 用 X-Lab-Token 头校验）。
+- `cmd/manager-headless/` — go1.21 构建的无窗口管理端（**Win7 教师机**）：
+  同一 Lab + 同一套前端经浏览器访问，默认 `127.0.0.1:47825`，
+  `-addr`/`−no-browser` 可配。embed `dist/`（构建时从根 dist/ 拷入）。
+  数据目录与桌面管理端一致，身份密钥与注册表共用。
 - `internal/lan/` — 局域网协议层（真实实现，可直接跨机部署）：
   - `crypto.go` X25519 临时 ECDH + 管理端 Ed25519 签名握手 + HKDF-SHA256
     导出双向 AES-256-GCM 会话密钥；帧 = u32 长度前缀 + AEAD，seq 当 nonce 防重放；
@@ -105,7 +120,9 @@ GOTOOLCHAIN=go1.21.13 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=
 - `castbar.html` + `src/castbar-entry.tsx` + `src/castbar/` — 管理端广播
   悬浮条页（仿极域顶栏：模式切换/画质/管理端/退出，`--app-region` 拖动）。
 - `src/components/ui/` — shadcn/ui Base Nova 组件；`src/index.css` — 共用主题与布局令牌。
-- `src/api.ts` — MyGo 绑定与浏览器 mock 的单一 API 边界；`src/store.ts` — Zustand 跨视图状态。
+- `src/api.ts` — 单一 API 边界：mygo 绑定 / headless HTTP（remoteRuntime）/ 浏览器 mock 三选一；
+  `src/remote.ts` — headless 传输层（/api/call、SSE、文件上传、安装包下载 URL）；
+  `src/store.ts` — Zustand 跨视图状态。
 - `src/mock.ts` — 无 MyGo runtime 时（浏览器调试）的假数据。
 - `tools/genicon/` — 三叶草图标生成器（resources/icon.png、tray*.png、
   internal/trayicon/clover.ico）；`resources/` 为应用与托盘图标。
@@ -129,7 +146,8 @@ Windows `%AppData%\lab-assistant`。
 管理端「分发客户端…」→ 显示本机 LAN IP:47823 + 公钥指纹 →
 「导出安装包」生成 `client-package/`：`client.json`（已写管理端地址+公钥）、
 `agent.exe`（若已交叉编译）、`install.bat`、`uninstall.bat`、
-`verify-config.ps1` 与 `README.txt`。管理端导出和 GitHub 发布包共用 `packaging/windows/client-package/` 模板。
+`verify-config.ps1` 与 `README.txt`。模板内嵌于 `internal/labsvc/clientpkg/`；
+headless 管理端导出为 zip 下载（`/api/client-package`），桌面端为选目录导出。
 
 学生机：**解冻状态下** 管理员运行 `install.bat` →
 校验 `client.json` 中的管理端 Ed25519 公钥 → 拷到 `C:\LabHelper` →
@@ -150,4 +168,6 @@ Windows `%AppData%\lab-assistant`。
   学生拿到自己机器的 token 可冒充本机。要挡复制得换 DPAPI/TPM 绑定的凭证。
 - 其余 catalog 功能的 Windows 执行端（USB 存储/网站黑白名单/进程守护等）
   尚未实现，目录里标 `ready: false` 不展示为已生效
-- 可选：管理端加一个 `net/http` 适配器把同一套 UI 挂到局域网浏览器
+- ~~可选：管理端加一个 `net/http` 适配器把同一套 UI 挂到局域网浏览器~~
+  已实现为 `cmd/manager-headless` + `internal/lanhttp`（Win7 兼容）；局域网
+  访问用 `-addr 0.0.0.0:47825`

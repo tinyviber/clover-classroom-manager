@@ -96,10 +96,20 @@ bun run build                      # 打包管理端（可 -platform 跨编译�
 # go1.21 是最后支持 Windows 7 的 Go 版本，配 agent.go.mod 的降版依赖，学生机 Win7+ 可运行
 GOTOOLCHAIN=go1.21.13 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=agent.go.mod -trimpath \
   -ldflags="-s -w -H windowsgui" -o build/windows-amd64/agent.exe ./cmd/client
+
+# headless 管理端（Win7 教师机）：无窗口进程 + 浏览器 UI，embed 前端产物
+bun run build:web && cp -r dist/. cmd/manager-headless/dist/
+GOTOOLCHAIN=go1.21.13 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=agent.go.mod -trimpath \
+  -ldflags="-s -w" -o build/windows-amd64/manager-headless.exe ./cmd/manager-headless
 ```
 
+管理端两种形态：**桌面管理端**（Windows 10+，mygo/WebView2 原生窗口）与
+**headless 管理端**（Windows 7+，控制台进程，启动后自动用默认浏览器打开
+同一套管理界面，默认 `http://127.0.0.1:47825`）。两者共用
+`%AppData%\lab-assistant` 数据目录，身份密钥与设备注册表一致。
+
 1. 教师机运行管理端 → 「分发客户端」导出安装包（自动写入管理端
-   地址 + Ed25519 公钥 pin）。
+   地址 + Ed25519 公钥 pin；headless 模式下导出为 zip 下载）。
 2. 学生机**解冻状态**下管理员运行 `install.bat` → 校验公钥 →
    拷贝到 `C:\LabHelper` → 写登录启动项 + 收紧 ACL → 首启固化身份。
 3. 登录后 agent 静默驻留托盘，管理端上线可见 → 冻结还原软件。
@@ -107,7 +117,7 @@ GOTOOLCHAIN=go1.21.13 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=
    UDP 广播发现，公钥匹配即重连。
 
 GitHub Release 流程见 `.github/workflows/windows-release.yml`
-（push `v*` 标签自动构建管理端 EXE/含 agent 包/校验清单）。
+（push `v*` 标签自动构建管理端 EXE/headless EXE/含 agent 包/校验清单）。
 
 ## 安全要点
 

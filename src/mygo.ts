@@ -230,10 +230,14 @@ export const Lab = {
   /**
    * ExportClientPackage 生成学生机安装包到所选目录，返回实际输出路径。
    * 含 client.json（已写入管理端地址+公钥）、install.bat、README.txt，
-   * 以及 agent.exe（若已用 GOOS=windows go build ./cmd/client 构建过）。
+   * 以及 agent.exe（若存在，见 agentCandidates）。
    */
   exportClientPackage(addr: string): Promise<string> {
     return call("Lab.ExportClientPackage", addr);
+  },
+  /** ExportClientPackageTo 生成安装包到 dir（不弹对话框——headless zip 下载端点用）。 */
+  exportClientPackageTo(dir: string, addr: string): Promise<void> {
+    return call("Lab.ExportClientPackageTo", dir, addr);
   },
   /** FocusAdmin 唤起管理端主窗口（悬浮条的「显示管理端」按钮）。 */
   focusAdmin(): Promise<void> {

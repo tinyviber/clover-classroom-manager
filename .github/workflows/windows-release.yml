@@ -54,6 +54,14 @@ jobs:
           GOTOOLCHAIN=go1.21.13 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=agent.go.mod -trimpath -ldflags="-s -w -H windowsgui" -o build/client-agent/agent.exe ./cmd/client
           python3 -c "import struct; d=open('build/client-agent/agent.exe','rb').read(); o=struct.unpack_from('<I',d,0x3C)[0]; assert struct.unpack_from('<H',d,o+64)[0]<=6, 'agent.exe PE min OS > 6.1, breaks Windows 7'"
 
+      - name: Build headless manager (Windows 7+)
+        run: |
+          mkdir -p build/manager-headless
+          # headless 管理端 embed 前端产物（mygo build 已跑过 build:web 产出 dist/）
+          cp -r dist/. cmd/manager-headless/dist/
+          GOTOOLCHAIN=go1.21.13 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=agent.go.mod -trimpath -ldflags="-s -w" -o build/manager-headless/manager-headless.exe ./cmd/manager-headless
+          python3 -c "import struct; d=open('build/manager-headless/manager-headless.exe','rb').read(); o=struct.unpack_from('<I',d,0x3C)[0]; assert struct.unpack_from('<H',d,o+64)[0]<=6, 'manager-headless.exe PE min OS > 6.1, breaks Windows 7'"
+
       - name: Assemble release assets
         shell: bash
         run: |
@@ -64,7 +72,6 @@ jobs:
           else
             version="snapshot-${GITHUB_SHA::7}"
           fi
-          version_number="${version#v}"
           manager_exe="$(find build/windows-amd64 -maxdepth 1 -type f -iname 'lab-assistant.exe' -print -quit)"
           if [[ -z "$manager_exe" ]]; then
             echo "MyGo did not produce build/windows-amd64/lab-assistant.exe" >&2
@@ -74,32 +81,23 @@ jobs:
 
           release_dir="dist/release"
           manager_dir="dist/manager-package"
-          client_dir="dist/client-package"
           agent_exe="build/client-agent/agent.exe"
-          mkdir -p "$release_dir" "$manager_dir" "$client_dir"
+          headless_exe="build/manager-headless/manager-headless.exe"
+          mkdir -p "$release_dir" "$manager_dir"
 
           manager_name="clover-classroom-manager-${version}-windows-x64.exe"
-          agent_name="clover-classroom-client-agent-${version}-windows-x64.exe"
+          headless_name="clover-classroom-manager-headless-${version}-windows-x64.exe"
           manager_zip="clover-classroom-manager-${version}-windows-x64.zip"
-          client_zip="clover-classroom-client-package-${version}-windows-x64.zip"
 
           cp "$manager_exe" "$release_dir/$manager_name"
-          cp "$agent_exe" "$release_dir/$agent_name"
+          cp "$headless_exe" "$release_dir/$headless_name"
 
           cp "$manager_exe" "$manager_dir/Clover-Classroom-Manager.exe"
+          cp "$headless_exe" "$manager_dir/Clover-Classroom-Manager-Win7.exe"
           cp "$agent_exe" "$manager_dir/agent.exe"
           cp public/clover-mark.svg "$manager_dir/clover-mark.svg"
           cp packaging/windows/manager/README.txt "$manager_dir/README.txt"
           (cd "$manager_dir" && zip -qr "../release/$manager_zip" .)
-
-          cp "$agent_exe" "$client_dir/agent.exe"
-          cp packaging/windows/client-package/client.json "$client_dir/client.json"
-          cp packaging/windows/client-package/install.bat "$client_dir/install.bat"
-          cp packaging/windows/client-package/uninstall.bat "$client_dir/uninstall.bat"
-          cp packaging/windows/client-package/verify-config.ps1 "$client_dir/verify-config.ps1"
-          sed "s|@AGENT_STATUS@|此发行包包含 agent.exe。|g" packaging/windows/client-package/README.txt \
-            | sed "s|@VERSION@|${version_number}|g" > "$client_dir/README.txt"
-          (cd "$client_dir" && zip -qr "../release/$client_zip" .)
 
           (cd "$release_dir" && sha256sum *.exe *.zip > SHA256SUMS.txt)
 
@@ -134,11 +132,11 @@ jobs:
           body: |
             三叶草（Clover）局域网课堂管理的 Windows x64 版本。
 
-            - 管理端 EXE：教师机运行；管理端 ZIP 另外包含学生端 agent，便于直接导出已固定管理端公钥的客户端安装包。
-            - 学生端 agent EXE：客户端程序本体。
-            - 学生端安装包 ZIP：通用模板。首次部署请优先使用管理端“分发客户端”导出的安装包，其中已写入当前管理端地址和公钥。
+            - 管理端 EXE：教师机运行，需 Windows 10+（mygo/WebView2）。
+            - 管理端 headless EXE：无窗口管理端，教师用浏览器打开同一套管理界面，可在 Windows 7 运行。
+            - 管理端 ZIP：内含桌面管理端、Win7 headless 管理端与学生端 agent.exe——客户端安装包由管理端「分发客户端」自动生成（已写入管理端地址和公钥），不单发。
             - `SHA256SUMS.txt`：发布文件校验和。
 
-            管理端与学生端均为 Windows x86_64。首次连接前请使用管理端导出的配置固定公钥；安装说明见 ZIP 内 README。
+            管理端 GUI 需 Windows 10+；headless 管理端与学生端 agent 为 Windows 7+。首次连接前请使用管理端导出的配置固定公钥；安装说明见 ZIP 内 README。
           files: dist/release/*
           fail_on_unmatched_files: true

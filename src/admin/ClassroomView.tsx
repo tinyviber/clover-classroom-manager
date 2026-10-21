@@ -17,7 +17,7 @@ import { Progress } from "@/components/ui/progress";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
-import { api, nativeRuntime } from "@/api";
+import { api, nativeRuntime, remoteRuntime, uploadFiles } from "@/api";
 import type { Device } from "@/mygo";
 import { targetDeviceIds, useLabStore } from "@/store";
 import { bytesLabel, formatClock } from "./shared";
@@ -221,7 +221,7 @@ export function ClassroomView() {
     const hint = force
       ? `确认【强制】${label} ${targets.length} 台学生机？未保存的学生工作将丢失。`
       : `确认${label} ${targets.length} 台学生机？（60 秒倒计时，可取消）`;
-    if (nativeRuntime && !window.confirm(hint)) return;
+    if ((nativeRuntime || remoteRuntime) && !window.confirm(hint)) return;
     try {
       const n = await api.powerAction(targets, base, force);
       toast.success(`已向 ${n} 台设备发出${label}指令`);
@@ -315,7 +315,17 @@ export function ClassroomView() {
   return (
     <div className="space-y-3">
       <input ref={fileInputRef} type="file" multiple className="hidden"
-        onChange={(e) => { const paths = Array.from(e.currentTarget.files ?? []).map((f) => `mock://${f.name}`); e.currentTarget.value = ""; void sendPaths(paths); }} />
+        onChange={async (e) => {
+          const files = Array.from(e.currentTarget.files ?? []);
+          e.currentTarget.value = "";
+          if (!files.length) return;
+          if (remoteRuntime) {
+            try { await sendPaths(await uploadFiles(files)); }
+            catch (error) { toast.error(error instanceof Error ? error.message : "上传文件失败"); }
+            return;
+          }
+          void sendPaths(files.map((f) => `mock://${f.name}`));
+        }} />
 
       {/* 极域式快捷工具条 */}
       <div className="sticky top-0 z-20 -mx-1 flex flex-wrap items-center gap-1.5 rounded-lg border bg-card/95 px-2 py-1.5 backdrop-blur">
