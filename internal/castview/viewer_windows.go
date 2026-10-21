@@ -11,6 +11,7 @@ package castview
 
 import (
 	"bytes"
+	"fmt"
 	"image"
 	_ "image/jpeg"
 	"runtime"
@@ -74,15 +75,15 @@ func Locked() bool {
 }
 
 var (
-	gdi32     = windows.NewLazySystemDLL("gdi32.dll")
-	stretchDI = gdi32.NewProc("StretchDIBits")
-	user32    = windows.NewLazySystemDLL("user32.dll")
-	setTextW      = user32.NewProc("SetWindowTextW")
-	setHookW      = user32.NewProc("SetWindowsHookExW")
-	unhookW       = user32.NewProc("UnhookWindowsHookEx")
-	callNextH     = user32.NewProc("CallNextHookEx")
-	findWinW      = user32.NewProc("FindWindowW")
-	getAsyncKeyW  = user32.NewProc("GetAsyncKeyState")
+	gdi32        = windows.NewLazySystemDLL("gdi32.dll")
+	stretchDI    = gdi32.NewProc("StretchDIBits")
+	user32       = windows.NewLazySystemDLL("user32.dll")
+	setTextW     = user32.NewProc("SetWindowTextW")
+	setHookW     = user32.NewProc("SetWindowsHookExW")
+	unhookW      = user32.NewProc("UnhookWindowsHookEx")
+	callNextH    = user32.NewProc("CallNextHookEx")
+	findWinW     = user32.NewProc("FindWindowW")
+	getAsyncKeyW = user32.NewProc("GetAsyncKeyState")
 )
 
 // ---- 全屏输入锁定（仿极域：广播时锁死学生机键鼠）----
@@ -111,57 +112,28 @@ func init() {
 	mouCb = windows.NewCallback(mouseHookProc)
 }
 
-// 紧急解锁：Ctrl+Alt+Shift+F12 在 3 秒内连按 3 次。锁死状态下管理员
-// 的本机兜底通道（教师端异常关闭/断网时救机器）。仍会被吞掉不传给系统。
-const (
-	vkF12     = 0x7B
-	vkControl = 0x11
-	vkShift   = 0x10
-	vkMenu    = 0x12 // Alt
-)
+var chord emergencyChord
 
-var (
-	panicN    int
-	panicLast time.Time
-	f12Held   bool // 按住 F12 的自动重复不算一次按键
-)
+// callbackPtr 把钩子 lParam 还原成指针。这个地址由系统在回调期间持有，
+// 不是 Go 对象，不能存到回调之外。先取参数地址再按指针读出，避免把
+// uintptr 直接交给 unsafe.Pointer（go vet 会把那种转换判成误用）。
+func callbackPtr(v uintptr) unsafe.Pointer {
+	return *(*unsafe.Pointer)(unsafe.Pointer(&v))
+}
 
 func kbdHookProc(code int32, wp, lp uintptr) uintptr {
 	if code < 0 {
 		r, _, _ := callNextH.Call(0, uintptr(code), wp, lp)
 		return r
 	}
-	vk := *(*uint32)(unsafe.Pointer(lp))
-	if wp == win.WM_KEYUP || wp == win.WM_SYSKEYUP {
-		if vk == vkF12 {
-			f12Held = false
-		}
-		return 1
+	vk := *(*uint32)(callbackPtr(lp))
+	up := wp == win.WM_KEYUP || wp == win.WM_SYSKEYUP
+	down := func(key int32) bool {
+		r, _, _ := getAsyncKeyW.Call(uintptr(key))
+		return r&0x8000 != 0
 	}
-	if wp == win.WM_KEYDOWN || wp == win.WM_SYSKEYDOWN {
-		if vk != vkF12 {
-			return 1
-		}
-		if f12Held {
-			return 1 // 长按自动重复不计
-		}
-		f12Held = true
-		down := func(vk int32) bool {
-			r, _, _ := getAsyncKeyW.Call(uintptr(vk))
-			return r&0x8000 != 0
-		}
-		if down(vkControl) && down(vkShift) && down(vkMenu) {
-			now := time.Now()
-			if now.Sub(panicLast) > 3*time.Second {
-				panicN = 0
-			}
-			panicLast = now
-			panicN++
-			if panicN >= 3 {
-				panicN = 0
-				emergencyUnlock()
-			}
-		}
+	if chord.key(vk, up, down(vkControl), down(vkShift), down(vkMenu), time.Now()) {
+		emergencyUnlock()
 	}
 	return 1 // 吞掉所有按键
 }
@@ -183,7 +155,7 @@ func mouseHookProc(code int32, wp, lp uintptr) uintptr {
 		r, _, _ := callNextH.Call(0, uintptr(code), wp, lp)
 		return r
 	}
-	pt := (*win.POINT)(unsafe.Pointer(lp)) // MSLLHOOKSTRUCT.pt 在前
+	pt := (*win.POINT)(callbackPtr(lp)) // MSLLHOOKSTRUCT.pt 在前
 	mu.Lock()
 	b := bar
 	mu.Unlock()
@@ -200,14 +172,44 @@ func mouseHookProc(code int32, wp, lp uintptr) uintptr {
 
 // lockInput/unlockInput 只在窗口线程上调。
 func lockInput() {
+	_ = installInputHooks()
+	hideTaskbar()
+}
+
+// installInputHooks 装上低级键鼠钩子。失败时返回错误且不留下半套钩子。
+// 不碰任务栏——测试可以只验钩子，不必抢交互桌面的外壳。
+func installInputHooks() error {
 	hMod := uintptr(win.GetModuleHandle(nil))
 	if kbdHookH == 0 {
-		kbdHookH, _, _ = setHookW.Call(whKeyboardLL, kbdCb, hMod, 0)
+		h, _, err := setHookW.Call(whKeyboardLL, kbdCb, hMod, 0)
+		if h == 0 {
+			return fmt.Errorf("WH_KEYBOARD_LL: %v", err)
+		}
+		kbdHookH = h
 	}
 	if mouHookH == 0 {
-		mouHookH, _, _ = setHookW.Call(whMouseLL, mouCb, hMod, 0)
+		h, _, err := setHookW.Call(whMouseLL, mouCb, hMod, 0)
+		if h == 0 {
+			removeInputHooks()
+			return fmt.Errorf("WH_MOUSE_LL: %v", err)
+		}
+		mouHookH = h
 	}
-	// 连任务栏/开始菜单一起藏掉
+	return nil
+}
+
+func removeInputHooks() {
+	if kbdHookH != 0 {
+		unhookW.Call(kbdHookH)
+		kbdHookH = 0
+	}
+	if mouHookH != 0 {
+		unhookW.Call(mouHookH)
+		mouHookH = 0
+	}
+}
+
+func hideTaskbar() {
 	for _, cls := range []string{"Shell_TrayWnd", "Shell_SecondaryTrayWnd"} {
 		p, _ := windows.UTF16PtrFromString(cls)
 		if h, _, _ := findWinW.Call(uintptr(unsafe.Pointer(p)), 0); h != 0 {
@@ -218,14 +220,7 @@ func lockInput() {
 }
 
 func unlockInput() {
-	if kbdHookH != 0 {
-		unhookW.Call(kbdHookH)
-		kbdHookH = 0
-	}
-	if mouHookH != 0 {
-		unhookW.Call(mouHookH)
-		mouHookH = 0
-	}
+	removeInputHooks()
 	restoreTaskbar()
 }
 
@@ -369,19 +364,20 @@ func hideAll() {
 
 // syncState 是唯一的状态汇点（窗口线程上跑）：广播、教师锁、守护锁
 // 三组输入在这里算出四个输出，任何状态变化都统一走它：
-//   wantVisible   = 广播中 || 任一锁定
-//   wantFullscreen = 任一锁定 || 广播模式为 fullscreen
-//   wantInputLock = 任一锁定 || （广播中且 fullscreen）
-//   wantBar       = 广播中 && 无锁定（锁定不给学生工具条）
+//
+//	wantVisible   = 广播中 || 任一锁定
+//	wantFullscreen = 任一锁定 || 广播模式为 fullscreen
+//	wantInputLock = 任一锁定 || （广播中且 fullscreen）
+//	wantBar       = 广播中 && 无锁定（锁定不给学生工具条）
 func syncState() {
 	mu.Lock()
-	l := locked()
-	wantVisible := visible || l
-	wantFullscreen := l || mode == "fullscreen"
-	wantInputLock := l || (visible && mode == "fullscreen")
-	wantBar := visible && !l
+	view := deriveLockView(visible, teachLock, guardLock, mode)
 	h := hwnd
 	mu.Unlock()
+	wantVisible := view.visible
+	wantFullscreen := view.fullscreen
+	wantInputLock := view.inputLock
+	wantBar := view.bar
 
 	sw, sh := win.GetSystemMetrics(win.SM_CXSCREEN), win.GetSystemMetrics(win.SM_CYSCREEN)
 	style := uint32(win.WS_OVERLAPPEDWINDOW)
@@ -547,8 +543,9 @@ func barProc(h win.HWND, umsg uint32, wp, lp uintptr) uintptr {
 	return win.DefWindowProc(h, umsg, wp, lp)
 }
 
-// drawText 走 gdi32 DrawTextW（lxn/win 未导出）。
-var drawTextW = gdi32.NewProc("DrawTextW")
+// drawText 走 user32 DrawTextW（lxn/win 未导出）。它不在 gdi32 里，
+// 从 gdi32 取会在第一次绘制锁定提示时直接 panic。
+var drawTextW = user32.NewProc("DrawTextW")
 
 func drawText(hdc win.HDC, s []uint16, rc *win.RECT, format uint32) {
 	if len(s) == 0 {

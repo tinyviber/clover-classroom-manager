@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -95,7 +96,7 @@ func TestCastMulticastRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Skipf("本机无法建组播发送端: %v", err)
 	}
-	defer sender.Close()
+	defer func() { sender.Close() }()
 	rcv, err := JoinCast(p)
 	if err != nil {
 		t.Skipf("本机无法加入组播组: %v", err)
@@ -112,23 +113,27 @@ func TestCastMulticastRoundTrip(t *testing.T) {
 	for i := range frame {
 		frame[i] = byte(i * 31)
 	}
-	// 默认路由口不通时（VPN/热点网卡禁组播）退回回环口再试。
-	if _, err := sender.Send(frame); err != nil {
-		sender.Close()
-		if sender, err = NewCastSender(p, net.ParseIP("127.0.0.1")); err != nil {
-			t.Skipf("回环组播发送端也建不起来: %v", err)
-		}
-		if _, err := sender.Send(frame); err != nil {
-			t.Skipf("本机没有可用的组播出口: %v", err)
-		}
+	// 默认路由口可能把组播丢进虚拟网卡。换出口再试，包括回环。
+	outs := []net.IP{nil, net.ParseIP("127.0.0.1")}
+	for _, ip := range LocalIPv4s() {
+		outs = append(outs, net.ParseIP(ip))
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if _, err := sender.Send(frame); err != nil {
-			t.Fatalf("组播发送失败: %v", err)
+	var tried []string
+	for i, ifIP := range outs {
+		label := "default"
+		if ifIP != nil {
+			label = ifIP.String()
 		}
-		select {
-		case jpeg := <-got:
+		if i > 0 {
+			sender.Close()
+			var err error
+			sender, err = NewCastSender(p, ifIP)
+			if err != nil {
+				tried = append(tried, label+": "+err.Error())
+				continue
+			}
+		}
+		if jpeg, ok := waitCastFrame(t, sender, frame, got, 1500*time.Millisecond); ok {
 			if len(jpeg) != len(frame) {
 				t.Fatalf("帧长不符: %d != %d", len(jpeg), len(frame))
 			}
@@ -138,9 +143,28 @@ func TestCastMulticastRoundTrip(t *testing.T) {
 				}
 			}
 			return
+		}
+		tried = append(tried, label+": 发送成功但没有回环")
+	}
+	// 发送端能建起来，但本机一张网卡都没有把组播送回来。GitHub 的
+	// Windows 虚拟网卡和防火墙会这样；协议在 Linux CI 上有回环覆盖。
+	t.Skipf("本机没有回环任何组播数据报（%s）", strings.Join(tried, "; "))
+}
+
+func waitCastFrame(t *testing.T, sender *CastSender, frame []byte, got <-chan []byte, d time.Duration) ([]byte, bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for {
+		if _, err := sender.Send(frame); err != nil {
+			t.Logf("组播发送失败: %v", err)
+			return nil, false
+		}
+		select {
+		case jpeg := <-got:
+			return jpeg, true
 		case <-time.After(200 * time.Millisecond):
 			if time.Now().After(deadline) {
-				t.Fatal("组播帧 5s 内未收到")
+				return nil, false
 			}
 		}
 	}
@@ -493,22 +517,31 @@ func TestCollectDirConstraints(t *testing.T) {
 	defer func() { AllowedCollectRoots = oldRoots }()
 
 	// 目录链接逃逸：白名单目录里的符号链接指向外面 → 拒绝。
+	// Windows 上创建符号链接需要管理员或开发人员模式。权限不足时跳过
+	// 这一段，目录 junction 逃逸由 TestCollectWindowsJunctionAndSymlink 覆盖。
 	escape := filepath.Join(dir, "escape")
 	if err := os.Symlink(outside, escape); err != nil {
-		t.Fatalf("建符号链接失败: %v", err)
-	}
-	a.collectDir(nil, CollectOpenArgs{Dir: escape, Glob: "*"})
-	if stat, d := alertResult(); stat != "denied" {
-		t.Fatalf("目录符号链接逃逸未被拒: stat=%q %q", stat, d)
-	}
+		if !symlinkPrivilegeDenied(err) {
+			t.Fatalf("建符号链接失败: %v", err)
+		}
+		t.Logf("跳过符号链接逃逸（当前进程不能创建符号链接）: %v", err)
+	} else {
+		a.collectDir(nil, CollectOpenArgs{Dir: escape, Glob: "*"})
+		if stat, d := alertResult(); stat != "denied" {
+			t.Fatalf("目录符号链接逃逸未被拒: stat=%q %q", stat, d)
+		}
 
-	// 文件级逃逸：目录合法但文件是链接 → 跳过不计尝试。
-	secret := filepath.Join(outside, "secret.txt")
-	if err := os.WriteFile(secret, []byte("secret"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(secret, filepath.Join(dir, "linked.txt")); err != nil {
-		t.Fatalf("建文件链接失败: %v", err)
+		// 文件级逃逸：目录合法但文件是链接 → 跳过不计尝试。
+		secret := filepath.Join(outside, "secret.txt")
+		if err := os.WriteFile(secret, []byte("secret"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(secret, filepath.Join(dir, "linked.txt")); err != nil {
+			if !symlinkPrivilegeDenied(err) {
+				t.Fatalf("建文件链接失败: %v", err)
+			}
+			t.Logf("跳过文件符号链接（当前进程不能创建符号链接）: %v", err)
+		}
 	}
 
 	// 越界语法被拒
@@ -529,6 +562,43 @@ func TestCollectDirConstraints(t *testing.T) {
 	} else if !strings.Contains(d, "1 个文件") {
 		t.Fatalf("链接文件竟被计入尝试: %q", d)
 	}
+}
+
+func TestNormalizeCollectPath(t *testing.T) {
+	old := AllowedCollectRoots
+	AllowedCollectRoots = []string{`C:\Users\Public`, `C:\LabHelper\Homework`}
+	t.Cleanup(func() { AllowedCollectRoots = old })
+
+	for _, p := range []string{
+		`C:\Users\Public\Homework`,
+		`c:\users\public\homework`,
+		`\\?\C:\Users\Public\Homework`,
+		`\??\C:\LabHelper\Homework\a.txt`,
+	} {
+		if !collectPathInRoots(p) {
+			t.Fatalf("合法路径被拒: %s", p)
+		}
+	}
+	for _, p := range []string{
+		`C:\Users\PublicX`,
+		`\\?\C:\Users\PublicX`,
+		`\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\Users\Public`,
+		`\\server\share\Users\Public`,
+	} {
+		if collectPathInRoots(p) {
+			t.Fatalf("白名单外路径被接受: %s", p)
+		}
+	}
+}
+
+// symlinkPrivilegeDenied 只在 Windows 上把「没有创建符号链接的权限」当成环境限制。
+// 其他错误（以及非 Windows）仍是测试失败。
+func symlinkPrivilegeDenied(err error) bool {
+	if err == nil || runtime.GOOS != "windows" {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "privilege") || os.IsPermission(err)
 }
 
 // udpDiscoveryBound 探测 UDP 发现端口是否已被占用。探测本身会短暂 bind，

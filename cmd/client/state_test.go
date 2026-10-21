@@ -38,13 +38,13 @@ func TestAgentStateRoundTrip(t *testing.T) {
 
 func TestAgentStateWriteFailure(t *testing.T) {
 	dir := t.TempDir()
-	// 目录只读 → 保存必须返回错误（调用方据此上报告警）。
-	if err := os.Chmod(dir, 0o555); err != nil {
-		t.Skipf("chmod 不可用: %v", err)
+	target := filepath.Join(dir, "state.json")
+	// 原子写先落 path.tmp。把这个路径占成目录后，WriteFile 在 Windows 和
+	// Unix 上都会失败。对目录 chmod 在 Windows 上不取消写权限，测不到这条路径。
+	if err := os.Mkdir(target+".tmp", 0o755); err != nil {
+		t.Fatal(err)
 	}
-	defer os.Chmod(dir, 0o755)
-	err := saveAgentState(filepath.Join(dir, "state.json"), true, nil)
-	if err == nil {
-		t.Fatal("只读目录下保存竟成功（root 运行?）")
+	if err := saveAgentState(target, true, nil); err == nil {
+		t.Fatal("临时路径被目录占用时保存竟成功")
 	}
 }
