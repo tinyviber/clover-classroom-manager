@@ -1412,12 +1412,12 @@ func collectPathInRoots(p string) bool {
 // collectDirAllowed 目录校验：原始路径和解析后的真实路径【都】必须
 // 在白名单内，防止「白名单目录里的 junction 指出去」逃逸；目录本身
 // 是链接到白名单内的快捷方式时，原始路径也必须在白名单内。
-// EvalSymlinks 失败视为不可证明安全——拒绝。
+// 解析失败视为不可证明安全——拒绝。
 func collectDirAllowed(clean string) bool {
 	if !collectPathInRoots(clean) {
 		return false
 	}
-	resolved, err := filepath.EvalSymlinks(clean)
+	resolved, err := resolveCollectPath(clean)
 	if err != nil {
 		return false
 	}
@@ -1430,7 +1430,7 @@ func collectFileAllowed(p string) bool {
 	if !collectPathInRoots(p) {
 		return false
 	}
-	resolved, err := filepath.EvalSymlinks(p)
+	resolved, err := resolveCollectPath(p)
 	if err != nil {
 		return false
 	}
