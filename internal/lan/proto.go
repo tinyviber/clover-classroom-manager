@@ -167,7 +167,7 @@ type AlertMsg struct {
 	Detail string `json:"detail"`
 	Gen    uint32 `json:"gen,omitempty"`
 	// Stat 是结构化结果码：目录收取回执用它区分 ok/empty/denied/
-	// quota/fail，管理端不再从展示文本里猜成败。
+	// quota/partial/fail，管理端不再从展示文本里猜成败。
 	Stat string `json:"stat,omitempty"`
 }
 

@@ -498,10 +498,34 @@ func TestCollectDirConstraints(t *testing.T) {
 		t.Fatalf("白名单外路径未被拒: stat=%q %q", stat, d)
 	}
 
-	// 注入临时根目录模拟学校预设作业目录
+	// 注入临时根目录模拟学校预设作业目录（TempDir 在 macOS 上经
+	// /var→/private/var 链接，白名单校验用的是解析后的真实路径）。
+	resolvedDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	oldRoots := AllowedCollectRoots
-	AllowedCollectRoots = []string{dir}
+	AllowedCollectRoots = []string{resolvedDir, dir}
 	defer func() { AllowedCollectRoots = oldRoots }()
+
+	// 目录链接逃逸：白名单目录里的符号链接指向外面 → 拒绝。
+	escape := filepath.Join(dir, "escape")
+	if err := os.Symlink(outside, escape); err != nil {
+		t.Fatalf("建符号链接失败: %v", err)
+	}
+	a.collectDir(nil, CollectOpenArgs{Dir: escape, Glob: "*"})
+	if stat, d := alertResult(); stat != "denied" {
+		t.Fatalf("目录符号链接逃逸未被拒: stat=%q %q", stat, d)
+	}
+
+	// 文件级逃逸：目录合法但文件是链接 → 跳过不计尝试。
+	secret := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(secret, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(dir, "linked.txt")); err != nil {
+		t.Fatalf("建文件链接失败: %v", err)
+	}
 
 	// 越界语法被拒
 	a.collectDir(nil, CollectOpenArgs{Dir: "..\\Windows", Glob: "*"})
@@ -513,9 +537,12 @@ func TestCollectDirConstraints(t *testing.T) {
 	if stat, d := alertResult(); stat != "empty" || !strings.Contains(d, "无匹配文件") {
 		t.Fatalf("无匹配未上报: stat=%q %q", stat, d)
 	}
-	// 有匹配但离线：上传全部失败也要如实上报，大文件被跳过
+	// 有匹配但离线：上传全部失败也要如实上报，大文件与链接文件被
+	// 跳过——只剩 a.txt 一个真实文件进入尝试。
 	a.collectDir(nil, CollectOpenArgs{Dir: dir, Glob: "*.txt"})
 	if stat, d := alertResult(); stat != "fail" || !strings.Contains(d, "上传失败") {
 		t.Fatalf("离线上传失败未上报: stat=%q %q", stat, d)
+	} else if !strings.Contains(d, "1 个文件") {
+		t.Fatalf("链接文件竟被计入尝试: %q", d)
 	}
 }

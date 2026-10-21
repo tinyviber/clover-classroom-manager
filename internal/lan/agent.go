@@ -237,14 +237,23 @@ func (a *Agent) reportAlert(alert AlertMsg) {
 	a.pendMu.Unlock()
 }
 
+// flushAlerts 逐条补发离线缓存的告警；发送失败时把【未发出】的放回
+// 队列等下条会话再试——重连即断的抖动不能永久丢紧急解锁告警。
 func (a *Agent) flushAlerts(s *session) {
-	a.pendMu.Lock()
-	alerts := a.pendAlerts
-	a.pendAlerts = nil
-	a.pendMu.Unlock()
-	for _, alert := range alerts {
-		a := alert
-		_ = s.send(Msg{Type: MsgAlert, Alert: &a})
+	for {
+		a.pendMu.Lock()
+		if len(a.pendAlerts) == 0 {
+			a.pendMu.Unlock()
+			return
+		}
+		alert := a.pendAlerts[0]
+		a.pendMu.Unlock()
+		if err := s.send(Msg{Type: MsgAlert, Alert: &alert}); err != nil {
+			return // 连接又挂了：整个队列（含本条）保留下次重发
+		}
+		a.pendMu.Lock()
+		a.pendAlerts = a.pendAlerts[1:]
+		a.pendMu.Unlock()
 	}
 }
 
@@ -533,9 +542,12 @@ func (a *Agent) handleCmd(s *session, c CommandMsg) {
 			ack.OK, ack.Err = false, err.Error()
 		}
 	case OpPowerCancel:
+		// 两个通道都算：agent 侧普通倒计时 + 系统级 force 关机
+		// （shutdown /a）。任一路径真正取消成功就算成功——教师看到的是
+		// 是否还有关机在进行，而不是哪一层取消了它。
 		canceled := a.cancelScheduledPower()
-		_ = powerCancel() // 兜底 shutdown /a：可能残留系统级 force 倒计时
-		if !canceled {
+		sysErr := powerCancel() // /a 没有可取消的关机时返回非零
+		if !canceled && sysErr != nil {
 			ack.OK, ack.Err = false, "没有可取消的关机倒计时（未排程或已开始执行）"
 		}
 	case OpNotify:
@@ -1353,23 +1365,44 @@ func validLaunchPath(p string) error {
 // 也在安装目录里。变量形态便于测试注入临时根目录。
 var AllowedCollectRoots = []string{`C:\Users\Public`, `C:\LabHelper\Homework`}
 
-// collectDirAllowed 校验目录在白名单根之下；先 EvalSymlinks 解掉
-// junction/符号链接再用解析后的真实路径比对，防止目录重定向逃逸。
-func collectDirAllowed(clean string) bool {
-	resolved, err := filepath.EvalSymlinks(clean)
-	if err != nil {
-		resolved = clean
-	}
-	for _, cand := range []string{resolved, clean} {
-		low := strings.ToLower(filepath.ToSlash(cand))
-		for _, root := range AllowedCollectRoots {
-			r := strings.ToLower(filepath.ToSlash(filepath.Clean(root)))
-			if low == r || strings.HasPrefix(low, r+"/") {
-				return true
-			}
+// collectPathInRoots 原始路径必须在白名单内——不解析符号链接的版本。
+func collectPathInRoots(p string) bool {
+	low := strings.ToLower(filepath.ToSlash(filepath.Clean(p)))
+	for _, root := range AllowedCollectRoots {
+		r := strings.ToLower(filepath.ToSlash(filepath.Clean(root)))
+		if low == r || strings.HasPrefix(low, r+"/") {
+			return true
 		}
 	}
 	return false
+}
+
+// collectDirAllowed 目录校验：原始路径和解析后的真实路径【都】必须
+// 在白名单内，防止「白名单目录里的 junction 指出去」逃逸；目录本身
+// 是链接到白名单内的快捷方式时，原始路径也必须在白名单内。
+// EvalSymlinks 失败视为不可证明安全——拒绝。
+func collectDirAllowed(clean string) bool {
+	if !collectPathInRoots(clean) {
+		return false
+	}
+	resolved, err := filepath.EvalSymlinks(clean)
+	if err != nil {
+		return false
+	}
+	return collectPathInRoots(resolved)
+}
+
+// collectFileAllowed 文件级校验：目录合法不代表里面的文件合法——
+// 文件本身可以是符号链接指向白名单外（os.Stat 会跟随，直接读目标）。
+func collectFileAllowed(p string) bool {
+	if !collectPathInRoots(p) {
+		return false
+	}
+	resolved, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		return false
+	}
+	return collectPathInRoots(resolved)
 }
 
 // collectDir 指定目录收取：按 Glob 匹配目录下文件逐个自动上传。
@@ -1408,6 +1441,10 @@ func (a *Agent) collectDir(s *session, args CollectOpenArgs) {
 		if attempted >= maxFiles || total >= maxTotal {
 			break
 		}
+		if !collectFileAllowed(p) {
+			skipped++ // 符号链接逃出白名单等：不计尝试，静默跳过
+			continue
+		}
 		info, err := os.Stat(p)
 		if err != nil || !info.Mode().IsRegular() || info.Size() > MaxStudentUploadSize {
 			skipped++
@@ -1438,7 +1475,8 @@ func (a *Agent) collectDir(s *session, args CollectOpenArgs) {
 	case sent == 0:
 		report("empty", fmt.Sprintf("目录 %s 没有可收取的文件", clean))
 	case failed > 0:
-		report("ok", fmt.Sprintf("目录收取完成：已提交 %d 个文件（%.1f MB，%d 个失败%s）", sent, float64(total)/(1<<20), failed, suffix()))
+		// partial：部分文件上传失败——教师一眼看出不是全部完成。
+		report("partial", fmt.Sprintf("目录收取部分完成：已提交 %d 个文件（%.1f MB，%d 个失败%s）", sent, float64(total)/(1<<20), failed, suffix()))
 	default:
 		stat := "ok"
 		if limited {

@@ -29,8 +29,9 @@ func powerAction(op string, force bool) error {
 
 // powerCancel 取消系统级关机倒计时（shutdown /a）——兜底清理可能残留的
 // force 关机；agent 自己的普通倒计时由 cancelScheduledPower 单独管理。
+// Run 等待完成以拿到退出码：没有可取消的关机时 shutdown /a 返回非零。
 func powerCancel() error {
-	if err := exec.Command("shutdown.exe", "/a").Start(); err != nil {
+	if err := exec.Command("shutdown.exe", "/a").Run(); err != nil {
 		return fmt.Errorf("shutdown /a: %w", err)
 	}
 	return nil

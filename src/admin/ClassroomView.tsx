@@ -696,6 +696,7 @@ function TransfersDialog({ open, onClose }: { open: boolean; onClose: () => void
   const statBadge = (stat: string) => {
     switch (stat) {
       case "ok": return <Badge className="bg-emerald-500/15 text-emerald-600">完成</Badge>;
+      case "partial": return <Badge className="bg-amber-500/15 text-amber-600">部分</Badge>;
       case "quota": return <Badge className="bg-amber-500/15 text-amber-600">部分·超限</Badge>;
       case "empty": return <Badge variant="secondary">无文件</Badge>;
       case "denied": return <Badge variant="destructive">被拒</Badge>;
