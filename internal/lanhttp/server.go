@@ -29,6 +29,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -375,7 +376,9 @@ func (s *Server) serveStatic(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	name := strings.TrimPrefix(filepath.Clean("/"+r.URL.Path), "/")
+	// URL 路径必须用 path（永远正斜杠）；filepath 在 Windows 上会把
+	// /assets/app.js 清成 \assets\app.js 导致全部静态资源 404
+	name := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
 	if name == "" || name == "/" {
 		name = "index.html"
 	}
