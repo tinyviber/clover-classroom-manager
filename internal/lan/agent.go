@@ -320,6 +320,18 @@ func (a *Agent) discoverBroadcast(ctx context.Context, useConfiguredAddr bool) (
 		return "", nil, err
 	}
 	defer pc.Close()
+	// 调用方的超时（断线后的 3s 回退）必须能打断 ReadFromUDP。
+	// 否则一次读超时刚好卡在 ctx 到期前，循环会再挂上一个 3s deadline，
+	// 发现可以拖到 6s，重连和测试都会错过窗口。
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = pc.Close()
+		case <-done:
+		}
+	}()
 	uc := pc.(*net.UDPConn)
 
 	bcast := &net.UDPAddr{IP: net.IPv4bcast, Port: UDPPort}

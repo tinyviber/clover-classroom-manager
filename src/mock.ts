@@ -119,6 +119,15 @@ const state = {
   screenTimer: 0,
 };
 const seatStore = { cols: 8, seats: {} as Record<string, number[]> };
+
+// 与 main.go validCollectDir / agent 白名单一致：浏览器 mock 也要拒掉越界目录，
+// 否则「指定目录收取」的失败提示只在真机上才出现。
+function allowedCollectDir(dir: string): boolean {
+  if (!dir || dir.includes("..") || dir.startsWith("\\\\")) return false;
+  const low = dir.replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
+  const roots = ["c:/users/public", "c:/labhelper/homework"];
+  return roots.some((root) => low === root || low.startsWith(`${root}/`));
+}
 const listeners = new Set<(d: Device[]) => void>();
 const emit = () => listeners.forEach((cb) => cb([...state.devices]));
 const classroomListeners = new Set<(s: ClassroomState) => void>();
@@ -213,7 +222,8 @@ export const mockLab = {
   },
   async castStop() { state.classroom.castMode = ""; state.classroom.castTargetIds = []; emitClassroom(); },
   async castSetQuality(level: string) { state.classroom.castQuality = level; emitClassroom(); },
-  async collectFiles(ids: string[], _dir: string, _glob: string) {
+  async collectFiles(ids: string[], dir: string, _glob: string) {
+    if (dir && !allowedCollectDir(dir)) return -1;
     const targets = state.devices.filter((device) => device.online && ids.includes(device.id));
     return targets.length;
   },

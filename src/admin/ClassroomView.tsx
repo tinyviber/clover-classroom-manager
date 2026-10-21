@@ -179,17 +179,21 @@ export function ClassroomView() {
   };
 
   const collect = async (dir: string, glob: string) => {
-    if (!targets.length) { toast.error("当前没有在线目标设备"); return; }
+    if (!targets.length) { toast.error("当前没有在线目标设备"); return false; }
     try {
       const sent = await api.collectFiles(targets, dir, glob);
       if (sent < 0) {
         toast.error("目录不在允许范围（仅允许 C:\\Users\\Public 与 C:\\LabHelper\\Homework 之下）");
-        return;
+        return false;
       }
       toast.success(sent
         ? dir ? `已向 ${sent} 台设备发起目录收取` : `已向 ${sent} 台设备发出收取请求`
         : "没有设备接受收取请求");
-    } catch (error) { toast.error(error instanceof Error ? error.message : "收取文件失败"); }
+      return true;
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "收取文件失败");
+      return false;
+    }
   };
 
   const screenLock = async (on: boolean) => {
@@ -836,10 +840,10 @@ function LaunchDialog({ open, onClose, targets }: { open: boolean; onClose: () =
   );
 }
 
-function CollectDialog({ open, onClose, onSubmit }: { open: boolean; onClose: () => void; onSubmit: (dir: string, glob: string) => Promise<void> }) {
+function CollectDialog({ open, onClose, onSubmit }: { open: boolean; onClose: () => void; onSubmit: (dir: string, glob: string) => Promise<boolean> }) {
   const [mode, setMode] = useState<"manual" | "dir">("manual");
-  const [dir, setDir] = useState("C:\\Users\\Public\\Desktop\\作业");
-  const [glob, setGlob] = useState("*.*");
+  const [dir, setDir] = useState("C:\\LabHelper\\Homework");
+  const [glob, setGlob] = useState("*");
   return (
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
       <DialogContent>
@@ -852,13 +856,18 @@ function CollectDialog({ open, onClose, onSubmit }: { open: boolean; onClose: ()
           <p className="rounded-md bg-muted/30 px-3 py-2 text-xs text-muted-foreground">学生机收到气泡提醒，在互动页里选择文件提交。</p>
         ) : (
           <div className="space-y-2">
-            <label className="grid gap-1.5 text-xs font-medium">学生机目录<Input value={dir} onChange={(e) => setDir(e.target.value)} placeholder="C:\\Users\\Public\\Desktop\\作业" /></label>
-            <label className="grid gap-1.5 text-xs font-medium">匹配规则<Input value={glob} onChange={(e) => setGlob(e.target.value)} placeholder="*.* 或 *.docx" /></label>
-            <p className="text-xs text-muted-foreground">学生无需操作，匹配文件将自动上传（仅允许 C:\Users\Public 与 C:\LabHelper\Homework 之下的目录；单机尝试 ≤64 个文件、总量 ≤256MB、单文件 ≤128MB）。结果会逐台显示在「文件传输」。</p>
+            <label className="grid gap-1.5 text-xs font-medium">学生机目录<Input value={dir} onChange={(e) => setDir(e.target.value)} placeholder="C:\\LabHelper\\Homework" /></label>
+            <label className="grid gap-1.5 text-xs font-medium">匹配规则<Input value={glob} onChange={(e) => setGlob(e.target.value)} placeholder="* 或 *.docx" /></label>
+            <p className="text-xs text-muted-foreground">学生无需操作，匹配文件将自动上传。星号 * 匹配该目录下的全部文件名（按 Go 通配，不是命令行的 *.*）。仅允许 C:\Users\Public 与 C:\LabHelper\Homework 之下的目录；单机尝试 ≤64 个文件、总量 ≤256MB、单文件 ≤128MB。结果会逐台显示在「文件传输」。</p>
           </div>
         )}
         <DialogFooter>
-          <Button size="sm" onClick={() => { void onSubmit(mode === "dir" ? dir.trim() : "", mode === "dir" ? glob.trim() : ""); onClose(); }}>
+          <Button size="sm" onClick={() => {
+            void (async () => {
+              const ok = await onSubmit(mode === "dir" ? dir.trim() : "", mode === "dir" ? (glob.trim() || "*") : "");
+              if (ok) onClose();
+            })();
+          }}>
             <Download />{mode === "dir" ? "开始收取" : "发出请求"}
           </Button>
         </DialogFooter>

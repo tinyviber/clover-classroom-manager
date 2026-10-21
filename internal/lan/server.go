@@ -83,6 +83,10 @@ type Server struct {
 
 	// boundPort 是实际监听的 TCP 端口（TCPPort=0 时为内核分配值）。
 	boundPort atomic.Int32
+	// disableDiscover 跳过 UDP :47822 发现应答。测试用来隔离这个全局端口：
+	// 上一个 Server 还占着时新的会空等，而「故意把直连指到死端口」也会被
+	// 信标立刻改回真实地址，把断线场景测穿。
+	disableDiscover bool
 
 	mu        sync.Mutex
 	devices   map[string]*Device     // id -> device
@@ -248,7 +252,9 @@ func (s *Server) GetDevice(id string) (Device, bool) {
 // 或另一台机器上的管理端退出后本机接管）。
 func (s *Server) Run(ctx context.Context) error {
 	go s.tcpLoop(ctx)
-	go s.discoverLoop(ctx)
+	if !s.disableDiscover {
+		go s.discoverLoop(ctx)
+	}
 	go s.sweeper(ctx)
 	return nil
 }
@@ -258,7 +264,7 @@ func (s *Server) tcpLoop(ctx context.Context) {
 	for ctx.Err() == nil {
 		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", s.TCPPort))
 		if err != nil {
-			time.Sleep(3 * time.Second)
+			sleepCtx(ctx, 3*time.Second)
 			continue
 		}
 		// TCPPort=0 时记录内核分配的真实端口（测试/信标取这里）。
@@ -310,27 +316,46 @@ func (s *Server) effectivePort() int {
 func (s *Server) discoverLoop(ctx context.Context) {
 	buf := make([]byte, 256)
 	for ctx.Err() == nil {
-		// 与 tcpLoop 同理：端口被占就等一会儿再抢
+		// 与 tcpLoop 同理：端口被占就等一会儿再抢。
 		c, err := net.ListenUDP("udp4", &net.UDPAddr{Port: UDPPort})
 		if err != nil {
-			time.Sleep(3 * time.Second)
+			sleepCtx(ctx, 3*time.Second)
 			continue
 		}
 		log.Printf("lan: UDP 发现监听 :%d", UDPPort)
-		for ctx.Err() == nil {
-			c.SetReadDeadline(deadline(2))
-			n, src, err := c.ReadFromUDP(buf)
-			if err != nil {
-				if ctx.Err() != nil {
-					break
-				}
+		s.serveDiscover(ctx, c, buf)
+		_ = c.Close()
+	}
+}
+
+// serveDiscover 应答发现广播，ctx 结束时立刻关掉套接字。
+// 读超时最多 2s，若只靠超时退出，热重启和下一个测试会空等这段时间，
+// 期间旧公钥的信标还会把新 agent 的发现结果带偏。
+func (s *Server) serveDiscover(ctx context.Context, c *net.UDPConn, buf []byte) {
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = c.Close()
+		case <-done:
+		}
+	}()
+	for ctx.Err() == nil {
+		_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, src, err := c.ReadFromUDP(buf)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
-			if string(buf[:min(n, len(DiscoverMagic))]) == DiscoverMagic {
-				c.WriteToUDP(encodeBeacon(s.effectivePort(), s.ID.Pub()), src)
-			}
+			return
 		}
-		c.Close()
+		if string(buf[:min(n, len(DiscoverMagic))]) == DiscoverMagic {
+			_, _ = c.WriteToUDP(encodeBeacon(s.effectivePort(), s.ID.Pub()), src)
+		}
 	}
 }
 

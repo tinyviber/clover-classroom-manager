@@ -14,23 +14,17 @@ import (
 
 // 端到端：server + agent 走真实 TCP/握手/心跳/指令。
 func TestRoundTrip(t *testing.T) {
-	id, err := GenIdentity()
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := NewServer(id, 47893) // 测试端口，避开默认
+	srv, stopSrv := startTestServer(t)
+	defer stopSrv()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if err := srv.Run(ctx); err != nil {
-		t.Fatal(err)
-	}
 
 	a := NewAgent("pc-01", "TEST-PC01")
 	a.Label = "A-01"
 	a.IP = "127.0.0.1"
 	a.MAC = "00:11:22:33:44:55"
 	a.PinnedPub = srv.ID.Pub()
-	a.DirectAddr = "127.0.0.1:47893"
+	a.DirectAddr = fmt.Sprintf("127.0.0.1:%d", srv.boundPort.Load())
 	go a.Run(ctx)
 
 	// 等上线
@@ -84,7 +78,7 @@ func TestRoundTrip(t *testing.T) {
 	// 篡改签名应失败：用错误公钥握手
 	bad := NewAgent("pc-evil", "EVIL")
 	bad.PinnedPub = mustGenOtherPub(t)
-	bad.DirectAddr = "127.0.0.1:47893"
+	bad.DirectAddr = a.directAddr()
 	// clientHandshake 会因签名不匹配失败 → session 不建立，server 无设备
 	if err := bad.session(ctx, bad.DirectAddr, bad.PinnedPub); err == nil {
 		t.Fatal("伪造公钥的握手竟成功了")
@@ -155,32 +149,20 @@ func TestCastMulticastRoundTrip(t *testing.T) {
 // pending 设备的上行数据（屏幕帧/求助/文件）必须被丢弃——审批是双向边界，
 // 不只是下行指令。
 func TestPendingUpstreamBlocked(t *testing.T) {
-	id, err := GenIdentity()
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := NewServer(id, 47895)
+	srv, stopSrv := startTestServer(t)
+	defer stopSrv()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if err := srv.Run(ctx); err != nil {
-		t.Fatal(err)
-	}
 
 	a := NewAgent("pc-pending", "TEST-PC99")
 	a.PinnedPub = srv.ID.Pub()
-	a.DirectAddr = "127.0.0.1:47895"
+	a.DirectAddr = fmt.Sprintf("127.0.0.1:%d", srv.boundPort.Load())
 	go a.Run(ctx)
 
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if d, ok := srv.GetDevice("pc-pending"); ok && d.Online {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("agent 未上线")
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, "agent 上线", func() bool {
+		d, ok := srv.GetDevice("pc-pending")
+		return ok && d.Online
+	})
 
 	s := a.cur.Load()
 	if s == nil {
@@ -207,7 +189,7 @@ func TestPendingUpstreamBlocked(t *testing.T) {
 	if err := s.send(Msg{Type: MsgScreen, Screen: &ScreenMsg{JPEG: jpeg}}); err != nil {
 		t.Fatal(err)
 	}
-	deadline = time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(3 * time.Second)
 	for len(srv.Screens()) == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("批准后屏幕帧仍未入库")
@@ -245,6 +227,7 @@ func startTestServer(t *testing.T) (*Server, context.CancelFunc) {
 		t.Fatal(err)
 	}
 	srv := NewServer(id, 0)
+	srv.disableDiscover = true // 用例走直连；UDP :47822 全局只有一个，不能互相抢
 	ctx, cancel := context.WithCancel(context.Background())
 	if err := srv.Run(ctx); err != nil {
 		cancel()
@@ -332,7 +315,8 @@ func TestOfflineGuardEmergencyUnlock(t *testing.T) {
 
 	// 重连：告警补发，守护解锁且下轮断线可重新上弦。
 	a.setDirectAddr(goodAddr)
-	waitFor(t, 5*time.Second, "重连后告警送达", func() bool {
+	// 断线后 agent 先做最多 3s 的 UDP 回退，再 sleep 2s 才拨新地址。
+	waitFor(t, 8*time.Second, "重连后告警送达", func() bool {
 		d, _ := srv.GetDevice("pc-g")
 		return d.Alerts > 0
 	})
@@ -545,4 +529,36 @@ func TestCollectDirConstraints(t *testing.T) {
 	} else if !strings.Contains(d, "1 个文件") {
 		t.Fatalf("链接文件竟被计入尝试: %q", d)
 	}
+}
+
+// udpDiscoveryBound 探测 UDP 发现端口是否已被占用。探测本身会短暂 bind，
+// 调用方不要在已经指望自己持有该端口的紧循环里把它当成无副作用的查询。
+func udpDiscoveryBound() bool {
+	c, err := net.ListenUDP("udp4", &net.UDPAddr{Port: UDPPort})
+	if err != nil {
+		return true
+	}
+	_ = c.Close()
+	return false
+}
+
+// 发现套接字必须随 Server 取消立刻释放。旧实现要等最多 2s 的读超时，
+// 热重启和下一个监听方会空等，这段时间旧公钥信标还会污染发现结果。
+func TestDiscoverReleasesPortPromptly(t *testing.T) {
+	if udpDiscoveryBound() {
+		t.Skip("UDP 47822 已被占用")
+	}
+	id, err := GenIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(id, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, "UDP 发现端口被占用", udpDiscoveryBound)
+	cancel()
+	waitFor(t, time.Second, "取消后立即释放 UDP 发现端口", func() bool { return !udpDiscoveryBound() })
 }
