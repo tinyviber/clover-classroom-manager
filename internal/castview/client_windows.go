@@ -44,15 +44,6 @@ var (
 
 func anyDemand() bool { return wantShow || teachOn || guardOn }
 
-func curIn() io.WriteCloser {
-	clMu.Lock()
-	defer clMu.Unlock()
-	if child == nil {
-		return nil
-	}
-	return child.in
-}
-
 // ensure 需要时拉起 viewer 子进程。返回是否可用（Disabled 时恒 false）。
 // 拉起后会把当前期望状态回放给新进程，调用方只管照常发指令。
 // 正在退出（已发 opQuit）的旧进程不算可用——直接另起新进程，
@@ -90,55 +81,63 @@ func ensure() bool {
 		clMu.Unlock()
 		return false
 	}
-	child = &childProc{cmd: c, in: in}
+	ch := &childProc{cmd: c, in: in}
+	child = ch
 	show, m, tOn, t, gOn, g := wantShow, wantMode, teachOn, wantTeach, guardOn, wantGuard
 	clMu.Unlock()
 
-	go readLoop(out)
-	go waitLoop(child)
-	// 回放期望状态（新进程从零开始）
+	go readLoop(ch, out)
+	go waitLoop(ch)
+	// 回放期望状态到这一代子进程。固定写 ch.in 而非 curIn()：
+	// child 若在我们解锁后被更新一代替换，把旧快照写进新进程会回滚状态。
 	if show {
-		sendCtrl(opShow, []byte(m))
+		sendTo(ch, opShow, []byte(m))
 	}
 	if tOn {
-		sendCtrl(opLock, []byte(t))
+		sendTo(ch, opLock, []byte(t))
 	}
 	if gOn {
-		sendCtrl(opGuardLock, []byte(g))
+		sendTo(ch, opGuardLock, []byte(g))
 	}
 	return true
 }
 
-// sendCtrl 发控制消息。无存活子进程时静默丢弃（状态已记在 want*，
-// 下次 ensure 会回放）。
+// sendTo 向指定那一代子进程写消息；写失败只杀该进程（收割与重启决策
+// 仍由它的 waitLoop 负责）。
+func sendTo(ch *childProc, op byte, p []byte) {
+	writeMu.Lock()
+	err := writeMsg(ch.in, op, p)
+	writeMu.Unlock()
+	if err != nil && ch.cmd.Process != nil {
+		_ = ch.cmd.Process.Kill()
+	}
+}
+
+// sendCtrl 发控制消息给当前代。无存活子进程时静默丢弃（状态已记在
+// want*，下次 ensure 会回放）。
 func sendCtrl(op byte, p []byte) {
-	in := curIn()
-	if in == nil {
+	clMu.Lock()
+	ch := child
+	clMu.Unlock()
+	if ch == nil {
 		return
 	}
-	writeMu.Lock()
-	err := writeMsg(in, op, p)
-	writeMu.Unlock()
-	if err != nil {
-		killCur()
-	}
+	sendTo(ch, op, p)
 }
 
-// killCur 管道写失败时杀掉子进程，交给 waitLoop 统一收割。
-func killCur() {
-	clMu.Lock()
-	c := child
-	clMu.Unlock()
-	if c != nil && c.cmd.Process != nil {
-		_ = c.cmd.Process.Kill()
-	}
-}
-
-// readLoop 收子进程事件：学生操作回调与锁定态回传。
-func readLoop(out io.ReadCloser) {
+// readLoop 收子进程事件。代际纪律：只有当前代的子进程事件才允许更新
+// 全局锁定态/触发回调；旧代（已被替换、在退出路径上）的事件一律丢弃，
+// 防止陈旧进程污染新一代状态。
+func readLoop(ch *childProc, out io.ReadCloser) {
 	for {
 		ev, p, err := readMsg(out)
 		if err != nil {
+			return
+		}
+		clMu.Lock()
+		current := child == ch
+		clMu.Unlock()
+		if !current {
 			return
 		}
 		switch ev {
@@ -147,6 +146,13 @@ func readLoop(out io.ReadCloser) {
 				go f()
 			}
 		case evUnlock:
+			// 管理员紧急解锁对整机生效：同步清父侧期望锁状态，否则
+			// 子进程崩溃重拉时会按旧 teachOn 回放 opLock 把学生机再锁上。
+			clMu.Lock()
+			teachOn, wantTeach, guardOn, wantGuard = false, "", false, ""
+			lockedC.Store(false)
+			clMu.Unlock()
+			maybeRelease()
 			if f := OnEmergencyUnlock; f != nil {
 				go f()
 			}
@@ -159,19 +165,22 @@ func readLoop(out io.ReadCloser) {
 }
 
 // waitLoop 收割子进程：异常退出时清锁定缓存、兜底还任务栏、上报告警。
-// 退出后仍有可见需求一律重拉（回放状态）——包括"旧进程退出期间恰好
-// 来了新广播"这种竞态，保证期望状态总能收敛。
+// 只有当前代退出才能清 child/锁定缓存并决定是否重拉——旧代退出时
+// 新代可能已在锁定状态，无条件清 lockedC 会把它暂时覆盖为 false。
 func waitLoop(ch *childProc) {
 	err := ch.cmd.Wait()
 	clMu.Lock()
 	expected := err == nil || ch.quit
-	if child == ch {
+	stillCurrent := child == ch
+	if stillCurrent {
 		child = nil
 	}
 	demand := anyDemand()
 	clMu.Unlock()
 
-	lockedC.Store(false)
+	if stillCurrent {
+		lockedC.Store(false)
+	}
 	if !expected {
 		showTaskbar() // 子进程若藏过任务栏没来得及还，父进程兜底
 		log.Printf("castview: viewer 子进程异常退出: %v", err)
@@ -204,16 +213,13 @@ func maybeRelease() {
 // frameWriter：帧走单槽通道，只发最新（子进程消费慢时直接丢，视频语义）。
 func frameWriter() {
 	for jpeg := range frameCh {
-		in := curIn()
-		if in == nil {
+		clMu.Lock()
+		ch := child
+		clMu.Unlock()
+		if ch == nil {
 			continue
 		}
-		writeMu.Lock()
-		err := writeMsg(in, opFrame, jpeg)
-		writeMu.Unlock()
-		if err != nil {
-			killCur()
-		}
+		sendTo(ch, opFrame, jpeg)
 	}
 }
 

@@ -1162,7 +1162,7 @@ func (s *Server) onFileMsg(devID string, msg *FileMsg) {
 		if transfer := s.transfers[msg.ID]; transfer != nil && transfer.DeviceID == devID && !transfer.In && msg.Seq >= 0 {
 			maxSeq := int((transfer.Size + FileChunk - 1) / FileChunk)
 			if msg.Seq <= maxSeq {
-				transfer.Sent = min(transfer.Size, int64(msg.Seq)*FileChunk)
+				transfer.Sent = imin64(transfer.Size, int64(msg.Seq)*FileChunk)
 			}
 		}
 		s.mu.Unlock()
@@ -1320,7 +1320,7 @@ func (s *Server) rejectIncomingOffer(devID string, msg *FileMsg, cause error) {
 				}
 				s.transfers[progressID] = &FileProgress{
 					ID: progressID, DeviceID: devID, Label: label, Name: safeFilename(msg.Name),
-					Size: max(0, msg.Size), Done: true, In: true, Err: reason, At: time.Now(),
+					Size: imax64(0, msg.Size), Done: true, In: true, Err: reason, At: time.Now(),
 				}
 			}
 		}

@@ -2,7 +2,7 @@
 // 但用 net/http 挂到浏览器而不是 mygo WebView。
 //
 // 存在的理由：管理端 GUI 依赖 mygo（要求 Go 1.27）与 WebView2，二者都只能在
-// Windows 10+ 工作。本二进制用 go1.21 工具链 + agent.go.mod 构建，PE 最低
+// Windows 10+ 工作。本二进制用 go1.20 工具链 + agent.go.mod 构建，PE 最低
 // 版本 6.1——可在 Windows 7 教师机上运行，教师用浏览器打开管理界面。
 //
 // 数据目录与桌面管理端一致（%AppData%\lab-assistant）：admin.key、registry、
@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/tinyviber/clover-classroom-manager/internal/labsvc"
+	"github.com/tinyviber/clover-classroom-manager/internal/lan"
 	"github.com/tinyviber/clover-classroom-manager/internal/lanhttp"
 )
 
@@ -33,7 +34,7 @@ import (
 var distFS embed.FS
 
 func main() {
-	addr := flag.String("addr", "127.0.0.1:47825", "HTTP 监听地址（默认仅回环；如需局域网访问改 0.0.0.0:47825）")
+	addr := flag.String("addr", "127.0.0.1:47825", "HTTP 监听地址（默认仅回环；绑 0.0.0.0 时 LAN 访问需带 ?k 凭据，URL 见启动日志）")
 	noBrowser := flag.Bool("no-browser", false, "启动后不自动打开浏览器")
 	flag.Parse()
 
@@ -86,6 +87,17 @@ func main() {
 		_ = httpServer.Shutdown(shutdownCtx)
 	}()
 	log.Printf("三叶草课堂管理（headless）→ %s", origin)
+	// 绑定到局域网时页面不再自动发 token：LAN 访问须走带凭据的 URL，
+	// 只打印在管理端控制台（本机浏览器仍自动注入）。
+	if host, port, err := net.SplitHostPort(listener.Addr().String()); err == nil {
+		if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+			for _, lip := range lan.LocalIPv4s() {
+				log.Printf("局域网管理地址（含凭据，勿外传）: http://%s/?k=%s", net.JoinHostPort(lip, port), hs.Token())
+			}
+		} else if ip != nil && !ip.IsLoopback() {
+			log.Printf("局域网管理地址（含凭据，勿外传）: %s/?k=%s", origin, hs.Token())
+		}
+	}
 	if !*noBrowser {
 		go func() {
 			time.Sleep(300 * time.Millisecond)

@@ -591,3 +591,56 @@ func TestRemoveDevice(t *testing.T) {
 		t.Fatalf("重注册的设备应再计 1: %d", n)
 	}
 }
+
+// 删除设备必须清干净关联状态：缩略图订阅/高清查看/大图焦点/求助/
+// 广播目标/签到投票回执，否则删除后仍残留订阅或陈旧状态。
+func TestRemoveCleansAssociatedState(t *testing.T) {
+	srv, stopSrv := startTestServer(t)
+	defer stopSrv()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	startTestAgent(t, ctx, srv, "pc-x", "TEST-X")
+
+	srv.mu.Lock()
+	srv.screens["pc-x"] = ScreenFrame{JPEG: []byte{1}}
+	srv.screenWatch["pc-x"] = true
+	srv.hiView["pc-x"] = true
+	srv.hiFrames["pc-x"] = ScreenFrame{JPEG: []byte{2}}
+	srv.focusID = "pc-x"
+	srv.helpRequests["pc-x"] = HelpRequest{DeviceID: "pc-x"}
+	srv.cast = &serverCast{targets: map[string]bool{"pc-x": true, "pc-y": true}, tcpOnly: map[string]bool{"pc-x": true}}
+	srv.sign = &signState{recipients: map[string]bool{"pc-x": true}, replies: map[string]SignReply{"pc-x": {DeviceID: "pc-x"}}}
+	srv.poll = &pollState{recipients: map[string]bool{"pc-x": true}, replies: map[string]PollReply{"pc-x": {DeviceID: "pc-x"}}}
+	srv.mu.Unlock()
+
+	if n := srv.Remove([]string{"pc-x"}); n != 1 {
+		t.Fatalf("Remove 应删 1 台: %d", n)
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	checks := map[string]bool{
+		"screens":        srv.screens["pc-x"].JPEG == nil,
+		"screenWatch":    !srv.screenWatch["pc-x"],
+		"hiView":         !srv.hiView["pc-x"],
+		"hiFrames":       srv.hiFrames["pc-x"].JPEG == nil,
+		"focusID":        srv.focusID == "",
+		"helpRequests":   srv.helpRequests["pc-x"].DeviceID == "",
+		"cast.targets":   !srv.cast.targets["pc-x"],
+		"cast.tcpOnly":   !srv.cast.tcpOnly["pc-x"],
+		"sign.recipient": !srv.sign.recipients["pc-x"],
+		"sign.reply":     srv.sign.replies["pc-x"].DeviceID == "",
+		"poll.recipient": !srv.poll.recipients["pc-x"],
+		"poll.reply":     srv.poll.replies["pc-x"].DeviceID == "",
+	}
+	for name, ok := range checks {
+		if !ok {
+			t.Errorf("删除后 %s 仍残留 pc-x 状态", name)
+		}
+	}
+	// 广播的其他目标不受影响
+	if !srv.cast.targets["pc-y"] {
+		t.Error("删除 pc-x 不应动 pc-y 的广播目标")
+	}
+}

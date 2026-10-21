@@ -137,7 +137,7 @@ export function DevicesView() {
               variant="ghost"
               className="text-destructive"
               onClick={() => {
-                if (!window.confirm(`确定删除所选 ${selectedIds.length} 台设备？在线设备重连后需重新审批。`)) return;
+                if (!window.confirm(`确定删除所选 ${selectedIds.length} 台设备？在线设备会先尝试解锁/停广播再删除，重连后需重新审批。离线设备若处于锁定，删除后需现场紧急解锁（Ctrl+Alt+Shift+F12×3）恢复。`)) return;
                 void runAction(() => api.removeDevices(selectedIds), (count) => `已删除 ${count} 台设备`);
               }}
             ><Trash2 />删除所选</Button>
@@ -278,7 +278,7 @@ function DeviceRows({
               size="sm"
               className="text-destructive"
               onClick={() => {
-                if (!window.confirm(`确定删除设备 ${device.name}？其 agent 重连后需重新审批。`)) return;
+                if (!window.confirm(`确定删除设备 ${device.name}？在线设备会先尝试解锁/停广播再删除，重连后需重新审批。若该机当前锁定且不在线，删除后需现场紧急解锁（Ctrl+Alt+Shift+F12×3）恢复。`)) return;
                 void run(() => api.removeDevices([device.id]), () => `已删除 ${device.name}`);
               }}
             >删除</Button>

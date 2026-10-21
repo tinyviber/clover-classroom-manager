@@ -93,13 +93,13 @@ bun run build                      # 打包管理端（可 -platform 跨编译�
 
 ```sh
 # 交叉编译学生机 agent（GUI 子系统，无控制台窗口）
-# go1.21 是最后支持 Windows 7 的 Go 版本，配 agent.go.mod 的降版依赖，学生机 Win7+ 可运行
-GOTOOLCHAIN=go1.21.13 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=agent.go.mod -trimpath \
+# go1.20 是最后官方支持 Windows 7 的 Go 版本，配 agent.go.mod 的降版依赖，学生机 Win7+ 可运行
+GOTOOLCHAIN=go1.20.14 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=agent.go.mod -trimpath \
   -ldflags="-s -w -H windowsgui" -o build/windows-amd64/agent.exe ./cmd/client
 
 # headless 管理端（Win7 教师机）：无窗口进程 + 浏览器 UI，embed 前端产物
 bun run build:web && cp -r dist/. cmd/manager-headless/dist/
-GOTOOLCHAIN=go1.21.13 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=agent.go.mod -trimpath \
+GOTOOLCHAIN=go1.20.14 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=agent.go.mod -trimpath \
   -ldflags="-s -w" -o build/windows-amd64/manager-headless.exe ./cmd/manager-headless
 ```
 
@@ -126,4 +126,6 @@ GitHub Release 流程见 `.github/workflows/windows-release.yml`
 - 广播组播帧：随机会话密钥经加密通道下发；帧整体 GCM 加密 +
   每数据报 HMAC 认证，伪造分片无法污染重组；TTL=1 不出子网。
 - 学生互动页仅绑定 127.0.0.1 + 随机 token，不接受局域网访问。
+- headless 管理端默认仅回环；绑非回环地址时页面不再自动发 token——
+  LAN 访问须用启动日志里带 `?k` 凭据的 URL，写请求校验 Origin 同源。
 - 客户端目录 ACL 收紧（Users 只读），身份 id/token 首启随机生成。

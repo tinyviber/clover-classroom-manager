@@ -498,9 +498,21 @@ func (l *Lab) ApproveDevices(ids []string) int { return l.srv.Approve(ids) }
 // RejectDevices 拒绝待注册设备：移出注册表并断开连接。
 func (l *Lab) RejectDevices(ids []string) int { return l.srv.Reject(ids) }
 
-// RemoveDevices 从注册表删除任意设备（在线的先断开）。agent 重连后
-// 只能重新注册为待审批，不会自动恢复课堂资格。
-func (l *Lab) RemoveDevices(ids []string) int { return l.srv.Remove(ids) }
+// RemoveDevices 从注册表删除任意设备（在线的先下发解锁/停广播再断开）。
+// agent 重连后只能重新注册为待审批，不会自动恢复课堂资格。
+// 同时清掉座位布局里的陈旧条目。
+func (l *Lab) RemoveDevices(ids []string) int {
+	n := l.srv.Remove(ids)
+	if n > 0 {
+		l.seatMu.Lock()
+		for _, id := range ids {
+			delete(l.seatMap, id)
+		}
+		l.seatMu.Unlock()
+		l.saveSeats()
+	}
+	return n
+}
 
 // ClearAlerts resets a device's alert counter.
 func (l *Lab) ClearAlerts(id string) { l.srv.ClearAlerts(id) }

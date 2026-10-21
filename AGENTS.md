@@ -21,12 +21,12 @@ bun run build          # 打包各平台安装包到 build/（mygo 无 cgo，可
                        # 例：bunx mygo build -platform windows/amd64 → build/windows-amd64/lab-assistant.exe）
 go test ./...          # 后端测试（lan 协议端到端 + 安装包导出）
 mkdir -p build/windows-amd64
-GOTOOLCHAIN=go1.21.13 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=agent.go.mod -trimpath -ldflags="-s -w -H windowsgui" -o build/windows-amd64/agent.exe ./cmd/client
-                       # 交叉编译学生机 agent：go1.21 是最后支持 Win7 的 Go，配 agent.go.mod
+GOTOOLCHAIN=go1.20.14 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=agent.go.mod -trimpath -ldflags="-s -w -H windowsgui" -o build/windows-amd64/agent.exe ./cmd/client
+                       # 交叉编译学生机 agent：go1.20 是最后官方支持 Win7 的 Go，配 agent.go.mod
                        # 的降版依赖，产物 PE 最低版本 6.1（Win7+ 通吃）。
                        # -H windowsgui 无控制台窗口；导出安装包会带上它
 bun run build:web && cp -r dist/. cmd/manager-headless/dist/
-GOTOOLCHAIN=go1.21.13 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=agent.go.mod -trimpath -ldflags="-s -w" -o build/windows-amd64/manager-headless.exe ./cmd/manager-headless
+GOTOOLCHAIN=go1.20.14 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=agent.go.mod -trimpath -ldflags="-s -w" -o build/windows-amd64/manager-headless.exe ./cmd/manager-headless
                        # headless 管理端（Win7 教师机）：无窗口进程 + 浏览器 UI，embed 前端产物；
                        # 与桌面管理端共用 %AppData%\lab-assistant 数据目录（身份/注册表互通）
 ```
@@ -54,12 +54,18 @@ GOTOOLCHAIN=go1.21.13 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -modfile=
   `mygo.Bind(lab)`。广播开始时主窗最小化并弹出 `castbar.html` 悬浮条，
   管理端常驻系统托盘（三叶草图标）。
 - `internal/lanhttp/` — headless 的 `labsvc.Host` + HTTP 桥：`POST /api/call`
-  反射分发 Lab 方法、`GET /api/events` SSE 推 devices/classroom、
-  `/api/upload` 教师文件上传、`/api/client-package` 生成安装包 zip 下载、
-  静态前端（注入 `__LAB_HEADLESS__` token，/api 用 X-Lab-Token 头校验）。
-- `cmd/manager-headless/` — go1.21 构建的无窗口管理端（**Win7 教师机**）：
+  反射分发 Lab 方法（`httpDeny` 名单除外，如 ExportClientPackageTo——
+  它接受服务器侧目录参数，仅桌面端可用）、`GET /api/events` SSE 推
+  devices/classroom、`/api/upload` 教师文件上传、`/api/client-package`
+  生成安装包 zip 下载、静态前端。鉴权模型：token 是管理凭据，
+  只注入回环客户端或自带有效 `?k` 的页面；/api 走 X-Lab-Token 头
+  （SSE/下载用 ?k），写请求校验 Origin 同源；Go 方法末位 error
+  非 nil 映射为 HTTP 500。
+- `cmd/manager-headless/` — go1.20 构建的无窗口管理端（**Win7 教师机**）：
   同一 Lab + 同一套前端经浏览器访问，默认 `127.0.0.1:47825`，
-  `-addr`/`−no-browser` 可配。embed `dist/`（构建时从根 dist/ 拷入）。
+  `-addr`/`−no-browser` 可配。绑非回环地址时控制台打印带 `?k`
+  凭据的 LAN 管理 URL（不自动发 token 给任意页面访问者）。
+  embed `dist/`（构建时从根 dist/ 拷入）。
   数据目录与桌面管理端一致，身份密钥与注册表共用。
 - `internal/lan/` — 局域网协议层（真实实现，可直接跨机部署）：
   - `crypto.go` X25519 临时 ECDH + 管理端 Ed25519 签名握手 + HKDF-SHA256

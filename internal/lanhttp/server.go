@@ -9,8 +9,10 @@
 //	GET  /api/client-package?addr=&k= → 生成安装包 zip 下载
 //	GET  /*                   静态前端（*.html 注入 __LAB_HEADLESS__ token）
 //
-// 鉴权：/api/* 走 X-Lab-Token 头，SSE/下载走 ?k=（EventSource/链接不能带头）。
-// token 每次启动随机生成并注入所服务的页面——防的是局域网里裸打 API。
+// 鉴权：token 每次启动随机生成，本身就是管理凭据——只注入回环客户端
+// 或自带有效 ?k 的页面；/api/* 走 X-Lab-Token 头，SSE/下载走 ?k
+// （EventSource/链接不能带头），写请求校验 Origin 同源。绑定非回环
+// 地址时 LAN 用户必须持带 ?k 的 URL（启动时打印在管理端控制台）。
 package lanhttp
 
 import (
@@ -22,7 +24,9 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -75,13 +79,22 @@ func New(static fs.FS, uploadDir, origin string) (*Server, error) {
 	return s, nil
 }
 
-// Bind 把 Lab 的导出方法集挂到 /api/call 反射分发上。
+// httpDeny 里列出的导出方法只对桌面端（mygo 绑定）开放，不挂到 HTTP RPC：
+// 这类方法接受管理端本机路径参数或只做进程内用途，经网络暴露会扩大攻击面。
+var httpDeny = map[string]bool{
+	"ExportClientPackageTo": true, // 参数是服务器侧任意目录，HTTP 侧走固定下载端点
+}
+
+// Bind 把 Lab 的导出方法集挂到 /api/call 反射分发上（httpDeny 除外）。
 func (s *Server) Bind(lab *labsvc.Lab) {
 	s.lab = lab
 	lv := reflect.ValueOf(lab)
 	lt := lv.Type()
 	for i := 0; i < lt.NumMethod(); i++ {
 		m := lt.Method(i)
+		if httpDeny[m.Name] {
+			continue
+		}
 		s.methods["Lab."+m.Name] = lv.Method(i)
 	}
 }
@@ -240,9 +253,20 @@ func (s *Server) call(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "call failed", http.StatusInternalServerError)
 		return
 	}
+	errType := reflect.TypeOf((*error)(nil)).Elem()
 	var result any
-	if len(out) > 0 {
-		result = out[0].Interface()
+	for i, v := range out {
+		// 最后一个 error 返回值非 nil 视为调用失败——此前会把 error 序列化成 {} 吞掉
+		if i == len(out)-1 && v.Type().Implements(errType) {
+			if !v.IsNil() {
+				http.Error(w, v.Interface().(error).Error(), http.StatusInternalServerError)
+				return
+			}
+			continue
+		}
+		if result == nil {
+			result = v.Interface()
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(result)
@@ -320,12 +344,30 @@ func (s *Server) clientPackage(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) withAuth(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// 跨站防护：带 Origin 的写请求必须同源（?k 凭据在 URL 里时防 CSRF）
+		if o := r.Header.Get("Origin"); o != "" {
+			if u, err := url.Parse(o); err != nil || u.Host != r.Host {
+				http.Error(w, "cross-origin", http.StatusForbidden)
+				return
+			}
+		}
 		if r.Header.Get("X-Lab-Token") != s.token && r.URL.Query().Get("k") != s.token {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		h(w, r)
 	}
+}
+
+// clientOK 判断该请求是否有资格拿到注入 token 的页面：
+// 回环客户端（本机浏览器）直接信任；局域网请求必须自带有效 ?k 凭据——
+// token 就是管理凭据，不能发给任何能打开页面的人。
+func (s *Server) clientOK(r *http.Request) bool {
+	if r.URL.Query().Get("k") == s.token {
+		return true
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	return err == nil && net.ParseIP(host).IsLoopback()
 }
 
 func (s *Server) serveStatic(w http.ResponseWriter, r *http.Request) {
@@ -350,6 +392,10 @@ func (s *Server) serveStatic(w http.ResponseWriter, r *http.Request) {
 		name = "index.html"
 	}
 	if strings.HasSuffix(name, ".html") {
+		if !s.clientOK(r) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 		inject := fmt.Sprintf(`<script>window.__LAB_HEADLESS__={token:%q};</script>`, s.token)
 		data = injectHead(data, inject)
 	}
