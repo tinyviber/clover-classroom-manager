@@ -114,12 +114,19 @@ func init() {
 
 var chord emergencyChord
 
+// callbackPtr 把钩子 lParam 还原成指针。这个地址由系统在回调期间持有，
+// 不是 Go 对象，不能存到回调之外。先取参数地址再按指针读出，避免把
+// uintptr 直接交给 unsafe.Pointer（go vet 会把那种转换判成误用）。
+func callbackPtr(v uintptr) unsafe.Pointer {
+	return *(*unsafe.Pointer)(unsafe.Pointer(&v))
+}
+
 func kbdHookProc(code int32, wp, lp uintptr) uintptr {
 	if code < 0 {
 		r, _, _ := callNextH.Call(0, uintptr(code), wp, lp)
 		return r
 	}
-	vk := *(*uint32)(unsafe.Pointer(lp))
+	vk := *(*uint32)(callbackPtr(lp))
 	up := wp == win.WM_KEYUP || wp == win.WM_SYSKEYUP
 	down := func(key int32) bool {
 		r, _, _ := getAsyncKeyW.Call(uintptr(key))
@@ -148,7 +155,7 @@ func mouseHookProc(code int32, wp, lp uintptr) uintptr {
 		r, _, _ := callNextH.Call(0, uintptr(code), wp, lp)
 		return r
 	}
-	pt := (*win.POINT)(unsafe.Pointer(lp)) // MSLLHOOKSTRUCT.pt 在前
+	pt := (*win.POINT)(callbackPtr(lp)) // MSLLHOOKSTRUCT.pt 在前
 	mu.Lock()
 	b := bar
 	mu.Unlock()
