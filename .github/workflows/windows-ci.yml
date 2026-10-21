@@ -69,23 +69,28 @@ jobs:
       - name: Type-check and build frontend
         run: bun run build:web
 
-      - name: Build management app
-        run: bunx mygo build -platform windows/amd64 -o build
-        env:
-          CGO_ENABLED: "0"
-
       - name: Build client agent
         shell: pwsh
         env:
           CGO_ENABLED: "0"
         run: |
-          New-Item -ItemType Directory -Force -Path build/windows-amd64 | Out-Null
-          go build -trimpath -ldflags="-s -w -H windowsgui" -o build/windows-amd64/agent.exe ./cmd/client
+          New-Item -ItemType Directory -Force -Path packaging/windows | Out-Null
+          go build -trimpath -ldflags="-s -w -H windowsgui" -o packaging/windows/agent.exe ./cmd/client
+
+      - name: Build management app
+        run: bunx mygo build -platform windows/amd64 -o build
+        env:
+          CGO_ENABLED: "0"
+          GOFLAGS: "-tags=embedagent"
+
+      - name: Check Windows binaries
+        shell: pwsh
+        run: |
+          if (-not (Test-Path packaging/windows/agent.exe)) {
+            throw "missing packaging/windows/agent.exe"
+          }
           if (-not (Test-Path build/windows-amd64/lab-assistant.exe)) {
             Get-ChildItem -Recurse build | Select-Object FullName
             throw "mygo did not produce build/windows-amd64/lab-assistant.exe"
           }
-          if (-not (Test-Path build/windows-amd64/agent.exe)) {
-            throw "missing build/windows-amd64/agent.exe"
-          }
-          Get-Item build/windows-amd64/*.exe | Format-Table Name, Length
+          Get-Item packaging/windows/agent.exe, build/windows-amd64/lab-assistant.exe | Format-Table Name, Length

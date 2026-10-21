@@ -229,8 +229,8 @@ export const Lab = {
   },
   /**
    * ExportClientPackage 生成学生机安装包到所选目录，返回实际输出路径。
-   * 含 client.json（已写入管理端地址+公钥）、install.bat、README.txt，
-   * 以及 agent.exe（若已用 GOOS=windows go build ./cmd/client 构建过）。
+   * 含 client.json（已写入管理端地址+公钥）、安装脚本，以及 agent.exe。
+   * 发行版的 agent 嵌在管理端里；开发构建则使用管理端旁边的 agent.exe。
    */
   exportClientPackage(addr: string): Promise<string> {
     return call("Lab.ExportClientPackage", addr);
