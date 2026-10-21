@@ -7,15 +7,17 @@ import (
 	"os/exec"
 )
 
-// powerAction 远程重启/关机学生机。默认非强制 + 60s 倒计时
-// （应用可拒绝、学生可 shutdown /a 取消、管理端可发 power.cancel），
-// force=true 才是 5s 强关——强制是有数据丢失风险的显式操作。
+// powerAction 真正执行关机/重启。
+// 注意 Windows 的 shutdown /t >0 会【隐含 /f】强关应用——所以「非强制」
+// 语义必须是我们自己的 60s 可取消倒计时（schedulePower）到期后执行
+// /t 0 且不带 /f：应用收到关机通知、可以拒绝并显示「阻止关机」屏，
+// 学生未保存的工作不会静默丢失。force=true 才是 5s 强关。
 func powerAction(op string, force bool) error {
 	flag := "/r"
 	if op == OpShutdown {
 		flag = "/s"
 	}
-	args := []string{flag, "/t", "60", "/c", "三叶草课堂管理：教师发起远程关机/重启"}
+	args := []string{flag, "/t", "0", "/c", "三叶草课堂管理：教师发起远程关机/重启"}
 	if force {
 		args = []string{flag, "/f", "/t", "5", "/c", "三叶草课堂管理：强制远程关机/重启"}
 	}
@@ -25,7 +27,8 @@ func powerAction(op string, force bool) error {
 	return nil
 }
 
-// powerCancel 取消进行中的关机/重启倒计时（shutdown /a）。
+// powerCancel 取消系统级关机倒计时（shutdown /a）——兜底清理可能残留的
+// force 关机；agent 自己的普通倒计时由 cancelScheduledPower 单独管理。
 func powerCancel() error {
 	if err := exec.Command("shutdown.exe", "/a").Start(); err != nil {
 		return fmt.Errorf("shutdown /a: %w", err)

@@ -60,7 +60,7 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -H wi
     client.json）→ hello → 3s 心跳 + 指令执行；ack 之前先推 status，
     保证服务端 SendCommand 返回时注册表已更新；`OnPrompt`/`OnConn`/
     `OnNotify`（教师消息气泡）/`PersistState`（helperOn/features 回写
-    client.json，重启后策略继续生效）钩子；`enforce()` 把已启用功能落到
+    state.json，重启后策略继续生效）钩子；`enforce()` 把已启用功能落到
     本机（`enforce_windows.go` 的 DisableTaskMgr、guard_offline
     断线锁屏），落地失败的键经 `StatusMsg.FeatureErr` 上报；
     `castGen` 广播代数拒绝过期 cast.start/stop；`screen.watch` 带
@@ -85,8 +85,10 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -H wi
   状态机三分：广播(mode/visible)、教师锁(teachLock)、守护锁(guardLock)
   互独立，`syncState` 统一算输入锁/窗口形态/工具条；全屏或任一锁定
   → 低级钩子吞键鼠（工具条矩形内放行）+ 藏任务栏。
-  紧急解锁：Ctrl+Alt+Shift+F12 三秒内连按三次（OnEmergencyUnlock 上报
-  管理端并记日志），是管理端失联/进程异常时管理员的本机兜底
+  紧急解锁：Ctrl+Alt+Shift+F12 三秒内连按三次（F12 长按自动重复
+  不计数）。解锁同步 disarm agent 侧守护标记——本次断线期不再上锁
+  （管理员接管语义），重连后的下次断线正常再上锁；离线告警缓存
+  进 pendAlerts 上限 8 条，重连即补发
 - `internal/trayicon/` — agent 用无 cgo Win32 系统托盘（菜单/气泡/提示），
   `trayicon_stub.go` 为非 Windows 平台 no-op；`clover.ico` embed 进 exe
 - `internal/studentui/` — 学生本机回环 HTTP 互动页（签到/投票/举手/
@@ -112,6 +114,9 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -H wi
 Windows `%AppData%\lab-assistant`。
 - `admin.key` — 管理端 Ed25519 身份，首启生成后复用（客户端 pin 的就是它）
 - `registry.json` — 设备注册表，1s 防抖写盘；重启后设备保留且标离线
+- `state.json`（学生机侧）— `%APPDATA%\LabHelper\state.json`，用户可写；
+  helperOn/features 等可变策略（client.json 安装后被 ACL 收成只读，
+  可变状态必须分开持久化）
 - `client.json`（学生机侧）— agent.exe 同目录，installer 部署；含
   adminAddr/adminPub/token/id/room + 回写的 helperOn/features 策略，
   agent 首启 `-id` 固化 id+token

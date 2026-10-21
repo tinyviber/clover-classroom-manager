@@ -224,18 +224,26 @@ func (s *Server) SetScreenWatch(ids []string, on bool) {
 			delete(s.screenWatch, id)
 		}
 	}
-	targets := make([]string, 0, len(requested))
+	type target struct {
+		id string
+		hi bool
+	}
+	targets := make([]target, 0, len(requested))
 	for _, id := range requested {
 		if d := s.devices[id]; s.sessions[id] != nil && d != nil && !d.Pending {
-			targets = append(targets, id)
+			targets = append(targets, target{id: id, hi: s.hiView[id]})
 		}
 	}
 	s.mu.Unlock()
-	args := ScreenWatchArgs{On: on}
-	cmd := Msg{Type: MsgCommand, Cmd: &CommandMsg{
-		ID: fmt.Sprintf("w%d", s.cmdSeq.Add(1)), Op: OpScreenWatch, Args: args,
-	}}
-	s.Broadcast(cmd, targets)
+	// hiView 优先于普通监看：高清查看中的设备保持 hi 订阅，
+	// 避免重连批处理把大图流降回缩略图造成画面冻结。
+	for _, t := range targets {
+		s.sendMsg(t.id, Msg{Type: MsgCommand, Cmd: &CommandMsg{
+			ID:   fmt.Sprintf("w%d", s.cmdSeq.Add(1)),
+			Op:   OpScreenWatch,
+			Args: ScreenWatchArgs{On: on || t.hi, Hi: t.hi},
+		}})
+	}
 	s.changed()
 }
 
@@ -398,8 +406,15 @@ func (s *Server) Screens() map[string]ScreenFrame {
 
 // ViewDevice 开关某台设备的高清单机查看（教师双击卡片看大图）。
 // hi 帧只在查看期间推给管理端，结束后恢复原缩略图订阅状态。
+// 单焦点：换一台查看前先关闭上一台的 hi 流，不残留多余订阅。
 func (s *Server) ViewDevice(id string, on bool) {
 	s.mu.Lock()
+	var prevID string
+	if on && s.focusID != "" && s.focusID != id {
+		prevID = s.focusID
+		delete(s.hiView, prevID)
+		delete(s.hiFrames, prevID)
+	}
 	if on {
 		s.focusID = id
 		s.hiView[id] = true
@@ -411,11 +426,18 @@ func (s *Server) ViewDevice(id string, on bool) {
 		delete(s.hiFrames, id)
 	}
 	watch := s.screenWatch[id]
+	prevWatch := s.screenWatch[prevID]
 	s.mu.Unlock()
+	if prevID != "" {
+		s.sendMsg(prevID, Msg{Type: MsgCommand, Cmd: &CommandMsg{
+			ID: fmt.Sprintf("view-%d", s.cmdSeq.Add(1)),
+			Op: OpScreenWatch, Args: ScreenWatchArgs{On: prevWatch, Hi: false},
+		}})
+	}
 	// 查看中=On+Hi；结束查看恢复缩略图订阅状态（或关）
 	s.sendMsg(id, Msg{Type: MsgCommand, Cmd: &CommandMsg{
-		ID:   fmt.Sprintf("view-%d", s.cmdSeq.Add(1)),
-		Op:   OpScreenWatch, Args: ScreenWatchArgs{On: on || watch, Hi: on},
+		ID: fmt.Sprintf("view-%d", s.cmdSeq.Add(1)),
+		Op: OpScreenWatch, Args: ScreenWatchArgs{On: on || watch, Hi: on},
 	}})
 	s.changed()
 }

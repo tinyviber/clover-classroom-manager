@@ -123,6 +123,7 @@ const (
 var (
 	panicN    int
 	panicLast time.Time
+	f12Held   bool // 按住 F12 的自动重复不算一次按键
 )
 
 func kbdHookProc(code int32, wp, lp uintptr) uintptr {
@@ -130,13 +131,26 @@ func kbdHookProc(code int32, wp, lp uintptr) uintptr {
 		r, _, _ := callNextH.Call(0, uintptr(code), wp, lp)
 		return r
 	}
+	vk := *(*uint32)(unsafe.Pointer(lp))
+	if wp == win.WM_KEYUP || wp == win.WM_SYSKEYUP {
+		if vk == vkF12 {
+			f12Held = false
+		}
+		return 1
+	}
 	if wp == win.WM_KEYDOWN || wp == win.WM_SYSKEYDOWN {
-		vk := *(*uint32)(unsafe.Pointer(lp))
+		if vk != vkF12 {
+			return 1
+		}
+		if f12Held {
+			return 1 // 长按自动重复不计
+		}
+		f12Held = true
 		down := func(vk int32) bool {
 			r, _, _ := getAsyncKeyW.Call(uintptr(vk))
 			return r&0x8000 != 0
 		}
-		if vk == vkF12 && down(vkControl) && down(vkShift) && down(vkMenu) {
+		if down(vkControl) && down(vkShift) && down(vkMenu) {
 			now := time.Now()
 			if now.Sub(panicLast) > 3*time.Second {
 				panicN = 0

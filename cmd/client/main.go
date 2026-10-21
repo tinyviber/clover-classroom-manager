@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -85,12 +86,22 @@ func main() {
 			}
 		}
 	}
-	// 防护策略持久化：重启后按上次的 helperOn/features 继续生效。
+	// 防护策略持久化：client.json 在安装目录里被 ACL 收成只读，
+	// 可变状态必须写去用户可写的 state.json——否则 install.bat 装好的
+	// 机器上策略重启就丢（且失败只进日志教师不可见）。
+	statePath := filepath.Join(userConfig, "LabHelper", "state.json")
+	if st := loadAgentState(statePath); st != nil {
+		if st.HelperOn != nil {
+			a.SetHelper(*st.HelperOn)
+		}
+		if st.Features != nil {
+			a.SetFeatures(st.Features)
+		}
+	}
 	a.PersistState = func(helperOn bool, features []string) {
-		cfg.HelperOn = &helperOn
-		cfg.Features = features
-		if err := cfg.Save(*cfgPath); err != nil {
+		if err := saveAgentState(statePath, helperOn, features); err != nil {
 			log.Printf("agent[%s]: 策略回写失败: %v", cfg.ID, err)
+			a.ReportAlert("persist", "防护策略回写失败: "+err.Error())
 		}
 	}
 	log.Printf("agent[%s]: 启动 name=%s label=%s mac=%s ip=%s admin=%s",
@@ -164,6 +175,40 @@ func main() {
 	}
 
 	a.Run(ctx)
+}
+
+// agentState 是可变运行态（与只读 client.json 分开持久化）。
+type agentState struct {
+	HelperOn *bool    `json:"helperOn,omitempty"`
+	Features []string `json:"features,omitempty"`
+}
+
+func loadAgentState(path string) *agentState {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var st agentState
+	if err := json.Unmarshal(b, &st); err != nil {
+		log.Printf("agent: 解析 %s 失败（忽略）: %v", path, err)
+		return nil
+	}
+	return &st
+}
+
+func saveAgentState(path string, helperOn bool, features []string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(agentState{HelperOn: &helperOn, Features: features}, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // setupLog 把日志写到用户可写的数据目录（安装目录 ACL 是只读的）。

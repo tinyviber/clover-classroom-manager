@@ -69,9 +69,20 @@ type Agent struct {
 	guardTimer  *time.Timer
 	guardLocked bool
 
+	// pendingAlerts 离线时缓存的告警（紧急解锁发生在断网时也要在
+	// 重连后送达管理端），下条会话建立时 flush。
+	pendMu     sync.Mutex
+	pendAlerts []AlertMsg
+
 	// castGen 当前广播代数：只接受更大代的 cast.start，小于等于当前代的
 	// cast.stop 才生效。每条 TCP 会话结束时清零（服务端换代语义按会话计）。
 	castGen atomic.Uint32
+
+	// powerTimer 关机/重启的 agent 侧可取消倒计时：Windows 的
+	// shutdown /t>0 隐含 /f 强关应用，所以普通关机是我们自己的定时器，
+	// 到期执行不带 /f 的 shutdown /t 0（应用可拒绝）。power.cancel 停它。
+	powerMu    sync.Mutex
+	powerTimer *time.Timer
 
 	cur           atomic.Pointer[session] // 当前会话（SubmitFile 用）
 	watchMu       sync.Mutex
@@ -94,14 +105,7 @@ type Agent struct {
 // NewAgent 构造一个默认全开防护的 agent。
 func NewAgent(id, name string) *Agent {
 	a := &Agent{ID: id, Name: name, Version: "0.0.2", Token: RandHex(16), inFiles: map[string]*incoming{}, outgoing: map[string]chan FileMsg{}}
-	castview.OnEmergencyUnlock = func() {
-		// 管理员在学生机上按了紧急解锁组合键：记录 + 上报管理端。
-		log.Printf("agent[%s]: 本机触发紧急解锁组合键", a.ID)
-		if s := a.cur.Load(); s != nil {
-			_ = s.send(Msg{Type: MsgAlert, Alert: &AlertMsg{Kind: "emergency_unlock", Detail: "本机紧急解锁"}})
-			_ = a.pushStatus(s)
-		}
-	}
+	castview.OnEmergencyUnlock = a.onEmergencyUnlock
 	a.helperOn.Store(true)
 	a.features.Store([]string{})
 	a.featErrs.Store([]string{})
@@ -148,6 +152,9 @@ func (a *Agent) enforce() {
 	a.featErrs.Store(errs)
 }
 
+// offlineGuardDelay 断线守护上弦后的锁屏延迟（测试可缩短）。
+var offlineGuardDelay = 15 * time.Second
+
 // armOfflineGuard 在会话断开后上弦：guard_offline 开启时 15s 内没
 // 重连成功就锁屏（防拔网线脱控）。ctx 结束（agent 退出）不上弦。
 func (a *Agent) armOfflineGuard(ctx context.Context) {
@@ -159,7 +166,7 @@ func (a *Agent) armOfflineGuard(ctx context.Context) {
 	if a.guardLocked || a.guardTimer != nil {
 		return
 	}
-	a.guardTimer = time.AfterFunc(15*time.Second, func() {
+	a.guardTimer = time.AfterFunc(offlineGuardDelay, func() {
 		a.guardMu.Lock()
 		a.guardTimer = nil
 		if a.offlineGuardOn() {
@@ -191,6 +198,49 @@ func (a *Agent) disarmOfflineGuard() {
 
 func (a *Agent) offlineGuardOn() bool {
 	return a.helperOn.Load() && a.hasFeature("guard_offline")
+}
+
+// onEmergencyUnlock 本机紧急解锁（Ctrl+Alt+Shift+F12×3，管理员恢复通道）：
+// ① 同步解开 agent 侧的守护锁标记——不然 a.guardLocked 滞留会让
+// armOfflineGuard 永远不再上弦，解锁就成了一次性豁免；
+// ② 上报告警，离线则缓存到重连后补发。
+func (a *Agent) onEmergencyUnlock() {
+	log.Printf("agent[%s]: 本机触发紧急解锁组合键", a.ID)
+	a.disarmOfflineGuard() // 与 castview 的解锁保持一致，守护下次断线仍生效
+	a.reportAlert(AlertMsg{Kind: "emergency_unlock", Detail: "本机紧急解锁"})
+	if s := a.cur.Load(); s != nil {
+		_ = a.pushStatus(s)
+	}
+}
+
+// ReportAlert 供 agent 宿主（cmd/client）上报自定义告警（如策略回写失败）。
+func (a *Agent) ReportAlert(kind, detail string) {
+	a.reportAlert(AlertMsg{Kind: kind, Detail: detail})
+}
+
+// reportAlert 上报告警；离线时缓存（上限 8 条防膨胀），重连补发。
+func (a *Agent) reportAlert(alert AlertMsg) {
+	if s := a.cur.Load(); s != nil {
+		if err := s.send(Msg{Type: MsgAlert, Alert: &alert}); err == nil {
+			return
+		}
+	}
+	a.pendMu.Lock()
+	if len(a.pendAlerts) < 8 {
+		a.pendAlerts = append(a.pendAlerts, alert)
+	}
+	a.pendMu.Unlock()
+}
+
+func (a *Agent) flushAlerts(s *session) {
+	a.pendMu.Lock()
+	alerts := a.pendAlerts
+	a.pendAlerts = nil
+	a.pendMu.Unlock()
+	for _, alert := range alerts {
+		a := alert
+		_ = s.send(Msg{Type: MsgAlert, Alert: &a})
+	}
 }
 
 // Run 主循环：发现→连接→会话，断线重来。
@@ -328,6 +378,7 @@ func (a *Agent) session(ctx context.Context, addr string, pub ed25519.PublicKey)
 	a.cur.Store(sess)
 	a.emitConn(true)
 	a.disarmOfflineGuard() // 重连成功，解除断线锁屏守护
+	a.flushAlerts(sess)    // 补发断线期间缓存的告警（紧急解锁等）
 
 	done := make(chan struct{})
 	defer close(done)
@@ -460,14 +511,12 @@ func (a *Agent) handleCmd(s *session, c CommandMsg) {
 		castview.Unlock()
 	case OpRestart, OpShutdown:
 		var args PowerArgs
-		if b, _ := json.Marshal(c.Args); json.Unmarshal(b, &args) == nil {
-			if err := powerAction(c.Op, args.Force); err != nil {
-				ack.OK, ack.Err = false, err.Error()
-			}
-		} else if err := powerAction(c.Op, false); err != nil {
+		_ = json.Unmarshal(mustJSON(c.Args), &args)
+		if err := a.schedulePower(c.Op, args.Force); err != nil {
 			ack.OK, ack.Err = false, err.Error()
 		}
 	case OpPowerCancel:
+		a.cancelScheduledPower()
 		if err := powerCancel(); err != nil {
 			ack.OK, ack.Err = false, err.Error()
 		}
@@ -659,15 +708,15 @@ type StudentCollectPrompt struct {
 }
 
 type StudentUIState struct {
-	Connected   bool                   `json:"connected"`
-	Name        string                 `json:"name"`
-	Label       string                 `json:"label"`
-	SignIn      *StudentSignPrompt     `json:"signIn,omitempty"`
-	Poll        *StudentPollPrompt     `json:"poll,omitempty"`
-	Collect     *StudentCollectPrompt  `json:"collect,omitempty"`
-	HelpRaised  bool                   `json:"helpRaised"`
-	Demo        *StudentDemoPrompt     `json:"demo,omitempty"`
-	DemoRunning bool                   `json:"demoRunning"`
+	Connected   bool                  `json:"connected"`
+	Name        string                `json:"name"`
+	Label       string                `json:"label"`
+	SignIn      *StudentSignPrompt    `json:"signIn,omitempty"`
+	Poll        *StudentPollPrompt    `json:"poll,omitempty"`
+	Collect     *StudentCollectPrompt `json:"collect,omitempty"`
+	HelpRaised  bool                  `json:"helpRaised"`
+	Demo        *StudentDemoPrompt    `json:"demo,omitempty"`
+	DemoRunning bool                  `json:"demoRunning"`
 }
 
 func (a *Agent) StudentState() StudentUIState {
@@ -1183,6 +1232,51 @@ func (a *Agent) SubmitFile(path string, displayName ...string) error {
 	}
 }
 
+// powerDelay 普通关机/重启的 agent 侧倒计时（测试可缩短）。
+var powerDelay = 60 * time.Second
+
+// doPowerAction 是 powerAction 的调用接缝，测试可替换以免真的执行关机。
+var doPowerAction = powerAction
+
+// schedulePower 普通模式只上定时器（到期执行不带 /f 的关机）；
+// force 模式直接 5s 强关。重复下发同一 op 会重置倒计时。
+func (a *Agent) schedulePower(op string, force bool) error {
+	if force {
+		return doPowerAction(op, true)
+	}
+	a.powerMu.Lock()
+	defer a.powerMu.Unlock()
+	if a.powerTimer != nil {
+		a.powerTimer.Stop()
+	}
+	a.powerTimer = time.AfterFunc(powerDelay, func() {
+		a.powerMu.Lock()
+		a.powerTimer = nil
+		a.powerMu.Unlock()
+		if err := doPowerAction(op, false); err != nil {
+			log.Printf("agent[%s]: 执行远程关机/重启失败: %v", a.ID, err)
+		}
+	})
+	log.Printf("agent[%s]: %s 将在 %s 后执行（可用 power.cancel 取消）", a.ID, op, powerDelay)
+	return nil
+}
+
+// cancelScheduledPower 停掉 agent 侧的普通关机倒计时。
+func (a *Agent) cancelScheduledPower() {
+	a.powerMu.Lock()
+	defer a.powerMu.Unlock()
+	if a.powerTimer != nil {
+		a.powerTimer.Stop()
+		a.powerTimer = nil
+		log.Printf("agent[%s]: 关机/重启倒计时已取消", a.ID)
+	}
+}
+
+func mustJSON(v any) []byte {
+	b, _ := json.Marshal(v)
+	return b
+}
+
 // validOpenURL 只允许 http/https 教学网址（防 file:///javascript: 类注入）。
 func validOpenURL(u string) error {
 	if len(u) > 2048 {
@@ -1213,29 +1307,61 @@ func validLaunchPath(p string) error {
 	return nil
 }
 
-// collectDir 指定目录收取：按 Glob 匹配目录下文件逐个自动上传，
-// 全部完成后清掉收取提示。上限 64 个文件防止误收整盘。
+// collectDir 指定目录收取：按 Glob 匹配目录下文件逐个自动上传。
+// 限额：≤64 个文件、总量 ≤256MB、单文件 ≤128MB；结果经 "collect"
+// 告警回执给管理端（无匹配/失败原因都会点名，不再是只算请求送达）。
 func (a *Agent) collectDir(s *session, args CollectOpenArgs) {
+	report := func(detail string) {
+		a.reportAlert(AlertMsg{Kind: "collect", Detail: detail})
+	}
+	clean := filepath.Clean(args.Dir)
+	if !filepath.IsAbs(clean) || strings.Contains(args.Dir, "..") || strings.HasPrefix(clean, `\\`) {
+		report("目录收取失败：路径无效")
+		return
+	}
 	pattern := args.Glob
 	if pattern == "" {
 		pattern = "*"
 	}
-	matches, err := filepath.Glob(filepath.Join(args.Dir, pattern))
-	if err != nil || len(matches) == 0 {
-		log.Printf("agent[%s]: 收取目录 %q 无匹配文件", a.ID, args.Dir)
+	if strings.Contains(pattern, "..") || strings.ContainsAny(pattern, `/\\`) {
+		report("目录收取失败：匹配规则无效")
 		return
 	}
-	if len(matches) > 64 {
-		matches = matches[:64]
+	matches, err := filepath.Glob(filepath.Join(clean, pattern))
+	if err != nil || len(matches) == 0 {
+		report(fmt.Sprintf("目录 %s 无匹配文件", clean))
+		return
 	}
+	const maxFiles, maxTotal = 64, 256 << 20
+	var total int64
+	count := 0
+	failed := 0
 	for _, p := range matches {
+		if count >= maxFiles || total >= maxTotal {
+			break
+		}
 		info, err := os.Stat(p)
 		if err != nil || !info.Mode().IsRegular() || info.Size() > MaxStudentUploadSize {
 			continue
 		}
-		if err := a.SubmitFile(p); err != nil {
-			log.Printf("agent[%s]: 收取上传 %s 失败: %v", a.ID, p, err)
+		if total+info.Size() > maxTotal {
+			break
 		}
+		if err := a.SubmitFile(p); err != nil {
+			failed++
+			log.Printf("agent[%s]: 收取上传 %s 失败: %v", a.ID, p, err)
+			continue
+		}
+		count++
+		total += info.Size()
+	}
+	switch {
+	case count == 0 && failed > 0:
+		report(fmt.Sprintf("目录收取失败：%d 个文件均上传失败", failed))
+	case failed > 0:
+		report(fmt.Sprintf("目录收取完成：已提交 %d 个文件（%.1f MB，%d 个失败）", count, float64(total)/(1<<20), failed))
+	default:
+		report(fmt.Sprintf("目录收取完成：已提交 %d 个文件（%.1f MB）", count, float64(total)/(1<<20)))
 	}
 }
 

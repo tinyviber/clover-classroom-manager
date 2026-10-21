@@ -182,6 +182,10 @@ export function ClassroomView() {
     if (!targets.length) { toast.error("当前没有在线目标设备"); return; }
     try {
       const sent = await api.collectFiles(targets, dir, glob);
+      if (sent < 0) {
+        toast.error("目录不在允许范围（仅允许 C:\\Users\\Public 与 C:\\LabHelper 之下）");
+        return;
+      }
       toast.success(sent
         ? dir ? `已向 ${sent} 台设备发起目录收取` : `已向 ${sent} 台设备发出收取请求`
         : "没有设备接受收取请求");
@@ -359,6 +363,18 @@ export function ClassroomView() {
         <Button size="sm" variant={seatMode ? "secondary" : "ghost"} onClick={() => setSeatMode((v) => !v)} title="按真实机房座位排列">
           <LayoutGrid />{seatMode ? "退出座位" : "座位图"}
         </Button>
+        {seatMode && (
+          <Select value={String(seatCols)} onValueChange={(v) => {
+            const n = Number(v);
+            setSeatCols(n);
+            void api.setSeatCols(n).catch(() => undefined);
+          }}>
+            <SelectTrigger className="h-8 w-[72px]"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {[5, 6, 7, 8, 9, 10, 12].map((n) => <SelectItem key={n} value={String(n)}>{n} 列</SelectItem>)}
+            </SelectContent>
+          </Select>
+        )}
         <div className="ml-auto flex items-center gap-1.5">
           {helps.length > 0 && (
             <Button size="sm" variant="outline" className="border-warning/40 text-warning" onClick={() => setDialog("helps")}>
@@ -379,7 +395,17 @@ export function ClassroomView() {
             frames={frames} selectedIds={selectedIds} clock={clock}
             onCardClick={clickDevice} onCardDoubleClick={openView}
             onDropSeat={(id, r, c) => {
+              // 占位交换：拖到已占用格子时两台设备互换座位；
+              // 拖到空位只是移动。否则两台同坐标只有一台可见。
+              const occupant = Object.entries(seats).find(
+                ([oid, rc]) => oid !== id && rc[0] === r && rc[1] === c,
+              );
               const next = { ...seats, [id]: [r, c] };
+              if (occupant) {
+                const from = seats[id];
+                if (from) next[occupant[0]] = from;
+                else delete next[occupant[0]];
+              }
               saveSeat(next);
             }}
             onUnseat={(id) => {
@@ -801,7 +827,7 @@ function CollectDialog({ open, onClose, onSubmit }: { open: boolean; onClose: ()
           <div className="space-y-2">
             <label className="grid gap-1.5 text-xs font-medium">学生机目录<Input value={dir} onChange={(e) => setDir(e.target.value)} placeholder="C:\\Users\\Public\\Desktop\\作业" /></label>
             <label className="grid gap-1.5 text-xs font-medium">匹配规则<Input value={glob} onChange={(e) => setGlob(e.target.value)} placeholder="*.* 或 *.docx" /></label>
-            <p className="text-xs text-muted-foreground">学生无需操作，匹配文件将自动上传（单机最多 64 个文件、单文件 ≤128MB）。请提前告知学生该目录会被收取。</p>
+            <p className="text-xs text-muted-foreground">学生无需操作，匹配文件将自动上传（仅允许 C:\Users\Public 与 C:\LabHelper 之下的目录；单机 ≤64 个文件、总量 ≤256MB、单文件 ≤128MB）。结果会逐台显示在「文件传输」。</p>
           </div>
         )}
         <DialogFooter>

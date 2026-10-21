@@ -25,20 +25,20 @@ import (
 
 // Device 是注册表里的设备条目（含离线）。
 type Device struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Label     string    `json:"label"`
-	IP        string    `json:"ip"`
-	MAC       string    `json:"mac"`
-	Version   string    `json:"version"`
-	Online    bool      `json:"online"`
-	HelperOn  bool      `json:"helperOn"`
-	Features  []string  `json:"features"`
-	Alerts    int       `json:"alerts"`
-	TokenHash string    `json:"tokenHash,omitempty"`
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	Label     string   `json:"label"`
+	IP        string   `json:"ip"`
+	MAC       string   `json:"mac"`
+	Version   string   `json:"version"`
+	Online    bool     `json:"online"`
+	HelperOn  bool     `json:"helperOn"`
+	Features  []string `json:"features"`
+	Alerts    int      `json:"alerts"`
+	TokenHash string   `json:"tokenHash,omitempty"`
 	// Pending=true 表示新注册设备还未被教师批准（enrollment）。
 	// 待批准设备不下发任何课堂指令，也不能成为广播/分发目标。
-	Pending  bool      `json:"pending,omitempty"`
+	Pending bool `json:"pending,omitempty"`
 	// Locked 反映学生端真实锁定状态（教师锁或断线守护锁），由 status 上报。
 	Locked bool `json:"locked,omitempty"`
 	// FeatErrs 是 agent 侧落地失败的策略键（desired→applied 不一致时点名）。
@@ -103,12 +103,12 @@ type Server struct {
 	fileAcks       map[string]chan FileMsg
 	recvDir        string
 	frameWorkers   map[string]*frameWorker
-	screenWatch    map[string]bool // requested thumbnail subscriptions; includes offline targets
-	hiView         map[string]bool // 单机高清查看中的设备（帧更大更清，单独路由）
+	screenWatch    map[string]bool        // requested thumbnail subscriptions; includes offline targets
+	hiView         map[string]bool        // 单机高清查看中的设备（帧更大更清，单独路由）
 	hiFrames       map[string]ScreenFrame // devID -> 最新高清帧
 	focusID        string                 // 当前大图查看的设备
-	cast           *serverCast     // 当前教师广播会话（nil=未广播）
-	castSeq        atomic.Uint32   // 广播代数发生器（单调递增，防旧指令复活）
+	cast           *serverCast            // 当前教师广播会话（nil=未广播）
+	castSeq        atomic.Uint32          // 广播代数发生器（单调递增，防旧指令复活）
 }
 
 // serverCast 是一次屏幕广播：组播主通道 + TCP 兜底目标集合。
@@ -434,6 +434,22 @@ func (s *Server) handle(cc *clientConn, m Msg) {
 		}
 	case MsgAlert:
 		if m.Alert == nil {
+			return
+		}
+		if m.Alert.Kind == "collect" {
+			// 目录收取的逐设备结果（成功/无匹配/失败原因）记到传输列表，
+			// 教师能在「文件传输」里看到每台机器的真实收态。
+			s.mu.Lock()
+			label := ""
+			if d := s.devices[cc.devID]; d != nil {
+				label = d.Label
+			}
+			s.transfers[fmt.Sprintf("collect-%s-%d", cc.devID, time.Now().UnixNano())] = &FileProgress{
+				ID: fmt.Sprintf("collect-%s", cc.devID), DeviceID: cc.devID,
+				Label: label, Name: m.Alert.Detail, Done: true, In: true, At: time.Now(),
+			}
+			s.mu.Unlock()
+			s.changed()
 			return
 		}
 		if m.Alert.Kind == "cast_tcp" {

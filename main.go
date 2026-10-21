@@ -991,13 +991,35 @@ func (l *Lab) CastStop() {
 
 func (l *Lab) CastMode() string { return l.srv.CastMode() }
 
+// collectRoots 指定目录收取允许的根目录白名单（学校预设作业目录语义）。
+// 放开任意路径等于把整个学生机目录树变成可远程抓取面。
+var collectRoots = []string{`C:\Users\Public`, `C:\LabHelper`}
+
+func validCollectDir(dir string) bool {
+	if dir == "" || strings.Contains(dir, "..") || strings.HasPrefix(dir, `\\`) {
+		return false
+	}
+	low := strings.ToLower(dir)
+	for _, root := range collectRoots {
+		r := strings.ToLower(root)
+		if low == r || strings.HasPrefix(low, r+`\`) {
+			return true
+		}
+	}
+	return false
+}
+
 // CollectFiles 发起文件收取。dir 为空=学生手动选择提交（弹互动页）；
 // dir 非空=按 glob 从学生机指定目录自动收取（学生无需操作）。
+// 返回 -1 表示目录不在允许范围（collectRoots 白名单外）。
 func (l *Lab) CollectFiles(ids []string, dir, glob string) int {
 	session := "c-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	dir = strings.TrimSpace(dir)
 	if len(dir) > 512 || len(glob) > 128 {
 		return 0
+	}
+	if dir != "" && !validCollectDir(dir) {
+		return -1
 	}
 	args := lan.CollectOpenArgs{Session: session, Dir: dir, Glob: strings.TrimSpace(glob)}
 	var sent atomic.Int32

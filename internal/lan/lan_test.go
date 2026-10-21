@@ -5,6 +5,9 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -220,4 +223,270 @@ func mustGenOtherPub(t *testing.T) []byte {
 		t.Fatal(err)
 	}
 	return other.Pub()
+}
+
+func waitFor(t *testing.T, d time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("等待超时: %s", what)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func startTestServer(t *testing.T, port int) (*Server, context.CancelFunc) {
+	t.Helper()
+	id, err := GenIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(id, port)
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := srv.Run(ctx); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	return srv, cancel
+}
+
+func startTestAgent(t *testing.T, ctx context.Context, srv *Server, port int, id, name string) *Agent {
+	t.Helper()
+	a := NewAgent(id, name)
+	a.PinnedPub = srv.ID.Pub()
+	a.DirectAddr = "127.0.0.1:" + fmt.Sprint(port)
+	go a.Run(ctx)
+	waitFor(t, 5*time.Second, "agent 上线", func() bool {
+		d, ok := srv.GetDevice(id)
+		return ok && d.Online
+	})
+	if n := srv.Approve([]string{id}); n != 1 {
+		t.Fatalf("审批失败: %d", n)
+	}
+	return a
+}
+
+func (a *Agent) guardIsLocked() bool {
+	a.guardMu.Lock()
+	defer a.guardMu.Unlock()
+	return a.guardLocked
+}
+
+// 断线守护生命周期：断线超时锁屏 → 本机紧急解锁（守护标记清零、
+// 告警离线缓存、本次断线期内不再上锁——管理员已接管）→ 重连后
+// 告警补发，且下一次断线守护正常再上锁（不会被永久豁免）。
+func TestOfflineGuardEmergencyUnlock(t *testing.T) {
+	old := offlineGuardDelay
+	offlineGuardDelay = 60 * time.Millisecond
+	defer func() { offlineGuardDelay = old }()
+
+	srv, stopSrv := startTestServer(t, 47895)
+	defer stopSrv()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a := startTestAgent(t, ctx, srv, 47895, "pc-g", "PC-G")
+	if _, err := srv.SendCommand("pc-g", OpSetFeatures, SetFeaturesArgs{Keys: []string{"guard_offline"}}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, "guard_offline 生效", func() bool {
+		d, _ := srv.GetDevice("pc-g")
+		return fmt.Sprint(d.Features) == "[guard_offline]"
+	})
+
+	// 断线：关掉服务端侧连接，并把 agent 的直连地址指到死端口让它重连不上。
+	goodAddr := a.DirectAddr
+	killConn := func() {
+		srv.mu.Lock()
+		cc := srv.sessions["pc-g"]
+		srv.mu.Unlock()
+		if cc == nil {
+			t.Fatal("服务端会话缺失")
+		}
+		a.DirectAddr = "127.0.0.1:1"
+		_ = cc.sess.conn.Close()
+	}
+	killConn()
+
+	waitFor(t, 3*time.Second, "断线守护锁屏", a.guardIsLocked)
+
+	// 紧急解锁：守护标记清零，告警进离线缓存（管理端此刻不可达）。
+	a.onEmergencyUnlock()
+	if a.guardIsLocked() {
+		t.Fatal("紧急解锁后守护标记未清零")
+	}
+	a.pendMu.Lock()
+	cached := len(a.pendAlerts)
+	a.pendMu.Unlock()
+	if cached != 1 {
+		t.Fatalf("离线告警未缓存: %d", cached)
+	}
+	// 本次断线期内不再上锁（管理员已接管这台机器）。
+	time.Sleep(3 * offlineGuardDelay)
+	if a.guardIsLocked() {
+		t.Fatal("紧急解锁后本次断线期又被锁上")
+	}
+
+	// 重连：告警补发，守护解锁且下轮断线可重新上弦。
+	a.DirectAddr = goodAddr
+	waitFor(t, 5*time.Second, "重连后告警送达", func() bool {
+		d, _ := srv.GetDevice("pc-g")
+		return d.Alerts > 0
+	})
+	waitFor(t, 3*time.Second, "重连上线", func() bool {
+		d, _ := srv.GetDevice("pc-g")
+		return d.Online
+	})
+
+	// 再断一次：守护没被永久豁免，重新上锁。
+	killConn()
+	waitFor(t, 3*time.Second, "再次断线重新上锁", a.guardIsLocked)
+}
+
+// 关机语义：普通关机是 agent 侧可取消倒计时，到期执行非强制关机；
+// force 立即执行；power.cancel 停掉倒计时后不再执行。
+func TestPowerScheduleSemantics(t *testing.T) {
+	fired := make(chan bool, 4)
+	old := doPowerAction
+	doPowerAction = func(op string, force bool) error { fired <- force; return nil }
+	oldDelay := powerDelay
+	powerDelay = 120 * time.Millisecond
+	defer func() { doPowerAction = old; powerDelay = oldDelay }()
+
+	a := NewAgent("pc-pw", "PC-PW")
+
+	// 普通模式：不立即执行
+	if err := a.schedulePower(OpShutdown, false); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-fired:
+		t.Fatal("普通关机竟立即执行")
+	case <-time.After(50 * time.Millisecond):
+	}
+	// 取消后到期不执行
+	a.cancelScheduledPower()
+	select {
+	case <-fired:
+		t.Fatal("取消的倒计时仍执行了")
+	case <-time.After(200 * time.Millisecond):
+	}
+	// 重新排程 → 到期以非强制语义执行
+	if err := a.schedulePower(OpShutdown, false); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case f := <-fired:
+		if f {
+			t.Fatal("普通关机竟走了强制路径")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("倒计时到期未执行")
+	}
+	// 强制模式立即执行且带 force
+	if err := a.schedulePower(OpShutdown, true); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case f := <-fired:
+		if !f {
+			t.Fatal("force 标记丢失")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("强制关机未立即执行")
+	}
+}
+
+// 高清查看不被缩略图监看重发覆盖 + 单焦点：重发 screenWatch 后
+// A 机仍保持 hi 订阅；切到 B 机查看时 A 的 hi 关闭。
+func TestHiViewSurvivesScreenWatch(t *testing.T) {
+	srv, stopSrv := startTestServer(t, 47896)
+	defer stopSrv()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a1 := startTestAgent(t, ctx, srv, 47896, "pc-a", "PC-A")
+	startTestAgent(t, ctx, srv, 47896, "pc-b", "PC-B")
+
+	srv.SetScreenWatch([]string{"pc-a", "pc-b"}, true)
+	waitFor(t, 3*time.Second, "pc-a 缩略图订阅", func() bool {
+		a1.watchMu.Lock()
+		defer a1.watchMu.Unlock()
+		return a1.watchOff != nil && !a1.watchHi
+	})
+
+	// 双击看大图 → 再因其他设备重连重发全班监看 → A 必须保持 hi。
+	srv.ViewDevice("pc-a", true)
+	waitFor(t, 3*time.Second, "pc-a hi 订阅", func() bool {
+		a1.watchHiMu.Lock()
+		defer a1.watchHiMu.Unlock()
+		return a1.watchHi
+	})
+	srv.SetScreenWatch([]string{"pc-a", "pc-b"}, true)
+	time.Sleep(300 * time.Millisecond) // 让重发命令抵达 agent
+	a1.watchHiMu.Lock()
+	hi := a1.watchHi
+	a1.watchHiMu.Unlock()
+	if !hi {
+		t.Fatal("缩略图监看重发覆盖了高清查看")
+	}
+
+	// 单焦点：切去 B 查看时 A 的 hi 订阅被关闭。
+	srv.ViewDevice("pc-b", true)
+	waitFor(t, 3*time.Second, "pc-a hi 关闭", func() bool {
+		a1.watchHiMu.Lock()
+		defer a1.watchHiMu.Unlock()
+		return !a1.watchHi
+	})
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if srv.hiView["pc-a"] || !srv.hiView["pc-b"] || srv.focusID != "pc-b" {
+		t.Fatal("单焦点高清查看状态错误")
+	}
+}
+
+// 目录收取：路径校验、配额与逐设备结果回执。
+func TestCollectDirConstraints(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("homework"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 稀疏大文件：超过单文件上限应被跳过。
+	big := filepath.Join(dir, "big.bin")
+	f, err := os.Create(big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(MaxStudentUploadSize + 1); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	f.Close()
+
+	a := NewAgent("pc-c", "PC-C")
+	alertDetail := func() string {
+		a.pendMu.Lock()
+		defer a.pendMu.Unlock()
+		if len(a.pendAlerts) == 0 {
+			return ""
+		}
+		d := a.pendAlerts[len(a.pendAlerts)-1].Detail
+		a.pendAlerts = nil
+		return d
+	}
+
+	// 越界路径被拒
+	a.collectDir(nil, CollectOpenArgs{Dir: "..\\Windows", Glob: "*"})
+	if d := alertDetail(); !strings.Contains(d, "路径无效") {
+		t.Fatalf("越界路径未被拒: %q", d)
+	}
+	// 无匹配
+	a.collectDir(nil, CollectOpenArgs{Dir: dir, Glob: "*.zzz"})
+	if d := alertDetail(); !strings.Contains(d, "无匹配文件") {
+		t.Fatalf("无匹配未上报: %q", d)
+	}
+	// 有匹配但离线：上传全部失败也要如实上报，大文件被跳过
+	a.collectDir(nil, CollectOpenArgs{Dir: dir, Glob: "*.txt"})
+	if d := alertDetail(); !strings.Contains(d, "上传失败") {
+		t.Fatalf("离线上传失败未上报: %q", d)
+	}
 }
