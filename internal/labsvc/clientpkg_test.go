@@ -46,12 +46,16 @@ func TestWriteClientPackageNoAgentFails(t *testing.T) {
 	old := EmbeddedAgent
 	EmbeddedAgent = nil
 	t.Cleanup(func() { EmbeddedAgent = old })
-	// 工作目录切到临时目录，确保候选路径里也没有 agent.exe
+	// 工作目录切到临时目录，确保候选路径里也没有 agent.exe。
+	// 注意 t.Cleanup 后进先出：先注册 TempDir、再注册 Chdir 还原，
+	// 才能保证还原当前目录发生在删除临时目录之前（Windows 不允许
+	// 删除进程当前目录）。
+	tmp := t.TempDir()
 	wd, _ := os.Getwd()
-	t.Cleanup(func() { _ = os.Chdir(wd) })
-	if err := os.Chdir(t.TempDir()); err != nil {
+	if err := os.Chdir(tmp); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = os.Chdir(wd) })
 
 	id, err := lan.GenIdentity()
 	if err != nil {
