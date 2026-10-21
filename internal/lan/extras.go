@@ -139,9 +139,10 @@ type incomingReservation struct {
 func (s *Server) sendMsg(id string, m Msg) bool {
 	s.mu.Lock()
 	cc := s.sessions[id]
+	d := s.devices[id]
 	s.mu.Unlock()
-	if cc == nil {
-		return false
+	if cc == nil || (d != nil && d.Pending) {
+		return false // 待审批设备连推送都不给（含重连恢复消息）
 	}
 	if err := cc.sess.send(m); err != nil {
 		_ = cc.sess.conn.Close()
@@ -151,20 +152,25 @@ func (s *Server) sendMsg(id string, m Msg) bool {
 }
 
 // Broadcast sends a message to all online clients or the selected subset.
+// 待审批设备在两层都被跳过——未批准的机器连一帧广播也不该收到。
 func (s *Server) Broadcast(m Msg, only []string) int {
 	s.mu.Lock()
 	var targets []*clientConn
 	seen := make(map[*clientConn]bool)
+	eligible := func(id string, cc *clientConn) bool {
+		d := s.devices[id]
+		return cc != nil && d != nil && !d.Pending && !seen[cc]
+	}
 	if only == nil {
-		for _, cc := range s.sessions {
-			if !seen[cc] {
+		for id, cc := range s.sessions {
+			if eligible(id, cc) {
 				seen[cc] = true
 				targets = append(targets, cc)
 			}
 		}
 	} else {
 		for _, id := range only {
-			if cc := s.sessions[id]; cc != nil && !seen[cc] {
+			if cc := s.sessions[id]; eligible(id, cc) {
 				seen[cc] = true
 				targets = append(targets, cc)
 			}
@@ -220,7 +226,7 @@ func (s *Server) SetScreenWatch(ids []string, on bool) {
 	}
 	targets := make([]string, 0, len(requested))
 	for _, id := range requested {
-		if s.sessions[id] != nil {
+		if d := s.devices[id]; s.sessions[id] != nil && d != nil && !d.Pending {
 			targets = append(targets, id)
 		}
 	}
@@ -248,7 +254,8 @@ func (s *Server) StartCast(p CastSessionParams, mode string, ids []string) {
 	if mode != "window" && mode != "fullscreen" {
 		return
 	}
-	args := CastStartArgs{Mode: mode}
+	gen := s.castSeq.Add(1)
+	args := CastStartArgs{Gen: gen, Mode: mode}
 	var sender *CastSender
 	if p.Group != "" {
 		if cs, err := NewCastSender(p, nil); err == nil {
@@ -264,6 +271,7 @@ func (s *Server) StartCast(p CastSessionParams, mode string, ids []string) {
 		s.cast.sender.Close() // 防重复调用泄漏旧发送端
 	}
 	s.cast = &serverCast{
+		gen:     gen,
 		args:    args,
 		sender:  sender,
 		targets: map[string]bool{},
@@ -279,14 +287,15 @@ func (s *Server) StartCast(p CastSessionParams, mode string, ids []string) {
 	s.changed()
 }
 
-// StopCast 关闭当前广播会话并返回旧目标集合（调用方负责逐个发 cast.stop）。
-func (s *Server) StopCast() []string {
+// StopCast 关闭当前广播会话，返回旧目标集合与代数（调用方负责逐个发
+// cast.stop{Gen}，让客户端能识别这是结束哪一代广播）。
+func (s *Server) StopCast() (ids []string, gen uint32) {
 	s.mu.Lock()
 	old := s.cast
 	s.cast = nil
 	s.mu.Unlock()
 	if old == nil {
-		return nil
+		return nil, 0
 	}
 	if old.sender != nil {
 		old.sender.Close()
@@ -300,7 +309,7 @@ func (s *Server) StopCast() []string {
 	}
 	s.mu.Unlock()
 	s.changed()
-	return sortedIDs(old.targets)
+	return sortedIDs(old.targets), old.gen
 }
 
 // CastArgs 返回当前广播要下发给某台客户端的会话参数；id 不在目标里则 false。
@@ -652,6 +661,12 @@ func (s *Server) ClearHelp(id string) {
 // syncClientActivities restores current classroom prompts after a client
 // reconnects and removes stale prompts that were closed while it was offline.
 func (s *Server) syncClientActivities(deviceID string) {
+	s.mu.Lock()
+	pending := s.devices[deviceID] != nil && s.devices[deviceID].Pending
+	s.mu.Unlock()
+	if pending {
+		return // 待审批设备什么课堂活动都不恢复——包括监看与广播
+	}
 	// A student demo is not resumed after a transport reconnect. Stop its
 	// viewer first, then restore any teacher-owned activities below.
 	s.stopDemoForDevice(deviceID)
@@ -701,14 +716,17 @@ func (s *Server) syncClientActivities(deviceID string) {
 	if args, ok := s.CastArgs(deviceID); ok {
 		go func() {
 			ack, err := s.SendCommand(deviceID, OpCastStart, args)
-			if err != nil || !ack.OK || ack.Detail == "tcp" {
+			// Detail=="stale" 是客户端认出过期代数，不算失败更不该标 TCP。
+			if ack.Detail == "tcp" || (ack.Detail != "stale" && (err != nil || !ack.OK)) {
 				s.MarkCastTCP(deviceID)
 			}
-			// 发送期间广播可能已结束/换会话：复查，失效则补 cast.stop，
-			// 否则客户端会守着僵尸组播与全屏窗。
-			if _, still := s.CastArgs(deviceID); !still {
+			// 发送期间广播可能已结束/换代：复查，代数变了补对应代的
+			// cast.stop，否则客户端会守着僵尸组播与全屏窗。
+			if cur, still := s.CastArgs(deviceID); !still || cur.Gen != args.Gen {
 				s.sendMsg(deviceID, Msg{Type: MsgCommand, Cmd: &CommandMsg{
-					ID: fmt.Sprintf("cast-%d", s.cmdSeq.Add(1)), Op: OpCastStop,
+					ID:   fmt.Sprintf("cast-%d", s.cmdSeq.Add(1)),
+					Op:   OpCastStop,
+					Args: CastStopArgs{Gen: args.Gen},
 				}})
 			}
 		}()
@@ -1462,22 +1480,29 @@ func normalizeIDs(ids []string) []string {
 	return out
 }
 
-// OnlineIDs resolves an empty selection to every online client and filters stale IDs.
+// OnlineIDs resolves an empty selection to every online client and filters
+// stale IDs. 待审批（pending）设备一律排除——没批准的机器不能成为课堂目标。
 func (s *Server) OnlineIDs(ids []string) []string {
 	selected := normalizeIDs(ids)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	eligible := func(id string) bool {
+		d := s.devices[id]
+		return s.sessions[id] != nil && d != nil && !d.Pending
+	}
 	if len(selected) == 0 {
 		selected = make([]string, 0, len(s.sessions))
 		for id := range s.sessions {
-			selected = append(selected, id)
+			if eligible(id) {
+				selected = append(selected, id)
+			}
 		}
 		sort.Strings(selected)
 		return selected
 	}
 	out := make([]string, 0, len(selected))
 	for _, id := range selected {
-		if s.sessions[id] != nil {
+		if eligible(id) {
 			out = append(out, id)
 		}
 	}

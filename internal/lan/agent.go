@@ -41,6 +41,10 @@ type Agent struct {
 
 	// OnCommand 可选钩子：自定义指令处理。返回 false 表示已由 agent 内置处理。
 	OnCommand func(CommandMsg) bool
+	// PersistPub 可选钩子：TOFU 学到的管理端公钥（PinnedPub 原本为空时
+	// 第一次握手验证通过的那个）交给调用方落盘 client.json——否则每次
+	// 断线重发现都在重新「首次信任」，TOFU 名不副实。
+	PersistPub func(ed25519.PublicKey)
 	// OnPrompt 可选钩子：有新的课堂互动（"signin"/"poll"/"demo"/"collect"）待学生处理。
 	// 静默运行的客户端用它做气泡通知 + 唤起互动窗口。
 	OnPrompt func(kind, session string)
@@ -49,6 +53,16 @@ type Agent struct {
 
 	helperOn atomic.Bool
 	features atomic.Value // []string
+
+	// guard_offline 守护：断线超时后自动锁屏。guardLocked 只记守护自己
+	// 上的锁，解锁也只解自己的（教师 screen.lock 独立管理）。
+	guardMu     sync.Mutex
+	guardTimer  *time.Timer
+	guardLocked bool
+
+	// castGen 当前广播代数：只接受更大代的 cast.start，小于等于当前代的
+	// cast.stop 才生效。每条 TCP 会话结束时清零（服务端换代语义按会话计）。
+	castGen atomic.Uint32
 
 	cur           atomic.Pointer[session] // 当前会话（SubmitFile 用）
 	watchMu       sync.Mutex
@@ -88,8 +102,78 @@ func (a *Agent) SetHelper(on bool) { a.helperOn.Store(on) }
 // SetFeatures 替换功能集。
 func (a *Agent) SetFeatures(keys []string) { a.features.Store(keys) }
 
+func (a *Agent) hasFeature(key string) bool {
+	for _, k := range a.Features() {
+		if k == key {
+			return true
+		}
+	}
+	return false
+}
+
+// enforce 把已启用的功能真正落地到本机。目前落地的策略：
+//   - lock_taskmgr：HKCU DisableTaskMgr
+//   - guard_offline：断线 15s 自动锁屏（计时在 arm/disarm 里管）
+//
+// 其余 catalog 项尚未实现，服务端目录里标 ready=false 不展示为已生效。
+func (a *Agent) enforce() {
+	on := a.helperOn.Load()
+	if err := setDisableTaskMgr(on && a.hasFeature("lock_taskmgr")); err != nil {
+		log.Printf("agent[%s]: DisableTaskMgr 策略写入失败: %v", a.ID, err)
+	}
+	if !(on && a.hasFeature("guard_offline")) {
+		a.disarmOfflineGuard()
+	}
+}
+
+// armOfflineGuard 在会话断开后上弦：guard_offline 开启时 15s 内没
+// 重连成功就锁屏（防拔网线脱控）。ctx 结束（agent 退出）不上弦。
+func (a *Agent) armOfflineGuard(ctx context.Context) {
+	if ctx.Err() != nil || !a.offlineGuardOn() {
+		return
+	}
+	a.guardMu.Lock()
+	defer a.guardMu.Unlock()
+	if a.guardLocked || a.guardTimer != nil {
+		return
+	}
+	a.guardTimer = time.AfterFunc(15*time.Second, func() {
+		a.guardMu.Lock()
+		a.guardTimer = nil
+		if a.offlineGuardOn() {
+			a.guardLocked = true
+			a.guardMu.Unlock()
+			log.Printf("agent[%s]: 与管理端断线超时，锁定屏幕", a.ID)
+			castview.Lock("与管理端的连接已断开")
+			return
+		}
+		a.guardMu.Unlock()
+	})
+}
+
+// disarmOfflineGuard 重连成功（或功能关闭）后解除守护：停计时器，
+// 并解开守护自己上的锁。
+func (a *Agent) disarmOfflineGuard() {
+	a.guardMu.Lock()
+	if a.guardTimer != nil {
+		a.guardTimer.Stop()
+		a.guardTimer = nil
+	}
+	locked := a.guardLocked
+	a.guardLocked = false
+	a.guardMu.Unlock()
+	if locked {
+		castview.Unlock()
+	}
+}
+
+func (a *Agent) offlineGuardOn() bool {
+	return a.helperOn.Load() && a.hasFeature("guard_offline")
+}
+
 // Run 主循环：发现→连接→会话，断线重来。
 func (a *Agent) Run(ctx context.Context) {
+	a.enforce() // 启动即落地本地策略（例如上次关机前残留的 taskmgr 禁用要清掉）
 	for ctx.Err() == nil {
 		addr, pub, err := a.discover(ctx)
 		if err != nil {
@@ -180,13 +264,23 @@ func (a *Agent) session(ctx context.Context, addr string, pub ed25519.PublicKey)
 	if err != nil {
 		return err
 	}
+	if a.PinnedPub == nil {
+		// TOFU：握手已验证对端持有该公钥对应的私钥——钉住并持久化，
+		// 以后重连/重发现都认这把钥匙。
+		a.PinnedPub = pub
+		if a.PersistPub != nil {
+			a.PersistPub(pub)
+		}
+	}
 	defer func() {
 		a.cur.Store(nil)
 		a.emitConn(false)
 		a.stopWatch()
 		a.stopDemoStream()
 		a.stopCast()
+		a.castGen.Store(0) // 会话结束，广播代数随连接重置
 		a.abortIncoming()
+		a.armOfflineGuard(ctx) // 断线守护上弦（ctx 已结束则不上）
 		a.uiMu.Lock()
 		a.signPrompt, a.pollPrompt, a.demoPrompt, a.collectPrompt = nil, nil, nil, nil
 		a.demoSession, a.helpRaised = "", false
@@ -211,6 +305,7 @@ func (a *Agent) session(ctx context.Context, addr string, pub ed25519.PublicKey)
 	// 在服务端见到 hello 前发包会被直接断连。
 	a.cur.Store(sess)
 	a.emitConn(true)
+	a.disarmOfflineGuard() // 重连成功，解除断线锁屏守护
 
 	done := make(chan struct{})
 	defer close(done)
@@ -279,11 +374,13 @@ func (a *Agent) handleCmd(s *session, c CommandMsg) {
 		var args SetHelperArgs
 		if b, _ := json.Marshal(c.Args); json.Unmarshal(b, &args) == nil {
 			a.helperOn.Store(args.On)
+			a.enforce()
 		}
 	case OpSetFeatures:
 		var args SetFeaturesArgs
 		if b, _ := json.Marshal(c.Args); json.Unmarshal(b, &args) == nil {
 			a.features.Store(args.Keys)
+			a.enforce()
 		}
 	case OpScreenWatch:
 		var args ScreenWatchArgs
@@ -293,21 +390,52 @@ func (a *Agent) handleCmd(s *session, c CommandMsg) {
 	case OpCastStart:
 		var args CastStartArgs
 		if b, _ := json.Marshal(c.Args); json.Unmarshal(b, &args) == nil {
-			if args.Mode == "window" || args.Mode == "fullscreen" {
+			cur := a.castGen.Load()
+			switch {
+			case args.Gen != 0 && args.Gen < cur:
+				// 过期指令：教师早已换代，回了 "stale" 服务端不做 TCP 兜底
+				ack.Detail = "stale"
+			case args.Gen == cur && cur != 0:
+				castview.Show(args.Mode) // 同代重发：幂等只刷新模式
+			case args.Mode != "window" && args.Mode != "fullscreen":
+				ack.OK, ack.Err = false, "无效的广播模式"
+				ack.Detail = "tcp" // 拒绝广播也走兜底，不留黑屏
+			default:
+				a.castGen.Store(args.Gen)
 				if err := a.startCast(s, args); err != nil {
 					// 组播不可用 → 回 "tcp"，管理端把这机标记为 TCP 兜底
 					ack.Detail = "tcp"
 				}
-			} else {
-				ack.OK, ack.Err = false, "无效的广播模式"
-				ack.Detail = "tcp" // 拒绝广播也走兜底，不留黑屏
 			}
 		} else {
 			ack.Detail = "tcp" // 参数解不开：退到 TCP 也不留黑屏
 		}
 	case OpCastStop:
-		a.stopCast()
-		castview.Close()
+		var args CastStopArgs
+		if b, _ := json.Marshal(c.Args); json.Unmarshal(b, &args) == nil {
+			// 只停对应代的广播；过期 stop（Gen 比当前小）直接忽略，
+			// 防旧 cast.stop 晚到把新一代广播掐掉。
+			if args.Gen == 0 || args.Gen >= a.castGen.Load() {
+				a.stopCast()
+				castview.Close()
+			}
+		} else {
+			a.stopCast()
+			castview.Close()
+		}
+	case OpLockScreen:
+		var args LockScreenArgs
+		if b, _ := json.Marshal(c.Args); json.Unmarshal(b, &args) == nil {
+			castview.Lock(args.Reason)
+		} else {
+			castview.Lock("")
+		}
+	case OpUnlockScreen:
+		castview.Unlock()
+	case OpRestart, OpShutdown:
+		if err := powerAction(c.Op); err != nil {
+			ack.OK, ack.Err = false, err.Error()
+		}
 	case OpSignInOpen:
 		var args SignInOpenArgs
 		if b, _ := json.Marshal(c.Args); json.Unmarshal(b, &args) == nil {
@@ -392,10 +520,12 @@ func (a *Agent) handleCmd(s *session, c CommandMsg) {
 		ack.OK = false
 		ack.Err = "未知指令 " + c.Op
 	}
+	// 先推状态再回 ack：服务端按序处理消息，ack 到达时注册表已更新，
+	// SendCommand 返回后 GetDevice 立刻能看到新状态（不靠竞态运气）。
+	a.pushStatus(s)
 	if err := s.send(Msg{Type: MsgAck, Ack: &ack}); err != nil {
 		return
 	}
-	a.pushStatus(s) // 指令落地后立即回报新状态
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) {

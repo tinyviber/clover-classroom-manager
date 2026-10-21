@@ -5,6 +5,7 @@ import { ArrowDownToLine, CheckCircle2, ChevronRight, Computer, LoaderCircle, Mo
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { api, nativeRuntime, onClassroomChanged, onDevicesChanged } from "@/api";
@@ -154,6 +155,7 @@ function DistributionDialog() {
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState("");
   const [exporting, setExporting] = useState(false);
+  const [addr, setAddr] = useState(""); // 教师选定的管理端 LAN 地址
 
   const loadInfo = async () => {
     setLoading(true);
@@ -176,7 +178,7 @@ function DistributionDialog() {
   const exportPackage = async () => {
     setExporting(true);
     try {
-      const output = await api.exportClientPackage();
+      const output = await api.exportClientPackage(addr);
       if (output) { toast.success(`安装包已导出到 ${output}`); setOpen(false); }
       else toast.info("已取消导出");
     } catch (error) {
@@ -197,9 +199,16 @@ function DistributionDialog() {
         ) : info ? (
           <div className="space-y-4 py-2">
             <div className="rounded-lg border bg-muted/20 p-3">
-              <p className="mb-2 text-xs font-medium text-muted-foreground">管理端地址 · TCP {info.port}</p>
-              {info.ips.length ? info.ips.map((ip) => <p key={ip} className="font-mono text-sm">{ip}:{info.port}</p>) : <p className="text-sm text-muted-foreground">未检测到本机 IPv4</p>}
-              <p className="mt-2 text-xs text-muted-foreground">UDP 发现端口 47822</p>
+              <p className="mb-2 text-xs font-medium text-muted-foreground">安装包写入的管理端地址 · TCP {info.port}</p>
+              {info.ips.length ? (
+                <Select value={addr || info.ips[0]} onValueChange={(v) => typeof v === "string" && setAddr(v)}>
+                  <SelectTrigger className="h-8 font-mono text-sm"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {info.ips.map((ip) => <SelectItem key={ip} value={ip}>{ip}:{info.port}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              ) : <p className="text-sm text-muted-foreground">未检测到本机 IPv4</p>}
+              <p className="mt-2 text-xs text-muted-foreground">多网卡/VPN 环境请选学生机可达的地址；UDP 发现端口 47822 兜底</p>
             </div>
             <InfoLine label="公钥指纹" value={info.fingerprint} mono />
             <InfoLine label="数据目录" value={info.dataDir} mono />

@@ -2,8 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
   ArrowDownToLine, Check, CheckCheck, ClipboardCheck, Download, HelpCircle,
-  MessageSquareText, Monitor, MonitorOff, Play, ScreenShare, Send, Square,
-  StopCircle, Users, Video,
+  Lock, LockOpen, MessageSquareText, Monitor, MonitorOff, Play, Power,
+  ScreenShare, Send, Square, StopCircle, Users, Video,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -36,7 +36,8 @@ export function ClassroomView() {
   const clearSelection = useLabStore((store) => store.clearSelection);
   const classroom = useLabStore((store) => store.classroom);
 
-  const online = useMemo(() => devices.filter((device) => device.online), [devices]);
+  // 待审批设备可见但不算可操作学生机（不能选也不能被广播）。
+  const online = useMemo(() => devices.filter((device) => device.online && !device.pending), [devices]);
   const onlineKey = online.map((device) => device.id).join(",");
   const onlineIds = useMemo(() => online.map((device) => device.id), [online]);
   const targets = useMemo(() => targetDeviceIds(devices, selectedIds), [devices, selectedIds]);
@@ -183,6 +184,25 @@ export function ClassroomView() {
     } catch (error) { toast.error(error instanceof Error ? error.message : "收取文件失败"); }
   };
 
+  const screenLock = async (on: boolean) => {
+    if (!targets.length) { toast.error("当前没有在线目标设备"); return; }
+    try {
+      const n = await api.screenLock(targets, on);
+      toast.success(on ? `已锁定 ${n} 台学生机` : `已解锁 ${n} 台学生机`);
+    } catch (error) { toast.error(error instanceof Error ? error.message : "锁屏操作失败"); }
+  };
+
+  const power = async (action: string) => {
+    if (action !== "restart" && action !== "shutdown") return;
+    if (!targets.length) { toast.error("当前没有在线目标设备"); return; }
+    const label = action === "restart" ? "重启" : "关机";
+    if (nativeRuntime && !window.confirm(`确认${label} ${targets.length} 台学生机？`)) return;
+    try {
+      const n = await api.powerAction(targets, action);
+      toast.success(`已向 ${n} 台设备发出${label}指令`);
+    } catch (error) { toast.error(error instanceof Error ? error.message : `远程${label}失败`); }
+  };
+
   const selectedOnline = devices.filter((d) => selectedIds.includes(d.id) && d.online).length;
   const activeTransfers = (classroom?.files ?? []).filter((t) => !t.done && !t.err).length;
   const helps = classroom?.helps ?? [];
@@ -222,6 +242,16 @@ export function ClassroomView() {
         <Button size="sm" variant="outline" onClick={() => void toggleWatch()}>
           {watching ? <MonitorOff /> : <Monitor />}{watching ? "停止监看" : "开始监看"}
         </Button>
+        <Separator orientation="vertical" className="mx-1 h-5" />
+        <Button size="sm" variant="outline" onClick={() => void screenLock(true)}><Lock />锁屏</Button>
+        <Button size="sm" variant="ghost" onClick={() => void screenLock(false)}><LockOpen />解锁</Button>
+        <Select value="" onValueChange={(v) => typeof v === "string" && void power(v)}>
+          <SelectTrigger className="h-8 w-[88px]"><Power className="size-3.5" /><SelectValue placeholder="电源" /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="restart">远程重启</SelectItem>
+            <SelectItem value="shutdown">远程关机</SelectItem>
+          </SelectContent>
+        </Select>
         <div className="ml-auto flex items-center gap-1.5">
           {helps.length > 0 && (
             <Button size="sm" variant="outline" className="border-warning/40 text-warning" onClick={() => setDialog("helps")}>
@@ -262,6 +292,7 @@ export function ClassroomView() {
                     selected ? "border-primary bg-primary text-primary-foreground" : "border-foreground/20 bg-background/80 text-transparent"
                   }`}><Check className="size-3" /></span>
                   {!device.online && <Badge variant="secondary" className="absolute top-1.5 right-1.5">离线</Badge>}
+                  {device.pending && <Badge variant="outline" className="absolute top-1.5 right-1.5 border-warning/50 bg-warning/10 text-warning">待审批</Badge>}
                 </div>
                 <div className="flex items-center gap-2 px-2.5 py-1.5">
                   <span className={`size-1.5 shrink-0 rounded-full ${device.online ? "bg-success" : "bg-muted-foreground/50"}`} />
@@ -282,7 +313,7 @@ export function ClassroomView() {
       {/* 底部活动条：广播/演示/签到/投票/传输/求助 摘要 */}
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-lg border bg-card px-3 py-2 text-xs text-muted-foreground">
         <span className={casting ? "font-medium text-success" : ""}>
-          {casting ? `● 广播中 · ${castTargets.length} 台 · ${classroom?.castMode === "fullscreen" ? "全屏" : "窗口"} · ${qualityLabels[classroom?.castQuality ?? "better"] ?? ""}` : "未广播"}
+          {casting ? `● 广播中 · ${castTargets.length} 台 · ${classroom?.castMode === "fullscreen" ? "全屏" : `窗口${classroom?.castTitle ? `：${classroom.castTitle}` : ""}`} · ${qualityLabels[classroom?.castQuality ?? "better"] ?? ""}` : "未广播"}
         </span>
         {classroom?.demo?.state ? <span>学生演示：{classroom.demo.state === "pending" ? "等待确认" : `${classroom.demo.sourceLabel} 演示中`}</span> : null}
         {classroom?.signIn?.id ? <button className="hover:text-foreground" onClick={() => setDialog("signin")}>签到 {classroom.signIn.replies.length}/{classroom.signIn.sent}{classroom.signIn.open ? " 进行中" : ""}</button> : null}

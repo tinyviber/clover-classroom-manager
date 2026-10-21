@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import type { ClassroomState, Device, FeatureGroup } from "./mygo";
 
-export type DeviceFilter = "all" | "online" | "offline" | "alert";
+export type DeviceFilter = "all" | "online" | "offline" | "alert" | "pending";
 export type MainView = "devices" | "classroom";
 export type ThemePreference = "light" | "dark" | "system";
 
@@ -117,12 +117,14 @@ export function filterDevices(devices: Device[], filter: DeviceFilter, query: st
     if (filter === "online" && !device.online) return false;
     if (filter === "offline" && device.online) return false;
     if (filter === "alert" && device.alerts === 0) return false;
+    if (filter === "pending" && !device.pending) return false;
     return !needle || [device.name, device.label, device.ip].some((value) => value.toLowerCase().includes(needle));
   });
 }
 
 export function targetDeviceIds(devices: Device[], selectedIds: string[]) {
-  const online = devices.filter((device) => device.online);
+  // 待审批设备不能成为课堂目标（服务端 OnlineIDs 也会再拦一层）。
+  const online = devices.filter((device) => device.online && !device.pending);
   return selectedIds.length === 0
     ? online.map((device) => device.id)
     : online.filter((device) => selectedIds.includes(device.id)).map((device) => device.id);

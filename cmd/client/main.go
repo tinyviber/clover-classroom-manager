@@ -16,6 +16,8 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"log"
@@ -74,6 +76,14 @@ func main() {
 	lan.CleanIncompleteFiles(a.RecvDir)
 	if a.PinnedPub == nil {
 		log.Printf("agent[%s]: 未 pin 管理端公钥，使用 TOFU（信任第一个应答的信标）", cfg.ID)
+		// 首个可信管理端握手成功后把公钥回写 client.json——
+		// TOFU 只「首次」信任，之后重连重发现都认这把钥匙。
+		a.PersistPub = func(pub ed25519.PublicKey) {
+			cfg.AdminPub = base64.StdEncoding.EncodeToString(pub)
+			if err := cfg.Save(*cfgPath); err != nil {
+				log.Printf("agent[%s]: TOFU 公钥回写失败: %v", cfg.ID, err)
+			}
+		}
 	}
 	log.Printf("agent[%s]: 启动 name=%s label=%s mac=%s ip=%s admin=%s",
 		cfg.ID, a.Name, a.Label, a.MAC, a.IP, a.DirectAddr)

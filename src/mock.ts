@@ -2,7 +2,10 @@
 // 用与 main.go 相同的假数据替代 Lab 绑定，让界面可交互。
 import type { ClassroomState, Device, FeatureGroup } from "./mygo";
 
-export const catalog: FeatureGroup[] = [
+// 与 main.go catalog() 同步：只有这两项在客户端有真实执行实现。
+const readyKeys = new Set(["guard_offline", "lock_taskmgr"]);
+type RawFeature = { key: string; name: string; desc: string };
+const rawCatalog: { title: string; features: RawFeature[] }[] = [
   {
     title: "脱控防护",
     features: [
@@ -54,6 +57,11 @@ export const catalog: FeatureGroup[] = [
   },
 ];
 
+export const catalog: FeatureGroup[] = rawCatalog.map((group) => ({
+  ...group,
+  features: group.features.map((feature) => ({ ...feature, ready: readyKeys.has(feature.key) })),
+}));
+
 const allKeys = () => catalog.flatMap((g) => g.features.map((f) => f.key));
 
 function seed(): Device[] {
@@ -75,6 +83,7 @@ function seed(): Device[] {
       version: "0.0.2",
       alerts: 0,
       features: [...core],
+      pending: false,
       lastSeen: "刚刚",
     });
   }
@@ -100,6 +109,7 @@ const state = {
     castMode: "",
     castTargetIds: [],
     castQuality: "better",
+    castTitle: "",
   } as ClassroomState,
   watching: new Set<string>(),
   screenTimer: 0,
@@ -201,6 +211,12 @@ export const mockLab = {
   async collectFiles(ids: string[]) {
     const targets = state.devices.filter((device) => device.online && ids.includes(device.id));
     return targets.length;
+  },
+  async screenLock(ids: string[], _on: boolean) {
+    return state.devices.filter((d) => d.online && ids.includes(d.id)).length;
+  },
+  async powerAction(ids: string[], _action: string) {
+    return state.devices.filter((d) => d.online && ids.includes(d.id)).length;
   },
   async focusAdmin() {},
   async signInStart(seconds: number, ids: string[]) {
@@ -313,6 +329,18 @@ export const mockLab = {
       dataDir: "(浏览器预览)",
     };
   },
-  async exportClientPackage() { return ""; },
+  async exportClientPackage(_addr: string) { return ""; },
+  async approveDevices(ids: string[]) {
+    let n = 0;
+    for (const d of state.devices) if (ids.includes(d.id) && d.pending) { d.pending = false; n++; }
+    emit();
+    return n;
+  },
+  async rejectDevices(ids: string[]) {
+    const before = state.devices.length;
+    state.devices = state.devices.filter((d) => !(ids.includes(d.id) && d.pending));
+    if (state.devices.length !== before) emit();
+    return before - state.devices.length;
+  },
   async clearAlerts(_id: string) {},
 };

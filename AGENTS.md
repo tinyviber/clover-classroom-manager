@@ -50,10 +50,17 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -H wi
     `Identity` 持久化为 admin.key（Ed25519 私钥文件）
   - `proto.go` 消息信封（hello/status/command/ack/alert）与 UDP 发现信标格式
   - `server.go` 管理端：UDP :47822 应答发现、TCP :47823 接客户端、
-    设备注册表持久化（registry.json，1s 防抖原子写）、`SendCommand` 等 Ack
+    设备注册表持久化（registry.json，1s 防抖原子写）、`SendCommand` 等 Ack；
+    新设备一律注册 pending（enrollment），教师 `Approve` 后才能收指令/
+    进广播目标（演示模式 `Server.AutoApprove` 跳过）；握手+hello 阶段
+    各有 10s deadline 且未认证连接数上限 64，防局域网资源耗尽
   - `agent.go` 学生机 agent：UDP 广播发现（或直接 `AdminAddr`）→ 握手
-    （pin 管理端公钥，空则 TOFU）→ hello → 3s 心跳 + 指令执行；
-    `OnPrompt`/`OnConn` 钩子供托盘气泡与按需唤起互动页
+    （pin 管理端公钥，空则 TOFU——首连学到的公钥经 `PersistPub` 回写
+    client.json）→ hello → 3s 心跳 + 指令执行；ack 之前先推 status，
+    保证服务端 SendCommand 返回时注册表已更新；`OnPrompt`/`OnConn`
+    钩子供托盘气泡与按需唤起互动页；`enforce()` 把已启用功能落到
+    本机（`enforce_windows.go` 的 DisableTaskMgr、guard_offline
+    断线锁屏）；`castGen` 广播代数拒绝过期 cast.start/stop
   - `mcast.go` 屏幕广播组播通道（仿极域）：教师端把 AES-256-GCM 加密帧
     切片组播到 239.42.4.23:47824，一次发送全班接收；每数据报另附
     HMAC-SHA256 截断 tag（HKDF 派生密钥），伪造分片无法污染重组器；
@@ -115,8 +122,12 @@ Windows `%AppData%\lab-assistant`。
 
 ## 正式部署时还要做
 
-- 客户端 enrollment token 审批（新机器首次上线需管理端确认）
 - 离线设备的指令队列（现在 SendCommand 对离线机直接报错，应改为上线补发）
 - 客户端 Windows 化：SYSTEM 服务（install.bat 现为计划任务兜底）+
-  守护进程互守 + DisableTaskMgr/IFEO + 禁蓝屏改全屏锁定
+  守护进程互守 + IFEO + 禁蓝屏改全屏锁定（DisableTaskMgr 已由 lock_taskmgr
+  落地，但 HKCU 用户策略可被学生自己改回，服务级执行才能防篡改）
+- client.json 的 token 是明文 bearer 凭证，目录 ACL 只能挡普通读取——
+  学生拿到自己机器的 token 可冒充本机。要挡复制得换 DPAPI/TPM 绑定的凭证。
+- 其余 catalog 功能的 Windows 执行端（USB 存储/网站黑白名单/进程守护等）
+  尚未实现，目录里标 `ready: false` 不展示为已生效
 - 可选：管理端加一个 `net/http` 适配器把同一套 UI 挂到局域网浏览器

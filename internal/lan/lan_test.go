@@ -42,6 +42,17 @@ func TestRoundTrip(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
+	// 新设备先进 pending：未批准前 SendCommand 必须被拒（enrollment 边界）。
+	if d, _ := srv.GetDevice("pc-01"); !d.Pending {
+		t.Fatal("新注册设备应为 pending")
+	}
+	if _, err := srv.SendCommand("pc-01", OpSetHelper, SetHelperArgs{On: false}); err == nil {
+		t.Fatal("待审批设备竟能收到课堂指令")
+	}
+	if n := srv.Approve([]string{"pc-01"}); n != 1 {
+		t.Fatalf("审批失败: %d", n)
+	}
+
 	// 下发 helper.set false
 	ack, err := srv.SendCommand("pc-01", OpSetHelper, SetHelperArgs{On: false})
 	if err != nil {
@@ -50,8 +61,7 @@ func TestRoundTrip(t *testing.T) {
 	if !ack.OK {
 		t.Fatalf("ack 失败: %s", ack.Err)
 	}
-	// 等 status 推回
-	time.Sleep(100 * time.Millisecond)
+	// agent 先推 status 再回 ack：SendCommand 返回时注册表必须已更新。
 	d, _ := srv.GetDevice("pc-01")
 	if d.HelperOn {
 		t.Fatal("注册表未更新 helperOn=false")
@@ -62,7 +72,6 @@ func TestRoundTrip(t *testing.T) {
 	if _, err := srv.SendCommand("pc-01", OpSetFeatures, SetFeaturesArgs{Keys: keys}); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(100 * time.Millisecond)
 	d, _ = srv.GetDevice("pc-01")
 	if fmt.Sprint(d.Features) != fmt.Sprint(keys) {
 		t.Fatalf("features 不符: %v", d.Features)

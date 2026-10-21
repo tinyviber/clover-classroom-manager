@@ -36,7 +36,10 @@ type Device struct {
 	Features  []string  `json:"features"`
 	Alerts    int       `json:"alerts"`
 	TokenHash string    `json:"tokenHash,omitempty"`
-	LastSeen  time.Time `json:"lastSeen"`
+	// Pending=true 表示新注册设备还未被教师批准（enrollment）。
+	// 待批准设备不下发任何课堂指令，也不能成为广播/分发目标。
+	Pending  bool      `json:"pending,omitempty"`
+	LastSeen time.Time `json:"lastSeen"`
 }
 
 // LastSeenText 给 UI 的友好时间。
@@ -67,6 +70,10 @@ type clientConn struct {
 type Server struct {
 	ID      Identity
 	TCPPort int
+	// AutoApprove 跳过 enrollment 审批：新设备直接注册为正式设备。
+	// 仅演示/测试开启；正式部署必须保持 false，否则任何局域网客户端
+	// 都能直接混入课堂。
+	AutoApprove bool
 
 	mu        sync.Mutex
 	devices   map[string]*Device     // id -> device
@@ -79,6 +86,7 @@ type Server struct {
 	persistT    *time.Timer
 
 	screens        map[string]ScreenFrame // 各设备最新缩略图 JPEG
+	handshaking    atomic.Int32           // 处于握手/hello 阶段的连接数
 	sign           *signState             // 当前签到会话
 	poll           *pollState             // 当前单题投票
 	demo           *demoState             // 唯一学生演示活动
@@ -91,10 +99,12 @@ type Server struct {
 	frameWorkers   map[string]*frameWorker
 	screenWatch    map[string]bool // requested thumbnail subscriptions; includes offline targets
 	cast           *serverCast     // 当前教师广播会话（nil=未广播）
+	castSeq        atomic.Uint32   // 广播代数发生器（单调递增，防旧指令复活）
 }
 
 // serverCast 是一次屏幕广播：组播主通道 + TCP 兜底目标集合。
 type serverCast struct {
+	gen     uint32          // 本代广播号
 	args    CastStartArgs   // 下发给客户端的会话参数；Group=="" 表示纯 TCP
 	sender  *CastSender     // 组播发送端（nil 表示管理端侧也组播不出去）
 	targets map[string]bool // 全部目标（含离线，重连恢复用）
@@ -256,6 +266,13 @@ func (s *Server) acceptLoop(ctx context.Context, ln net.Listener) {
 			ln.Close()
 			return
 		}
+		// 未认证阶段的并发连接设上限：不可信局域网里客户端可以
+		// 批量连上握手然后吊着不发 hello，占着 goroutine 做资源耗尽。
+		if s.handshaking.Add(1) > maxHandshaking {
+			s.handshaking.Add(-1)
+			conn.Close()
+			continue
+		}
 		go s.serve(conn)
 	}
 }
@@ -292,19 +309,26 @@ func (s *Server) discoverLoop(ctx context.Context) {
 
 // ---- TCP 会话 ----
 
+// maxHandshaking 是同时处于握手/未 hello 阶段的连接上限。
+const maxHandshaking = 64
+
 func (s *Server) serve(conn net.Conn) {
 	defer conn.Close()
+	defer s.handshaking.Add(-1)
 	sess, err := serverHandshake(conn, s.ID)
 	if err != nil {
 		log.Printf("lan: 握手失败 %v: %v", conn.RemoteAddr(), err)
 		return
 	}
-	// 第一条必须是 hello
+	// 第一条必须是 hello，且只给有限时间——握手清掉 deadline 后
+	// 一直不发的连接会占着 goroutine 做资源耗尽。
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	var m Msg
 	if err := sess.recv(&m); err != nil || m.Type != MsgHello || m.Hello == nil {
 		log.Printf("lan: 首条消息不是 hello: %v %v", conn.RemoteAddr(), m.Type)
 		return
 	}
+	conn.SetReadDeadline(time.Time{}) // hello 之后回归心跳超时语义
 	h := m.Hello
 	if h.ID == "" || len(h.ID) > 96 || h.Token == "" || len(h.Token) < 32 || len(h.Token) > 512 || len(h.Name) > 256 || len(h.Label) > 128 {
 		log.Printf("lan: 拒绝无效 hello %v", conn.RemoteAddr())
@@ -315,7 +339,9 @@ func (s *Server) serve(conn net.Conn) {
 	s.mu.Lock()
 	d, ok := s.devices[h.ID]
 	if !ok {
-		d = &Device{ID: h.ID}
+		// 新设备只能注册到 pending：等教师在 UI 上批准后才算
+		// 授权学生机（enrollment），防止局域网里冒充注册污染名单。
+		d = &Device{ID: h.ID, Pending: !s.AutoApprove}
 		s.devices[h.ID] = d
 	}
 	tokenHash := sha256.Sum256([]byte(h.Token))
@@ -507,12 +533,17 @@ func (s *Server) sweeper(ctx context.Context) {
 }
 
 // SendCommand 给在线设备下发指令并等待 Ack；离线/超时返回错误。
+// 待审批设备（Pending）拒绝一切课堂指令——enrollment 边界。
 func (s *Server) SendCommand(id string, op string, args any) (AckMsg, error) {
 	s.mu.Lock()
 	cc := s.sessions[id]
+	d := s.devices[id]
 	s.mu.Unlock()
 	if cc == nil {
 		return AckMsg{}, errors.New("设备不在线")
+	}
+	if d != nil && d.Pending {
+		return AckMsg{}, errors.New("设备待审批")
 	}
 	cid := fmt.Sprintf("c%d", s.cmdSeq.Add(1))
 	ch := make(chan AckMsg, 1)
@@ -549,6 +580,54 @@ func (s *Server) InjectAlert(id, kind, detail string) {
 	s.mu.Unlock()
 	log.Printf("lan: 告警 %s %s: %s", id, kind, detail)
 	s.changed()
+}
+
+// Approve 批准待注册设备（enrollment）：之后才能下发指令/成为广播目标。
+// 批准时对还在线的设备补一次课堂活动同步（签到/投票/广播等恢复推送
+// 在 pending 期间是被跳过的，不然要等到下次重连才补齐）。
+func (s *Server) Approve(ids []string) int {
+	s.mu.Lock()
+	n := 0
+	var online []string
+	for _, id := range ids {
+		if d := s.devices[id]; d != nil && d.Pending {
+			d.Pending = false
+			n++
+			if s.sessions[id] != nil {
+				online = append(online, id)
+			}
+		}
+	}
+	s.mu.Unlock()
+	for _, id := range online {
+		go s.syncClientActivities(id)
+	}
+	if n > 0 {
+		s.changed()
+	}
+	return n
+}
+
+// Reject 拒绝待注册设备：从注册表删除并断开其连接（学生端会退回发现循环，
+// 但再连上依然只能注册为 pending）。
+func (s *Server) Reject(ids []string) int {
+	s.mu.Lock()
+	n := 0
+	for _, id := range ids {
+		if d := s.devices[id]; d != nil && d.Pending {
+			delete(s.devices, id)
+			if cc := s.sessions[id]; cc != nil {
+				cc.sess.conn.Close()
+				delete(s.sessions, id)
+			}
+			n++
+		}
+	}
+	s.mu.Unlock()
+	if n > 0 {
+		s.changed()
+	}
+	return n
 }
 
 func (s *Server) changed() {

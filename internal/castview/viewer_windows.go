@@ -38,6 +38,8 @@ var (
 	img     *image.RGBA // 最新解码帧
 	mode    string      // 目标模式
 	visible bool        // 有窗口在显示（隐藏时 Frame 不解码省 CPU）
+	locked  bool        // screen.lock 黑屏锁定（无退出按钮，键鼠全锁）
+	lockWhy string
 	cmds    = make(chan func(), 16)
 	frames  = make(chan []byte, 1) // 单槽：只解最新帧
 	once    sync.Once
@@ -52,7 +54,98 @@ var (
 	stretchDI = gdi32.NewProc("StretchDIBits")
 	user32    = windows.NewLazySystemDLL("user32.dll")
 	setTextW  = user32.NewProc("SetWindowTextW")
+	setHookW  = user32.NewProc("SetWindowsHookExW")
+	unhookW   = user32.NewProc("UnhookWindowsHookEx")
+	callNextH = user32.NewProc("CallNextHookEx")
+	findWinW  = user32.NewProc("FindWindowW")
 )
+
+// ---- 全屏输入锁定（仿极域：广播时锁死学生机键鼠）----
+//
+// WH_KEYBOARD_LL/WH_MOUSE_LL 低级钩子在我们自己的进程里回调（不注入
+// 别人），装在跑消息循环的窗口线程上。键盘全吞（含 Alt+Tab/Win/
+// Ctrl+Esc）；鼠标只放行落在悬浮工具条矩形内的点（模式切换/退出
+// 按钮还要能用）。Ctrl+Alt+Del 是安全注意序列，用户态拦不了——
+// 和极域一样，只能再配 DisableTaskMgr 策略兜底。
+
+const (
+	whKeyboardLL = 13
+	whMouseLL    = 14
+)
+
+var (
+	kbdHookH, mouHookH uintptr
+	taskbarHidden      bool
+	kbdCb              = windows.NewCallback(kbdHookProc)
+	mouCb              = windows.NewCallback(mouseHookProc)
+)
+
+func kbdHookProc(code int32, wp, lp uintptr) uintptr {
+	if code < 0 {
+		r, _, _ := callNextH.Call(0, uintptr(code), wp, lp)
+		return r
+	}
+	return 1 // 吞掉所有按键
+}
+
+func mouseHookProc(code int32, wp, lp uintptr) uintptr {
+	if code < 0 {
+		r, _, _ := callNextH.Call(0, uintptr(code), wp, lp)
+		return r
+	}
+	pt := (*win.POINT)(unsafe.Pointer(lp)) // MSLLHOOKSTRUCT.pt 在前
+	mu.Lock()
+	b := bar
+	mu.Unlock()
+	if b != 0 {
+		var rc win.RECT
+		win.GetWindowRect(b, &rc)
+		if pt.X >= rc.Left && pt.X < rc.Right && pt.Y >= rc.Top && pt.Y < rc.Bottom {
+			r, _, _ := callNextH.Call(0, uintptr(code), wp, lp)
+			return r // 放行工具条上的点
+		}
+	}
+	return 1 // 吞掉其余鼠标
+}
+
+// lockInput/unlockInput 只在窗口线程上调。
+func lockInput() {
+	hMod := uintptr(win.GetModuleHandle(nil))
+	if kbdHookH == 0 {
+		kbdHookH, _, _ = setHookW.Call(whKeyboardLL, kbdCb, hMod, 0)
+	}
+	if mouHookH == 0 {
+		mouHookH, _, _ = setHookW.Call(whMouseLL, mouCb, hMod, 0)
+	}
+	// 连任务栏/开始菜单一起藏掉
+	for _, cls := range []string{"Shell_TrayWnd", "Shell_SecondaryTrayWnd"} {
+		p, _ := windows.UTF16PtrFromString(cls)
+		if h, _, _ := findWinW.Call(uintptr(unsafe.Pointer(p)), 0); h != 0 {
+			win.ShowWindow(win.HWND(h), win.SW_HIDE)
+		}
+	}
+	taskbarHidden = true
+}
+
+func unlockInput() {
+	if kbdHookH != 0 {
+		unhookW.Call(kbdHookH)
+		kbdHookH = 0
+	}
+	if mouHookH != 0 {
+		unhookW.Call(mouHookH)
+		mouHookH = 0
+	}
+	if taskbarHidden {
+		for _, cls := range []string{"Shell_TrayWnd", "Shell_SecondaryTrayWnd"} {
+			p, _ := windows.UTF16PtrFromString(cls)
+			if h, _, _ := findWinW.Call(uintptr(unsafe.Pointer(p)), 0); h != 0 {
+				win.ShowWindow(win.HWND(h), win.SW_SHOW)
+			}
+		}
+		taskbarHidden = false
+	}
+}
 
 type atom = win.ATOM
 
@@ -86,7 +179,7 @@ func Show(m string) {
 // UDP/TCP 读循环），窗口隐藏时直接丢弃省 CPU。
 func Frame(jpeg []byte) {
 	mu.Lock()
-	v := visible
+	v := visible && !locked // 锁定态黑屏盖着广播，不解码省 CPU
 	mu.Unlock()
 	if !v {
 		return
@@ -123,7 +216,35 @@ func decodeThread() {
 	}
 }
 
+// Lock 黑屏锁定（screen.lock）：全屏黑 + 锁键鼠，工具条不给学生
+// 「退出」的机会。和广播共用窗口线程，后进的全屏广播照样显示画面
+// （锁输入仍然生效，画面被黑帧盖住）。
+func Lock(reason string) {
+	mu.Lock()
+	locked = true
+	lockWhy = reason
+	mode = "fullscreen"
+	visible = true
+	img = nil
+	mu.Unlock()
+	once.Do(func() {
+		go windowThread()
+		go decodeThread()
+	})
+	enqueue(func() { applyMode() })
+}
+
+// Unlock 解除黑屏锁定（screen.unlock）。
+func Unlock() {
+	mu.Lock()
+	locked = false
+	lockWhy = ""
+	mu.Unlock()
+	enqueue(func() { hideAll() })
+}
+
 // Close 关闭广播窗与工具条（学生端「退出广播」也是走这里）。
+// 黑屏锁定状态下 Close 只收广播，不解锁——锁归 screen.unlock 管。
 func Close() {
 	enqueue(func() { hideAll() })
 }
@@ -131,12 +252,24 @@ func Close() {
 func hideAll() {
 	mu.Lock()
 	h, b := hwnd, bar
+	l := locked
 	img = nil
-	visible = false
+	if !l {
+		visible = false
+	}
 	mu.Unlock()
 	if b != 0 {
 		win.ShowWindow(b, win.SW_HIDE)
 	}
+	if l {
+		// 锁定态：只收广播画面，黑屏窗和键鼠锁保留到 screen.unlock
+		if h != 0 {
+			lockInput()
+			win.InvalidateRect(h, nil, true)
+		}
+		return
+	}
+	unlockInput()
 	if h != 0 {
 		win.ShowWindow(h, win.SW_HIDE)
 	}
@@ -170,6 +303,21 @@ func applyMode() {
 	}
 	win.ShowWindow(h, win.SW_SHOW)
 	win.InvalidateRect(h, nil, true)
+	mu.Lock()
+	l := locked
+	mu.Unlock()
+	if m == "fullscreen" {
+		lockInput()
+	} else {
+		unlockInput()
+	}
+	if l {
+		b := bar
+		if b != 0 {
+			win.ShowWindow(b, win.SW_HIDE) // 锁定态不给学生工具条
+		}
+		return
+	}
 	showBar()
 }
 
@@ -372,6 +520,7 @@ func wndProc(h win.HWND, umsg uint32, wp, lp uintptr) uintptr {
 		}
 		return 0
 	case win.WM_DESTROY:
+		unlockInput() // 窗口没了无论如何放开键鼠和任务栏
 		mu.Lock()
 		hwnd = 0
 		mu.Unlock()
@@ -381,11 +530,23 @@ func wndProc(h win.HWND, umsg uint32, wp, lp uintptr) uintptr {
 	return win.DefWindowProc(h, umsg, wp, lp)
 }
 
-// paint 把最新帧拉伸画满客户区（黑边留宽高比）。
+// paint 把最新帧拉伸画满客户区（黑边留宽高比）。锁定态画黑底+提示。
 func paint(hdc win.HDC, rc win.RECT) {
 	mu.Lock()
 	src := img
+	l, why := locked, lockWhy
 	mu.Unlock()
+	if l {
+		win.SetTextColor(hdc, 0x00DDDDDD)
+		win.SetBkMode(hdc, win.TRANSPARENT)
+		msg := "屏幕已锁定"
+		if why != "" {
+			msg = why
+		}
+		txt, _ := windows.UTF16FromString(msg)
+		drawText(hdc, txt, &rc, win.DT_CENTER|win.DT_VCENTER|win.DT_SINGLELINE)
+		return
+	}
 	if src == nil {
 		return
 	}

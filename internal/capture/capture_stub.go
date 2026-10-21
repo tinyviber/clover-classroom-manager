@@ -41,6 +41,10 @@ func grab() (image.Image, error) {
 
 func grabWindow() (image.Image, error) { return grab() }
 
+// PinWindow/UnpinWindow 非 Windows 平台空实现（窗口共享只在 Windows 落地）。
+func PinWindow() string { return "" }
+func UnpinWindow()      {}
+
 func drawText(img *image.RGBA, s string, x, y int) {
 	d := &font.Drawer{
 		Dst:  img,

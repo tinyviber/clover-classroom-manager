@@ -90,6 +90,8 @@ export interface ClassroomState {
   castMode: string;
   castTargetIds: string[];
   castQuality: string;
+  /** 窗口模式共享的窗口标题 */
+  castTitle: string;
 }
 
 /** Device 是给 UI 的设备视图。 */
@@ -104,14 +106,21 @@ export interface Device {
   version: string;
   alerts: number;
   features: string[];
+  /** 待审批的新注册设备 */
+  pending: boolean;
   lastSeen: string;
 }
 
-/** Feature describes one protection/policy switch a client can enforce. */
+/**
+ * Feature describes one protection/policy switch a client can enforce.
+ * Ready=false 表示该策略在客户端还没有执行实现（规划中）——
+ * UI 禁用勾选，也不计入「生效」数，避免把占位功能显示成已保护。
+ */
 export interface Feature {
   key: string;
   name: string;
   desc: string;
+  ready: boolean;
 }
 
 /** FeatureGroup is a section of the per-device feature checklist. */
@@ -141,6 +150,10 @@ export const Lab = {
   /** ApplyTemplate sets the same feature set on many devices at once. */
   applyTemplate(ids: string[], keys: string[]): Promise<number> {
     return call("Lab.ApplyTemplate", ids, keys);
+  },
+  /** ApproveDevices 批准待注册设备（enrollment）。返回批准的台数。 */
+  approveDevices(ids: string[]): Promise<number> {
+    return call("Lab.ApproveDevices", ids);
   },
   castMode(): Promise<string> {
     return call("Lab.CastMode");
@@ -194,8 +207,8 @@ export const Lab = {
    * 含 client.json（已写入管理端地址+公钥）、install.bat、README.txt，
    * 以及 agent.exe（若已用 GOOS=windows go build ./cmd/client 构建过）。
    */
-  exportClientPackage(): Promise<string> {
-    return call("Lab.ExportClientPackage");
+  exportClientPackage(addr: string): Promise<string> {
+    return call("Lab.ExportClientPackage", addr);
   },
   /** FocusAdmin 唤起管理端主窗口（悬浮条的「显示管理端」按钮）。 */
   focusAdmin(): Promise<void> {
@@ -213,12 +226,24 @@ export const Lab = {
   pollStop(): Promise<void> {
     return call("Lab.PollStop");
   },
+  /** PowerAction 远程重启/关机学生机。action: "restart" | "shutdown"。 */
+  powerAction(ids: string[], action: string): Promise<number> {
+    return call("Lab.PowerAction", ids, action);
+  },
+  /** RejectDevices 拒绝待注册设备：移出注册表并断开连接。 */
+  rejectDevices(ids: string[]): Promise<number> {
+    return call("Lab.RejectDevices", ids);
+  },
   /**
    * Scan re-discovers devices on the LAN. 发现是被动的（agent 自己找来），
    * 这里只做一次注册表刷新。
    */
   scan(): Promise<Device[]> {
     return call("Lab.Scan");
+  },
+  /** ScreenLock 锁定/解锁学生机屏幕（黑屏 + 锁键鼠，学生端无退出途径）。 */
+  screenLock(ids: string[], on: boolean): Promise<number> {
+    return call("Lab.ScreenLock", ids, on);
   },
   sendFiles(ids: string[], paths: string[]): Promise<number> {
     return call("Lab.SendFiles", ids, paths);

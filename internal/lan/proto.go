@@ -89,8 +89,10 @@ type CommandMsg struct {
 const (
 	OpSetHelper   = "helper.set"   // args: {"on": true}
 	OpSetFeatures = "features.set" // args: {"keys": [...]}
-	OpLockScreen  = "screen.lock"  // args: {"reason": "..."}
-	OpRestart     = "helper.restart"
+	OpLockScreen  = "screen.lock"   // args: {"reason": "..."}——黑屏+锁键鼠
+	OpUnlockScreen = "screen.unlock"
+	OpRestart     = "helper.restart" // 学生机重启（shutdown /r）
+	OpShutdown    = "helper.shutdown" // 学生机关机（shutdown /s）
 
 	OpScreenWatch  = "screen.watch" // args: {"on": bool}——开/关缩略图流
 	OpCastStart    = "cast.start"   // args: CastStartArgs（含组播会话参数）
@@ -149,12 +151,20 @@ type ScreenMsg struct {
 
 // CastStartArgs 广播模式 + 组播会话参数。
 // Group 为空表示本次广播走纯 TCP（管理端侧组播也不可用）。
+// Gen 是单调递增的广播代数：学生端拒绝比当前代数旧的指令，
+// 解决「停掉旧广播立刻开新广播」时旧 cast.start 晚到造成的复活。
 type CastStartArgs struct {
+	Gen     uint32 `json:"gen"`               // 广播代数（服务端单调递增）
 	Mode    string `json:"mode"`              // "fullscreen" | "window"
 	Group   string `json:"group,omitempty"`   // 组播地址
 	Port    int    `json:"port,omitempty"`    // 组播端口
-	Session uint32 `json:"session,omitempty"` // 会话号（帧 nonce 的一部分）
+	Session uint32 `json:"session,omitempty"` // 组播会话号（帧 nonce 的一部分）
 	Key     string `json:"key,omitempty"`     // base64(AES-256 会话密钥)
+}
+
+// CastStopArgs 结束广播；Gen 匹配当前代才生效（0 = 无条件停，兼容旧端）。
+type CastStopArgs struct {
+	Gen uint32 `json:"gen,omitempty"`
 }
 
 // CollectOpenArgs 收取文件请求：学生端弹出提交界面。

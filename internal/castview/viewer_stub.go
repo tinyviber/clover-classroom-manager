@@ -23,3 +23,7 @@ func Frame(jpeg []byte) {}
 
 // Close 关闭广播窗。
 func Close() { log.Printf("castview: close") }
+
+// Lock/Unlock 黑屏锁定 stub（非 Windows 只记日志）。
+func Lock(reason string) { log.Printf("castview: lock %q", reason) }
+func Unlock()          { log.Printf("castview: unlock") }

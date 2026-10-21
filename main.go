@@ -37,10 +37,13 @@ var trayIconTemplatePNG []byte
 // ---- 功能目录 ---------------------------------------------------------------
 
 // Feature describes one protection/policy switch a client can enforce.
+// Ready=false 表示该策略在客户端还没有执行实现（规划中）——
+// UI 禁用勾选，也不计入「生效」数，避免把占位功能显示成已保护。
 type Feature struct {
-	Key  string `json:"key"`
-	Name string `json:"name"`
-	Desc string `json:"desc"`
+	Key   string `json:"key"`
+	Name  string `json:"name"`
+	Desc  string `json:"desc"`
+	Ready bool   `json:"ready"`
 }
 
 // FeatureGroup is a section of the per-device feature checklist.
@@ -52,7 +55,7 @@ type FeatureGroup struct {
 func catalog() []FeatureGroup {
 	return []FeatureGroup{
 		{Title: "脱控防护", Features: []Feature{
-			{Key: "guard_offline", Name: "断网/拔网线检测", Desc: "检测到断网时自动锁定并告警"},
+			{Key: "guard_offline", Name: "断网/拔网线检测", Desc: "断线超过约 15 秒自动锁屏，重连后恢复", Ready: true},
 			{Key: "guard_process", Name: "防终止/挂起进程", Desc: "保护电子教室与小助手进程不被结束或挂起"},
 			{Key: "guard_ip", Name: "IP 地址篡改恢复", Desc: "学生修改 IP 后自动恢复并上报"},
 			{Key: "guard_firewall", Name: "防火墙阻止检测", Desc: "防止勾选「阻止所有传入连接」脱控"},
@@ -60,7 +63,7 @@ func catalog() []FeatureGroup {
 			{Key: "guard_safemode", Name: "安全模式防护", Desc: "开机进入安全模式时蓝屏锁定"},
 		}},
 		{Title: "系统限制", Features: []Feature{
-			{Key: "lock_taskmgr", Name: "禁用任务管理器", Desc: "含性能页的资源监视器"},
+			{Key: "lock_taskmgr", Name: "禁用任务管理器", Desc: "HKCU 策略项 DisableTaskMgr（学生自助可改，正式版需服务级防护）", Ready: true},
 			{Key: "lock_regedit", Name: "禁用注册表", Desc: "regedit 与策略编辑器"},
 			{Key: "lock_cmd", Name: "禁用命令行", Desc: "cmd / PowerShell / 脚本宿主"},
 			{Key: "lock_settings", Name: "禁用控制面板与设置", Desc: "防止修改网络与系统配置"},
@@ -109,6 +112,7 @@ type Device struct {
 	Version  string   `json:"version"`
 	Alerts   int      `json:"alerts"`
 	Features []string `json:"features"`
+	Pending  bool     `json:"pending"` // 待审批的新注册设备
 	LastSeen string   `json:"lastSeen"`
 }
 
@@ -116,7 +120,8 @@ func toView(d lan.Device) Device {
 	return Device{
 		ID: d.ID, Name: d.Name, Label: d.Label, IP: d.IP, MAC: d.MAC,
 		Online: d.Online, HelperOn: d.HelperOn, Version: d.Version,
-		Alerts: d.Alerts, Features: d.Features, LastSeen: d.LastSeenText(),
+		Alerts: d.Alerts, Features: d.Features, Pending: d.Pending,
+		LastSeen: d.LastSeenText(),
 	}
 }
 
@@ -130,6 +135,7 @@ type Lab struct {
 	classroomMu sync.Mutex // 序列化教师广播与学生演示的启停/冲突检查。
 	castCancel  context.CancelFunc
 	castQuality string // 画质档："perfect"|"better"|"normal"|"low"
+	castTitle   string // 窗口广播钉住的共享窗口标题（""=非窗口模式）
 	castBar     *mygo.Window // 广播悬浮控制条（Panel 小窗）
 }
 
@@ -219,6 +225,7 @@ type ClassroomState struct {
 	CastMode       string                  `json:"castMode"`
 	CastTargetIDs  []string                `json:"castTargetIds"`
 	CastQuality    string                  `json:"castQuality"`
+	CastTitle      string                  `json:"castTitle"` // 窗口模式共享的窗口标题
 }
 
 // Devices returns the current device list.
@@ -238,25 +245,7 @@ func (l *Lab) Catalog() []FeatureGroup { return catalog() }
 // SetHelper 下发启用/停用指令。返回成功下达的台数（离线设备不计）。
 // 并发下发，避免离线设备的超时拖慢整批。
 func (l *Lab) SetHelper(ids []string, on bool) int {
-	var mu sync.Mutex
-	n := 0
-	var wg sync.WaitGroup
-	for _, id := range ids {
-		wg.Add(1)
-		go func(id string) {
-			defer wg.Done()
-			ack, err := l.srv.SendCommand(id, lan.OpSetHelper, lan.SetHelperArgs{On: on})
-			if err == nil && ack.OK {
-				mu.Lock()
-				n++
-				mu.Unlock()
-			} else {
-				log.Printf("lab: 下发 helper.set 到 %s 失败: %v %s", id, err, ack.Err)
-			}
-		}(id)
-	}
-	wg.Wait()
-	return n
+	return l.broadcast(ids, lan.OpSetHelper, lan.SetHelperArgs{On: on})
 }
 
 // SetFeatures replaces the enabled feature set of one device.
@@ -271,6 +260,11 @@ func (l *Lab) SetFeatures(id string, keys []string) Device {
 
 // ApplyTemplate sets the same feature set on many devices at once.
 func (l *Lab) ApplyTemplate(ids []string, keys []string) int {
+	return l.broadcast(ids, lan.OpSetFeatures, lan.SetFeaturesArgs{Keys: keys})
+}
+
+// broadcast 向多台设备并发下发同一指令，返回成功（ack.OK）的台数。
+func (l *Lab) broadcast(ids []string, op string, args any) int {
 	var mu sync.Mutex
 	n := 0
 	var wg sync.WaitGroup
@@ -278,16 +272,46 @@ func (l *Lab) ApplyTemplate(ids []string, keys []string) int {
 		wg.Add(1)
 		go func(id string) {
 			defer wg.Done()
-			if _, err := l.srv.SendCommand(id, lan.OpSetFeatures, lan.SetFeaturesArgs{Keys: keys}); err == nil {
+			ack, err := l.srv.SendCommand(id, op, args)
+			if err == nil && ack.OK {
 				mu.Lock()
 				n++
 				mu.Unlock()
+			} else {
+				log.Printf("lab: 下发 %s 到 %s 失败: %v %s", op, id, err, ack.Err)
 			}
 		}(id)
 	}
 	wg.Wait()
 	return n
 }
+
+// ScreenLock 锁定/解锁学生机屏幕（黑屏 + 锁键鼠，学生端无退出途径）。
+func (l *Lab) ScreenLock(ids []string, on bool) int {
+	if on {
+		return l.broadcast(ids, lan.OpLockScreen, lan.LockScreenArgs{Reason: "教师锁定了屏幕"})
+	}
+	return l.broadcast(ids, lan.OpUnlockScreen, nil)
+}
+
+// PowerAction 远程重启/关机学生机。action: "restart" | "shutdown"。
+func (l *Lab) PowerAction(ids []string, action string) int {
+	op := lan.OpRestart
+	switch action {
+	case "shutdown":
+		op = lan.OpShutdown
+	case "restart":
+	default:
+		return 0
+	}
+	return l.broadcast(ids, op, nil)
+}
+
+// ApproveDevices 批准待注册设备（enrollment）。返回批准的台数。
+func (l *Lab) ApproveDevices(ids []string) int { return l.srv.Approve(ids) }
+
+// RejectDevices 拒绝待注册设备：移出注册表并断开连接。
+func (l *Lab) RejectDevices(ids []string) int { return l.srv.Reject(ids) }
 
 // ClearAlerts resets a device's alert counter.
 func (l *Lab) ClearAlerts(id string) { l.srv.ClearAlerts(id) }
@@ -321,7 +345,7 @@ func (l *Lab) AdminInfo() AdminInfo {
 // ExportClientPackage 生成学生机安装包到所选目录，返回实际输出路径。
 // 含 client.json（已写入管理端地址+公钥）、install.bat、README.txt，
 // 以及 agent.exe（若已用 GOOS=windows go build ./cmd/client 构建过）。
-func (l *Lab) ExportClientPackage() string {
+func (l *Lab) ExportClientPackage(addr string) string {
 	paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
 		Parent:            l.win,
 		Title:             "选择客户端安装包输出目录",
@@ -333,20 +357,24 @@ func (l *Lab) ExportClientPackage() string {
 		return "" // 用户取消
 	}
 	out := filepath.Join(paths[0], "client-package")
-	if err := writeClientPackage(out, l.srv); err != nil {
+	if err := writeClientPackage(out, l.srv, addr); err != nil {
 		log.Printf("导出安装包失败: %v", err)
 		return ""
 	}
 	return out
 }
 
-func writeClientPackage(dir string, srv *lan.Server) error {
+// writeClientPackage 生成安装包；addr 是教师选定的管理端 LAN 地址
+// （空串退回第一张网卡——多网卡/VPN 机器上默认项未必是学生可达的）。
+func writeClientPackage(dir string, srv *lan.Server, addr string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	ip := ""
-	if ips := lan.LocalIPv4s(); len(ips) > 0 {
-		ip = ips[0]
+	ip := addr
+	if ip == "" {
+		if ips := lan.LocalIPv4s(); len(ips) > 0 {
+			ip = ips[0]
+		}
 	}
 	cfg := lan.AgentConfig{
 		AdminAddr: fmt.Sprintf("%s:%d", ip, srv.TCPPort),
@@ -508,13 +536,14 @@ func main() {
 		log.Fatal(err)
 	}
 	srv := lan.NewServer(id, lan.TCPPort)
+	demoAgents := demoAgentCount()
+	srv.AutoApprove = demoAgents > 0 // 演示模式跳过 enrollment
 	srv.SetPersistPath(filepath.Join(dataDir, "registry.json"))
 	recvDir := filepath.Join(dataDir, "received")
 	if err := os.MkdirAll(recvDir, 0o700); err != nil {
 		log.Fatal(err)
 	}
 	srv.SetRecvDir(recvDir)
-	demoAgents := demoAgentCount()
 	if len(srv.Devices()) == 0 && demoAgents > 0 {
 		seedRegistry(srv) // 首启种子；之后以持久化注册表为准
 	}
@@ -610,6 +639,7 @@ func (l *Lab) ClassroomState() ClassroomState {
 		CastMode:       l.CastMode(),
 		CastTargetIDs:  l.srv.CastTargets(),
 		CastQuality:    l.quality(),
+		CastTitle:     l.castTitleForUI(),
 	}
 	for _, frame := range frames {
 		state.Screens = append(state.Screens, ScreenFrame{
@@ -690,6 +720,12 @@ var castQualityLevels = map[string]capture.Params{
 	"low":     {MaxWidth: 960, Quality: 42, IntervalMs: 800},  // 低质（弱网/教学提醒用）
 }
 
+func (l *Lab) castTitleForUI() string {
+	l.castMu.Lock()
+	defer l.castMu.Unlock()
+	return l.castTitle
+}
+
 func (l *Lab) quality() string {
 	l.castMu.Lock()
 	defer l.castMu.Unlock()
@@ -740,7 +776,7 @@ func (l *Lab) CastStart(mode string, ids []string) bool {
 	l.castCancel = cancel
 	l.castMu.Unlock()
 
-	oldIDs := l.srv.StopCast() // 结束旧会话（含组播发送端与兜底 worker）
+	oldIDs, oldGen := l.srv.StopCast() // 结束旧会话（含组播发送端与兜底 worker）
 	stale := make([]string, 0, len(oldIDs))
 	for _, id := range oldIDs {
 		if !contains(targets, id) {
@@ -749,7 +785,8 @@ func (l *Lab) CastStart(mode string, ids []string) bool {
 	}
 	if len(stale) > 0 {
 		l.srv.Broadcast(lan.Msg{Type: lan.MsgCommand, Cmd: &lan.CommandMsg{
-			ID: fmt.Sprintf("cast-stop-%d", time.Now().UnixNano()), Op: lan.OpCastStop,
+			ID: fmt.Sprintf("cast-stop-%d", time.Now().UnixNano()),
+			Op: lan.OpCastStop, Args: lan.CastStopArgs{Gen: oldGen},
 		}}, stale)
 	}
 
@@ -765,13 +802,15 @@ func (l *Lab) CastStart(mode string, ids []string) bool {
 				return // 会话已被停/换，不发陈旧参数
 			}
 			ack, err := l.srv.SendCommand(id, lan.OpCastStart, args)
-			if err != nil || !ack.OK || ack.Detail == "tcp" {
+			// "stale" 是客户端认出过期代数——不是失败，不该标 TCP 兜底。
+			if ack.Detail == "tcp" || (ack.Detail != "stale" && (err != nil || !ack.OK)) {
 				l.srv.MarkCastTCP(id)
 			}
-			// 广播期间被停/换会话：补 cast.stop 防止僵尸全屏窗。
-			if _, still := l.srv.CastArgs(id); !still {
+			// 广播期间被停/换代：补对应代数的 cast.stop 防僵尸全屏窗。
+			if cur, still := l.srv.CastArgs(id); !still || cur.Gen != args.Gen {
 				l.srv.Broadcast(lan.Msg{Type: lan.MsgCommand, Cmd: &lan.CommandMsg{
-					ID: fmt.Sprintf("cast-stop-%d", time.Now().UnixNano()), Op: lan.OpCastStop,
+					ID: fmt.Sprintf("cast-stop-%d", time.Now().UnixNano()),
+					Op: lan.OpCastStop, Args: lan.CastStopArgs{Gen: args.Gen},
 				}}, []string{id})
 			}
 		}(id)
@@ -795,10 +834,11 @@ func (l *Lab) CastStop() {
 	if cancel != nil {
 		cancel()
 	}
-	oldIDs := l.srv.StopCast()
+	oldIDs, gen := l.srv.StopCast()
 	if len(oldIDs) > 0 {
 		l.srv.Broadcast(lan.Msg{Type: lan.MsgCommand, Cmd: &lan.CommandMsg{
-			ID: fmt.Sprintf("cast-stop-%d", time.Now().UnixNano()), Op: lan.OpCastStop,
+			ID: fmt.Sprintf("cast-stop-%d", time.Now().UnixNano()),
+			Op: lan.OpCastStop, Args: lan.CastStopArgs{Gen: gen},
 		}}, oldIDs)
 	}
 	l.closeCastBar()
@@ -840,6 +880,20 @@ func (l *Lab) FocusAdmin() {
 // 画面静止时跳帧（心跳帧 4s 一保）。开播强制连发前 3 帧，让刚加入组播的
 // 客户端尽快拿到画面（它们可能错过了第 1 帧的分片）。
 func (l *Lab) castLoop(ctx context.Context, mode string) {
+	if mode == "window" {
+		// 钉住开播这一刻的前台窗：之后教师切换焦点不影响共享对象，
+		// 标题也告诉教师在播什么（想换共享窗口需停广播重开）。
+		l.castMu.Lock()
+		l.castTitle = capture.PinWindow()
+		l.castMu.Unlock()
+		defer func() {
+			capture.UnpinWindow()
+			l.castMu.Lock()
+			l.castTitle = ""
+			l.castMu.Unlock()
+			scheduleClassroomPush(l)
+		}()
+	}
 	fp := &capture.Fingerprinter{}
 	var lastSend time.Time
 	var lastInterval time.Duration

@@ -25,6 +25,7 @@ const filterOptions: { key: DeviceFilter; label: string }[] = [
   { key: "online", label: "在线" },
   { key: "offline", label: "离线" },
   { key: "alert", label: "有告警" },
+  { key: "pending", label: "待审批" },
 ];
 
 export function DevicesView() {
@@ -44,14 +45,19 @@ export function DevicesView() {
 
   const visible = useMemo(() => filterDevices(devices, filter, query), [devices, filter, query]);
   const online = devices.filter((device) => device.online).length;
+  const pendingCount = devices.filter((device) => device.pending).length;
   const protectedCount = devices.filter((device) => device.helperOn).length;
   const alertCount = devices.filter((device) => device.alerts > 0).length;
-  const featureTotal = catalog.reduce((count, group) => count + group.features.length, 0);
-  const { allFeatureKeys, featureNameByKey } = useMemo(() => {
+  // 生效功能只数 ready=true 的（客户端真有执行实现）；
+  // 规划中项不算数，也不允许勾选，避免「已启用」假象。
+  const readyFeatures = useMemo(() => catalog.flatMap((g) => g.features).filter((f) => f.ready), [catalog]);
+  const featureTotal = readyFeatures.length;
+  const { allFeatureKeys, featureNameByKey, readyKeys } = useMemo(() => {
     const features = catalog.flatMap((group) => group.features);
     return {
-      allFeatureKeys: features.map((feature) => feature.key),
+      allFeatureKeys: features.filter((f) => f.ready).map((feature) => feature.key),
       featureNameByKey: new Map(features.map((feature) => [feature.key, feature.name])),
+      readyKeys: new Set(features.filter((f) => f.ready).map((f) => f.key)),
     };
   }, [catalog]);
   const allVisibleSelected = visible.length > 0 && visible.every((device) => selectedIds.includes(device.id));
@@ -69,6 +75,11 @@ export function DevicesView() {
   const batchToggle = (on: boolean) => runAction(
     () => api.setHelper(selectedIds, on),
     (count) => `已向 ${count} 台设备下发${on ? "启用" : "停用"}防护`,
+  );
+
+  const pendingSelectedIds = useMemo(
+    () => devices.filter((d) => d.pending && selectedIds.includes(d.id)).map((d) => d.id),
+    [devices, selectedIds],
   );
 
   return (
@@ -100,6 +111,7 @@ export function DevicesView() {
                 <ToggleGroupItem key={option.key} value={option.key}>
                   {option.label}
                   {option.key === "all" ? <span className="text-muted-foreground">{devices.length}</span> : null}
+                  {option.key === "pending" && pendingCount ? <Badge variant="destructive" className="ml-1 px-1.5">{pendingCount}</Badge> : null}
                 </ToggleGroupItem>
               ))}
             </ToggleGroup>
@@ -117,6 +129,9 @@ export function DevicesView() {
             <Button size="sm" onClick={() => void batchToggle(true)}><ShieldCheck />启用防护</Button>
             <Button size="sm" variant="outline" onClick={() => void batchToggle(false)}><ShieldOff />停用防护</Button>
             <Button size="sm" variant="outline" onClick={() => setFeatureDialog({ mode: "template", ids: selectedIds })}><SlidersHorizontal />套用功能模板</Button>
+            {pendingSelectedIds.length > 0 && (
+              <Button size="sm" variant="outline" onClick={() => void runAction(() => api.approveDevices(pendingSelectedIds), (count) => `已批准 ${count} 台设备加入课堂`)}>批准所选 {pendingSelectedIds.length} 台</Button>
+            )}
             <Button size="sm" variant="ghost" className="ml-auto" onClick={clearSelection}>清除选择</Button>
           </div>
         )}
@@ -149,6 +164,8 @@ export function DevicesView() {
                 const selected = selectedIds.includes(device.id);
                 const expanded = expandedIds.includes(device.id);
                 const activeFeatures = device.features.map((key) => featureNameByKey.get(key)).filter((name): name is string => Boolean(name));
+                const enabledCount = device.features.filter((key) => readyKeys.has(key)).length;
+                const plannedCount = device.features.length - enabledCount;
                 return (
                   <DeviceRows
                     key={device.id}
@@ -156,6 +173,8 @@ export function DevicesView() {
                     selected={selected}
                     expanded={expanded}
                     featureTotal={featureTotal}
+                    enabledCount={enabledCount}
+                    plannedCount={plannedCount}
                     activeFeatures={activeFeatures}
                     allFeatureKeys={allFeatureKeys}
                     onSelect={() => toggleSelected(device.id)}
@@ -194,12 +213,14 @@ function MetricCard({ icon: Icon, label, value, hint, tone }: { icon: typeof Com
 }
 
 function DeviceRows({
-  device, selected, expanded, featureTotal, activeFeatures, allFeatureKeys, onSelect, onExpand, onConfigure,
+  device, selected, expanded, featureTotal, enabledCount, plannedCount, activeFeatures, allFeatureKeys, onSelect, onExpand, onConfigure,
 }: {
   device: Device;
   selected: boolean;
   expanded: boolean;
   featureTotal: number;
+  enabledCount: number;
+  plannedCount: number;
   activeFeatures: string[];
   allFeatureKeys: string[];
   onSelect: () => void;
@@ -220,7 +241,7 @@ function DeviceRows({
           </Button>
           <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-muted text-xs font-semibold text-muted-foreground">{device.label.replace(/^[A-Za-z]+-?/, "") || device.label}</span>
           <span className="min-w-0">
-            <span className="flex flex-wrap items-center gap-1.5 font-medium text-foreground">{device.name}{device.alerts > 0 && <Badge variant="destructive">{device.alerts} 告警</Badge>}</span>
+            <span className="flex flex-wrap items-center gap-1.5 font-medium text-foreground">{device.name}{device.pending && <Badge variant="outline" className="border-warning/40 bg-warning/10 text-warning">待审批</Badge>}{device.alerts > 0 && <Badge variant="destructive">{device.alerts} 告警</Badge>}</span>
             <span className="block text-xs text-muted-foreground">{device.label}</span>
           </span>
         </div>
@@ -232,10 +253,17 @@ function DeviceRows({
           {device.helperOn ? "已启用" : "已停用"}
         </Badge>
       </TableCell>
-      <TableCell className="tabular-nums text-muted-foreground">{device.features.length}<span className="text-muted-foreground/60">/{featureTotal}</span></TableCell>
+      <TableCell className="tabular-nums text-muted-foreground">{enabledCount}<span className="text-muted-foreground/60">/{featureTotal}</span>{plannedCount > 0 && <span className="ml-1 text-[10px] text-muted-foreground/60">+{plannedCount} 规划中</span>}</TableCell>
       <TableCell className="text-xs text-muted-foreground">{device.lastSeen}</TableCell>
       <TableCell className="pr-4 text-right" onClick={(event) => event.stopPropagation()}>
-        <Button variant="outline" size="sm" onClick={onConfigure}>配置</Button>
+        {device.pending ? (
+          <span className="inline-flex gap-1.5">
+            <Button variant="default" size="sm" onClick={() => void run(() => api.approveDevices([device.id]), () => `已批准 ${device.name} 加入课堂`)}>批准</Button>
+            <Button variant="ghost" size="sm" className="text-destructive" onClick={() => void run(() => api.rejectDevices([device.id]), () => `已拒绝 ${device.name}`)}>拒绝</Button>
+          </span>
+        ) : (
+          <Button variant="outline" size="sm" onClick={onConfigure}>配置</Button>
+        )}
       </TableCell>
     </TableRow>
     {expanded && (
@@ -276,7 +304,7 @@ function FeatureDialog({ state, onOpenChange }: { state: FeatureDialogState; onO
   const [busy, setBusy] = useState(false);
   const openedState = state;
   const open = Boolean(state);
-  const featureKeys = catalog.flatMap((group) => group.features.map((feature) => feature.key));
+  const featureKeys = catalog.flatMap((group) => group.features.filter((f) => f.ready).map((feature) => feature.key));
 
   // Reset the checklist whenever a new device/template target is opened.
   const identity = state?.mode === "single" ? state.device.id : state?.mode === "template" ? state.ids.join("|") : "closed";
@@ -290,14 +318,16 @@ function FeatureDialog({ state, onOpenChange }: { state: FeatureDialogState; onO
   const toggle = (key: string, on: boolean) => setChecked((current) => on ? [...new Set([...current, key])] : current.filter((item) => item !== key));
   const apply = async () => {
     if (!openedState) return;
+    // 只下发真正可执行的功能键——规划中项即使残留勾选也不发。
+    const effective = checked.filter((key) => featureKeys.includes(key));
     setBusy(true);
     try {
       if (openedState.mode === "single") {
-        await api.setFeatures(openedState.device.id, checked);
-        toast.success(`${openedState.device.name}：已保存 ${checked.length} 项功能`);
+        await api.setFeatures(openedState.device.id, effective);
+        toast.success(`${openedState.device.name}：已保存 ${effective.length} 项功能`);
       } else {
-        const count = await api.applyTemplate(openedState.ids, checked);
-        toast.success(`模板已应用到 ${count} 台设备（${checked.length} 项）`);
+        const count = await api.applyTemplate(openedState.ids, effective);
+        toast.success(`模板已应用到 ${count} 台设备（${effective.length} 项）`);
       }
       onOpenChange(false);
     } catch (error) {
@@ -331,9 +361,12 @@ function FeatureDialog({ state, onOpenChange }: { state: FeatureDialogState; onO
                 </div>
                 <div className="grid gap-1 sm:grid-cols-2">
                   {group.features.map((feature) => (
-                    <Label key={feature.key} className="items-start rounded-lg p-2.5 hover:bg-muted/50">
-                      <Checkbox checked={checked.includes(feature.key)} onCheckedChange={(value) => toggle(feature.key, value === true)} />
-                      <span className="grid min-w-0 gap-1"><span className="text-sm font-medium">{feature.name}</span><span className="text-xs text-muted-foreground">{feature.desc}</span></span>
+                    <Label key={feature.key} className={`items-start rounded-lg p-2.5 ${feature.ready ? "hover:bg-muted/50" : "opacity-55"}`}>
+                      <Checkbox disabled={!feature.ready} checked={feature.ready && checked.includes(feature.key)} onCheckedChange={(value) => toggle(feature.key, value === true)} />
+                      <span className="grid min-w-0 gap-1">
+                        <span className="flex items-center gap-1.5 text-sm font-medium">{feature.name}{!feature.ready && <Badge variant="outline" className="text-[10px] text-muted-foreground">规划中</Badge>}</span>
+                        <span className="text-xs text-muted-foreground">{feature.desc}</span>
+                      </span>
                     </Label>
                   ))}
                 </div>
